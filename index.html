@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>agentgateway InferencePool 两种接入方式对比</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #1f2430; --muted: #6b7280; --line: #d7dbe2;
+    --plain: #2563eb; --plain-bg: #eff4ff;
+    --llm: #7c3aed; --llm-bg: #f5f0ff;
+    --epp: #0d9488; --epp-bg: #e6f7f5;
+    --warn: #b45309; --warn-bg: #fef3e2;
+    --bug: #dc2626; --bug-bg: #fdecec;
+    --ok: #15803d; --ok-bg: #e8f6ec;
+    --code-bg: #f0f1f4;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--ink); font-family: "PingFang SC", "Microsoft YaHei", -apple-system, "Segoe UI", sans-serif; line-height: 1.5; padding: 32px 24px 64px; }
+  .wrap { max-width: 1240px; margin: 0 auto; }
+  h1 { font-size: 24px; margin-bottom: 6px; }
+  .sub { color: var(--muted); font-size: 14px; margin-bottom: 28px; }
+  code { font-family: "SF Mono", Consolas, "Courier New", monospace; background: var(--code-bg); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+  .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  @media (max-width: 980px) { .columns { grid-template-columns: 1fr; } }
+  .col { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 20px 26px; }
+  .col-head { margin-bottom: 6px; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .col-head .tag { font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 999px; color: #fff; }
+  .col.plain .tag { background: var(--plain); }
+  .col.llm .tag { background: var(--llm); }
+  .col-head h2 { font-size: 17px; }
+  .col-sub { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+  .phase { font-size: 12px; font-weight: 700; letter-spacing: .08em; color: var(--muted); text-transform: uppercase; margin: 20px 0 10px; padding-top: 16px; border-top: 1px dashed var(--line); }
+  .phase:first-of-type { border-top: none; padding-top: 0; margin-top: 8px; }
+  .flow { display: flex; flex-direction: column; align-items: stretch; }
+  .node { border: 1.5px solid var(--line); border-radius: 10px; padding: 10px 14px; background: #fff; position: relative; }
+  .node .t { font-weight: 600; font-size: 14px; }
+  .node .d { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .node .d code { font-size: 11.5px; }
+  .node.plainbox { border-color: var(--plain); background: var(--plain-bg); }
+  .node.llmbox { border-color: var(--llm); background: var(--llm-bg); }
+  .node.eppbox { border-color: var(--epp); background: var(--epp-bg); }
+  .node.warnbox { border-color: var(--warn); background: var(--warn-bg); }
+  .node.okbox { border-color: var(--ok); background: var(--ok-bg); }
+  .arrow { align-self: center; width: 0; height: 22px; border-left: 2px solid var(--line); position: relative; margin: 2px 0; }
+  .arrow::after { content: ""; position: absolute; bottom: -1px; left: -5px; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 6px solid var(--line); }
+  .arrow.lbl { height: 30px; }
+  .arrow .cap { position: absolute; left: 10px; top: 4px; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .side { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
+  .side .link { font-size: 11px; color: var(--epp); text-align: center; border-top: 2px dashed var(--epp); padding-top: 2px; min-width: 118px; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; border-radius: 999px; padding: 1px 8px; margin-left: 6px; vertical-align: 1px; }
+  .badge.miss { background: var(--bug-bg); color: var(--bug); }
+  .badge.hit { background: var(--ok-bg); color: var(--ok); }
+  .badge.skip { background: var(--warn-bg); color: var(--warn); }
+  .result { margin-top: 14px; border-radius: 10px; padding: 12px 14px; font-size: 13px; }
+  .result.bad { background: var(--warn-bg); border: 1px solid var(--warn); }
+  .result.good { background: var(--ok-bg); border: 1px solid var(--ok); }
+  .result b { display: block; margin-bottom: 3px; font-size: 13.5px; }
+  .bugnote { margin-top: 28px; background: var(--card); border: 1px solid var(--bug); border-left: 5px solid var(--bug); border-radius: 12px; padding: 18px 20px; }
+  .bugnote h3 { font-size: 15px; color: var(--bug); margin-bottom: 8px; }
+  .bugnote p { font-size: 13.5px; margin-bottom: 6px; }
+  .bugnote .fix { color: var(--ok); font-weight: 600; }
+  table.cmp { margin-top: 28px; width: 100%; border-collapse: collapse; background: var(--card); border-radius: 12px; overflow: hidden; border: 1px solid var(--line); font-size: 13.5px; }
+  table.cmp th, table.cmp td { padding: 10px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  table.cmp th { background: #eef0f4; font-size: 12.5px; }
+  table.cmp tr:last-child td { border-bottom: none; }
+  td.y { color: var(--ok); font-weight: 700; }
+  td.n { color: var(--bug); font-weight: 700; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 18px 0 8px; font-size: 12.5px; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1.5px solid; }
+  .lg-plain::before { background: var(--plain-bg); border-color: var(--plain) !important; }
+  .lg-llm::before { background: var(--llm-bg); border-color: var(--llm) !important; }
+  .lg-epp::before { background: var(--epp-bg); border-color: var(--epp) !important; }
+  .lg-warn::before { background: var(--warn-bg); border-color: var(--warn) !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>agentgateway × InferencePool:两种接入方式的配置解析与数据路径</h1>
+  <p class="sub">
+    环境:<code>polaris-gateway/llmd-gateway</code>(v1.4.1-eppfix) · InferencePool <code>warmup/warmup-ip</code> ·
+    EPP <code>warmup-epp-svc:9002</code>(FailClose) · 后端 vLLM P/D 分离,decode 端口 9080-9083
+  </p>
+
+  <div class="legend">
+    <span class="lg-plain">通用转发路径(轮次 0)</span>
+    <span class="lg-llm">LLM 解析路径(轮次 4)</span>
+    <span class="lg-epp">EPP / 推理扩展</span>
+    <span class="lg-warn">缺失能力</span>
+  </div>
+
+  <div class="columns">
+    <div class="col plain">
+      <div class="col-head"><span class="tag">轮次 0</span><h2>HTTPRoute 直连 InferencePool</h2></div>
+      <p class="col-sub">Gateway API Inference Extension 通用规范用法 —— 透明转发,网关不理解 LLM 语义</p>
+
+      <div class="phase">① 控制面:配置解析路径</div>
+      <div class="flow">
+        <div class="node k8s">
+          <div class="t">HTTPRoute <code>warmup-httproute</code></div>
+          <div class="d">match: header <code>X-Infer-ID</code> · backendRef 直接指向 ↓</div>
+        </div>
+        <div class="arrow lbl"><span class="cap">backendRef (group=inference.networking.k8s.io)</span></div>
+        <div class="node eppbox">
+          <div class="t">InferencePool <code>warmup-ip</code></div>
+          <div class="d">selector 圈定 vLLM pods · endpointPickerRef → <code>warmup-epp-svc:9002</code></div>
+        </div>
+        <div class="arrow lbl"><span class="cap">controller 翻译 (inference_plugin.go)</span></div>
+        <div class="node plainbox">
+          <div class="t">合成 Service 目标 + 2 条 Policy</div>
+          <div class="d">
+            route 后端 = <code>warmup-ip.warmup.inference.cluster.local:8000</code><br>
+            <code>InferenceRouting</code> policy → target: 该 hostname,<b>port=None</b><br>
+            <code>BackendTLS</code> policy → EPP 连接 (insecure)
+          </div>
+        </div>
+      </div>
+
+      <div class="phase">② 数据面:请求实际路径</div>
+      <div class="flow">
+        <div class="node k8s"><div class="t">Client</div>
+          <div class="d">POST /v1/chat/completions + <code>X-Infer-ID</code></div></div>
+        <div class="arrow"></div>
+        <div class="node plainbox">
+          <div class="t">路由匹配 → <code>Backend::Service</code> 分支</div>
+          <div class="d">按普通 HTTP 服务处理,<code>llm_provider = None</code></div>
+        </div>
+        <div class="arrow lbl"><span class="cap">backend_policies() 查询:hostname (无 port) → 命中<span class="badge hit">policy HIT</span></span></div>
+        <div class="side">
+          <div class="node eppbox">
+            <div class="t">InferenceRouting 生效 → 咨询 EPP</div>
+            <div class="d">ext_proc 发送请求头+体 → EPP 返回选中的 <code>pod_ip:port</code></div>
+          </div>
+          <div class="link">gRPC ext_proc<br>warmup-epp-svc:9002</div>
+        </div>
+        <div class="arrow lbl"><span class="cap">destination override(绕过 Service 负载均衡)</span></div>
+        <div class="node k8s">
+          <div class="t">直连 EPP 选中的 vLLM 实例</div>
+          <div class="d">如 <code>10.244.113.35:9083</code> · KV-cache 亲和 / 队列感知调度</div>
+        </div>
+        <div class="arrow lbl"><span class="cap">响应原样透传,不解析 body</span></div>
+        <div class="node warnbox">
+          <div class="t">响应返回 · <code>protocol=http</code></div>
+          <div class="d">access log 仅 <code>inferencepool.selected_endpoint</code>,无任何 <code>gen_ai.*</code></div>
+        </div>
+      </div>
+
+      <div class="result bad">
+        <b>EPP ✅ · gen_ai 指标 ❌</b>
+        请求/响应体从未被当作 LLM 流量解析 —— TTFT / TPOT / token usage 全部缺失。
+        这是规范定义的透明转发,指标缺失是设计使然(opt-in 未开启),不是故障。
+      </div>
+    </div>
+
+    <div class="col llm">
+      <div class="col-head"><span class="tag">轮次 4</span><h2>AgentgatewayBackend(custom)→ InferencePool</h2></div>
+      <p class="col-sub">agentgateway 官方为 "InferencePool + AI 能力" 设计的用法(Issue #288 / PR #1932,v1.3.0+)</p>
+
+      <div class="phase">① 控制面:配置解析路径</div>
+      <div class="flow">
+        <div class="node k8s">
+          <div class="t">HTTPRoute <code>warmup-llm-route</code></div>
+          <div class="d">match: header <code>X-Metrics-Test: round4</code> · backendRef 指向 ↓</div>
+        </div>
+        <div class="arrow lbl"><span class="cap">backendRef (group=agentgateway.dev)</span></div>
+        <div class="node llmbox">
+          <div class="t">AgentgatewayBackend <code>warmup-llm</code></div>
+          <div class="d">
+            <code>spec.ai.provider.custom</code>:声明 LLM 语义(opt-in 开关)<br>
+            <code>formats: [Completions]</code> = OpenAI 协议解析<br>
+            <code>backendRef</code> → InferencePool <code>warmup-ip</code>
+          </div>
+        </div>
+        <div class="arrow lbl"><span class="cap">controller 翻译 (backend_plugin.go + custom_provider.go)</span></div>
+        <div class="node llmbox">
+          <div class="t">AI Backend + providerBackend</div>
+          <div class="d">
+            <code>provider: custom</code> + <code>providerBackend =</code><br>
+            <code>warmup-ip.warmup.inference.cluster.local:8000</code>(取 targetPorts[0])
+          </div>
+        </div>
+        <div class="arrow lbl"><span class="cap">InferencePool 侧翻译与轮次 0 完全相同</span></div>
+        <div class="node eppbox">
+          <div class="t">同一份 InferenceRouting policy</div>
+          <div class="d">target: 同一 hostname,<b>port=None</b> · 两条路径共享,无重复配置</div>
+        </div>
+      </div>
+
+      <div class="phase">② 数据面:请求实际路径</div>
+      <div class="flow">
+        <div class="node k8s"><div class="t">Client</div>
+          <div class="d">POST /v1/chat/completions + <code>X-Metrics-Test</code></div></div>
+        <div class="arrow"></div>
+        <div class="node llmbox">
+          <div class="t">路由匹配 → <code>Backend::AI</code> 分支</div>
+          <div class="d"><code>llm_provider = Some(custom)</code> · 请求侧解析:提取 model / max_tokens / prompt(<code>process_completions_request</code>)</div>
+        </div>
+        <div class="arrow lbl"><span class="cap">providerBackend 存在 → build_simple_backend_call</span></div>
+        <div class="node llmbox">
+          <div class="t">policy 查询(bug 修复点)</div>
+          <div class="d">
+            官方 v1.4.1:<code>sub_backend_policies</code> 带 <b>port=8000</b> 查
+            <span class="badge miss">policy MISS</span> → EPP 被跳过<span class="badge skip">503</span><br>
+            eppfix:改用 <code>backend_policies</code>,同时用去 port 的 key 查
+            <span class="badge hit">policy HIT</span>
+          </div>
+        </div>
+        <div class="arrow"></div>
+        <div class="side">
+          <div class="node eppbox">
+            <div class="t">InferenceRouting 生效 → 咨询 EPP</div>
+            <div class="d">与轮次 0 完全相同的 ext_proc 交互,动态选点(实测分流 9080/9082)</div>
+          </div>
+          <div class="link">gRPC ext_proc<br>warmup-epp-svc:9002</div>
+        </div>
+        <div class="arrow lbl"><span class="cap">destination override</span></div>
+        <div class="node k8s">
+          <div class="t">直连 EPP 选中的 vLLM 实例</div>
+          <div class="d">同轮次 0 · EPP 的动态发现与决策能力完整保留</div>
+        </div>
+        <div class="arrow lbl"><span class="cap">响应侧解析 process_response(流式逐 chunk 计时)</span></div>
+        <div class="node okbox">
+          <div class="t">响应返回 · <code>protocol=llm</code></div>
+          <div class="d">
+            指标:<code>gen_ai_server_time_to_first_token</code>(需 stream=true)·
+            <code>time_per_output_token</code> · <code>client_token_usage</code> ·
+            <code>server_request_duration</code><br>
+            access log 同时带 <code>inferencepool.selected_endpoint</code> + <code>gen_ai.*</code>
+          </div>
+        </div>
+      </div>
+
+      <div class="result good">
+        <b>EPP ✅ · gen_ai 指标 ✅(单跳,0 额外代理)</b>
+        实测:TTFT 87.7ms · TPOT 2.33ms · token 9/16 · 与轮次 0 延迟无统计学差异
+        (解析大头 EPP 路径本来就要付:body 需缓冲发给 EPP 提取 model)。
+      </div>
+    </div>
+  </div>
+
+  <div class="bugnote">
+    <h3>⚠ v1.4.1 官方镜像的 bug:policy 索引 key 不对称(已打补丁 v1.4.1-eppfix)</h3>
+    <p>
+      <b>写入侧</b>(controller,<code>inference_plugin.go:89</code>):InferenceRouting policy 的 target 为
+      <code>Service{hostname, port=None}</code>。
+      <b>读取侧</b>(数据面,<code>httpproxy.rs:2046</code>):<code>provider_backend</code> 分支用
+      <code>sub_backend_policies</code> 查询,key 为 <code>Service{hostname, port=Some(8000)}</code>。
+    </p>
+    <p>
+      <code>PolicyTargetRef</code> 是精确哈希匹配 → <code>Some(8000) ≠ None</code> → 查不到 policy →
+      EPP 被静默跳过,InferencePool 退化为普通 Service 负载均衡(实测砸到 prefill pod 8000 端口,Connection refused)。
+      轮次 0 不受影响,因为它走 <code>backend_policies()</code>,该函数会以 strip 掉 port 的 key 再查一次。
+    </p>
+    <p class="fix">
+      修复(1 处):provider_backend 分支改调 backend_policies() —— 与轮次 0 路径同一套查询逻辑。官方测试仅覆盖了带 port 的 policy target,未覆盖 controller 生成的 port=None 真实产物,故未被发现;建议上报上游。
+    </p>
+  </div>
+
+  <table class="cmp">
+    <thead>
+      <tr><th style="width:220px">维度</th><th>轮次 0:HTTPRoute → InferencePool</th><th>轮次 4:AgentgatewayBackend(custom) → InferencePool</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>身份</td><td>Gateway API Inference Extension 通用规范用法</td><td>agentgateway 官方 "InferencePool + AI 能力" 用法(v1.3.0+)</td></tr>
+      <tr><td>K8s 对象数(每模型)</td><td>HTTPRoute + InferencePool</td><td>HTTPRoute + <b>AgentgatewayBackend</b> + InferencePool(多 1 个)</td></tr>
+      <tr><td>数据面代码分支</td><td><code>Backend::Service</code>(透明转发)</td><td><code>Backend::AI</code> → <code>build_simple_backend_call</code></td></tr>
+      <tr><td>EPP 动态发现/决策</td><td class="y">✅ 生效</td><td class="y">✅ 生效(eppfix 后;官方 v1.4.1 因 bug 失效)</td></tr>
+      <tr><td>gen_ai_* 指标(TTFT/TPOT/usage)</td><td class="n">❌ 无</td><td class="y">✅ 全部(TTFT/TPOT 需流式请求)</td></tr>
+      <tr><td>AI policies(token 限流/prompt guard 等)</td><td class="n">❌ 不可用</td><td class="y">✅ 可用</td></tr>
+      <tr><td>额外代理跳数</td><td>0</td><td>0</td></tr>
+      <tr><td>实测延迟差异</td><td colspan="2">无统计学差异(小请求中位数 97.0ms vs 84.5ms;48KB prompt 两者均 ~790ms)</td></tr>
+      <tr><td>代价</td><td>—</td><td>非流式响应需完整缓冲解析(内存);formats 声明与后端 API 需保持同步;当前需自建镜像直至 bugfix 合入上游</td></tr>
+      <tr><td>客户端使用方式</td><td colspan="2">完全相同:同一入口 / 同一 OpenAI 协议 / 同一认证 —— 两者切换客户端无感知</td></tr>
+    </tbody>
+  </table>
+</div>
+</body>
+</html>
