@@ -1022,14 +1022,16 @@ func processAPIKeyAuthenticationPolicy(
 }
 
 func processTimeoutPolicy(timeout *agentgateway.Timeouts, basePolicyName string, policy types.NamespacedName) *api.Policy {
+	if timeout.Request == nil {
+		return nil
+	}
+	request := durationToProto(timeout.Request)
 	timeoutPolicy := &api.Policy{
 		Key:  basePolicyName + timeoutPolicySuffix,
 		Name: TypedResourceFromName(wellknown.AgentgatewayPolicyGVK.Kind, policy),
 		Kind: &api.Policy_Traffic{
 			Traffic: &api.TrafficPolicySpec{
-				Kind: &api.TrafficPolicySpec_Timeout{Timeout: &api.Timeout{
-					Request: durationpb.New(timeout.Request.Duration),
-				}},
+				Kind: &api.TrafficPolicySpec_Timeout{Timeout: &api.Timeout{Request: request}},
 			},
 		},
 	}
@@ -1542,6 +1544,13 @@ func castCEL(item agentgateway.CELExpression, invalid func(agentgateway.CELExpre
 		invalid(item)
 	}
 	return string(item)
+}
+
+func durationToProto(value *agentgateway.Duration) *durationpb.Duration {
+	if value == nil {
+		return nil
+	}
+	return durationpb.New(value.Duration)
 }
 
 // processAuthorizationPolicy processes Authorization configuration and creates corresponding Agw policies
