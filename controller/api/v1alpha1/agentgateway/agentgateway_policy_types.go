@@ -1703,10 +1703,15 @@ type CrossAppAccessAuth struct {
 	Cache *OAuthTokenCache `json:"cache,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.tokenType) || (self.tokenType != 'IdJag' && self.tokenType != 'urn:ietf:params:oauth:token-type:id-jag')",message="tokenType IdJag is not supported by crossAppAccess"
 type CrossAppAccessSubjectToken struct {
 	// Where to read the subject token. Defaults to the Authorization Bearer header.
 	// +optional
 	Source *AuthorizationExtractionLocation `json:"source,omitempty"`
+
+	// OAuth RFC 8693 subject token type. Defaults to IdToken
+	// +optional
+	TokenType *OAuthTokenType `json:"tokenType,omitempty"`
 }
 
 // +kubebuilder:validation:ExactlyOneOf=backendRef;url

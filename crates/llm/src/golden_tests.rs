@@ -707,6 +707,10 @@ mod responses {
 		("stream_basic", ALL_ANTHROPIC),
 		("stream_thinking", ALL_ANTHROPIC),
 		(
+			"stream_message_delta_usage",
+			&[MESSAGES_TO_MESSAGES, MESSAGES_TO_COMPLETIONS],
+		),
+		(
 			"stream_tool",
 			&[MESSAGES_TO_MESSAGES, MESSAGES_TO_COMPLETIONS],
 		),

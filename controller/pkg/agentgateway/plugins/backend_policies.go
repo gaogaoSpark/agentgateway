@@ -1048,6 +1048,9 @@ func BuildCrossAppAccess(ctx PolicyCtx, auth *agentgateway.CrossAppAccessAuth, n
 		if err := validateExtractionAuthorizationLocation(auth.SubjectToken.Source, "crossAppAccess subjectToken source"); err != nil {
 			errs = append(errs, err)
 		}
+		if auth.SubjectToken.TokenType != nil {
+			errs = append(errs, validateOAuthTokenType(*auth.SubjectToken.TokenType, "crossAppAccess subjectToken tokenType"))
+		}
 	}
 	cache := translateOAuthTokenCache(auth.Cache)
 
@@ -1066,9 +1069,13 @@ func translateCrossAppAccessSubjectToken(spec *agentgateway.CrossAppAccessSubjec
 	if spec == nil {
 		return nil
 	}
-	return &api.CrossAppAccessAuth_SubjectToken{
+	res := &api.CrossAppAccessAuth_SubjectToken{
 		Source: translateAuthorizationExtractionLocation(spec.Source),
 	}
+	if spec.TokenType != nil {
+		res.TokenType = translateOAuthTokenType(*spec.TokenType)
+	}
+	return res
 }
 
 func buildCrossAppAccessPolicy(ctx PolicyCtx, auth *agentgateway.CrossAppAccessAuth, namespace string) (*api.BackendAuthPolicy, error) {
