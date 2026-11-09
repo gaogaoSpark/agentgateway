@@ -2,7 +2,6 @@ package translator
 
 import (
 	"cmp"
-	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -21,6 +20,7 @@ import (
 	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
+	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	klabels "k8s.io/apimachinery/pkg/labels"
@@ -30,6 +30,7 @@ import (
 	gwv1b1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/agentgateway/agentgateway/api"
+	apisettings "github.com/agentgateway/agentgateway/controller/api/settings"
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/plugins"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/utils"
@@ -171,6 +172,17 @@ func ConvertTCPRouteToAgw(ctx RouteContext, r gwv1.TCPRouteRule,
 	return res, backendErr
 }
 
+// trimRegexAnchors strips a leading ^ and trailing $ from a field regex. The service and method regexes are
+// anchored to their own field, but are embedded in a larger path regex where the anchors would never match.
+// The path regex is already full-match, so the anchors are redundant.
+func trimRegexAnchors(re string) string {
+	re = strings.TrimPrefix(re, "^")
+	if strings.HasSuffix(re, "$") && !strings.HasSuffix(re, `\$`) {
+		re = strings.TrimSuffix(re, "$")
+	}
+	return re
+}
+
 // ConvertGRPCRouteToAgw converts a GRPCRouteRule to an agentgateway HTTPRoute
 func ConvertGRPCRouteToAgw(ctx RouteContext, r gwv1.GRPCRouteRule,
 	obj *gwv1.GRPCRoute, pos int,
@@ -194,12 +206,22 @@ func ConvertGRPCRouteToAgw(ctx RouteContext, r gwv1.GRPCRouteRule,
 		var path *api.PathMatch
 		if match.Method != nil {
 			// Convert GRPC method to path for routing purposes
-			if match.Method.Service != nil && match.Method.Method != nil {
+			if ptr.OrEmpty(match.Method.Type) == gwv1.GRPCMethodMatchRegularExpression {
+				// An omitted service or method matches any single path segment
+				service, method := "[^/]+", "[^/]+"
+				if match.Method.Service != nil {
+					service = "(?:" + trimRegexAnchors(*match.Method.Service) + ")"
+				}
+				if match.Method.Method != nil {
+					method = "(?:" + trimRegexAnchors(*match.Method.Method) + ")"
+				}
+				path = &api.PathMatch{Kind: &api.PathMatch_Regex{Regex: "/" + service + "/" + method}}
+			} else if match.Method.Service != nil && match.Method.Method != nil {
 				pathStr := fmt.Sprintf("/%s/%s", *match.Method.Service, *match.Method.Method)
 				path = &api.PathMatch{Kind: &api.PathMatch_Exact{Exact: pathStr}}
 			} else if match.Method.Service != nil {
 				pathStr := fmt.Sprintf("/%s/", *match.Method.Service)
-				path = &api.PathMatch{Kind: &api.PathMatch_Exact{Exact: pathStr}}
+				path = &api.PathMatch{Kind: &api.PathMatch_PathPrefix{PathPrefix: pathStr}}
 			} else if match.Method.Method != nil {
 				// Convert wildcard to regex: "/*/{method}" becomes "/[^/]+/{method}"
 				pathStr := fmt.Sprintf("/[^/]+/%s", *match.Method.Method)
@@ -400,7 +422,7 @@ func BuildAgwTrafficPolicyFilters(
 			if h == nil {
 				continue
 			}
-			policies = append(policies, h)
+			policies = append(policies, &api.TrafficPolicySpec{Kind: &api.TrafficPolicySpec_UrlRewrite{UrlRewrite: h}})
 		case gwv1.HTTPRouteFilterCORS:
 			h := createAgwCorsFilter(filter.CORS)
 			if h == nil {
@@ -500,6 +522,12 @@ func BuildAgwBackendPolicyFilters(
 			} else {
 				mergedMirror = append(mergedMirror, h)
 			}
+		case gwv1.HTTPRouteFilterURLRewrite:
+			h := CreateAgwRewriteFilter(filter.URLRewrite)
+			if h == nil {
+				continue
+			}
+			policies = append(policies, &api.BackendPolicySpec{Kind: &api.BackendPolicySpec_UrlRewrite{UrlRewrite: h}})
 		default:
 			return nil, &reporter.RouteCondition{
 				Type:    gwv1.RouteConditionAccepted,
@@ -718,13 +746,20 @@ func ToInternalParentReference(p gwv1.ParentReference, localNamespace string, al
 	if !allowed.Contains(ref) {
 		return utils.TypedNamespacedName{}, fmt.Errorf("unsupported Parent: %v/%v", p.Group, p.Kind)
 	}
+	// Parent resolution keys omit the group, so built-in parent kinds are reserved.
+	for _, builtin := range []schema.GroupKind{
+		wellknown.GatewayGVK.GroupKind(), wellknown.ListenerSetGVK.GroupKind(),
+		wellknown.ServiceGVK.GroupKind(), wellknown.ServiceEntryGVK.GroupKind(),
+	} {
+		if ref.Kind == builtin.Kind && ref.Group != builtin.Group {
+			return utils.TypedNamespacedName{}, fmt.Errorf("unsupported Parent: %s: kind is reserved for group %q", ref, builtin.Group)
+		}
+	}
 	return utils.TypedNamespacedName{
 		Kind: ref.Kind,
-		NamespacedName: types.NamespacedName{
-			Name: string(p.Name),
-			// Unset namespace means "same namespace"
-			Namespace: defaultString(p.Namespace, localNamespace),
-		},
+		Name: string(p.Name),
+		// Unset namespace means "same namespace"
+		Namespace: defaultString(p.Namespace, localNamespace),
 	}, nil
 }
 
@@ -782,57 +817,52 @@ func ReferenceAllowed(
 			}
 		}
 
-		// AgentgatewayModels attach to listeners, but have no hostname matching
-		// surface. Their attachment is therefore independent of the listener's
-		// hostname; section, port, and allowedRoutes still apply below.
-		if routeKind != wellknown.AgentgatewayModelGVK {
-			// This is a bi-directional wildcard match. Only one route hostname must
-			// match for it to be allowed (but the others will be filtered at runtime).
-			// If either is empty it is treated as a wildcard which always matches.
-			if len(hostnames) == 0 {
-				hostnames = []gwv1.Hostname{"*"}
-			}
-			if len(parent.Hostnames) > 0 {
-				matched := false
-				hostMatched := false
-			out:
-				for _, routeHostname := range hostnames {
-					for _, parentHostNamespace := range parent.Hostnames {
-						var parentNamespace, parentHostname string
-						if strings.Contains(parentHostNamespace, "/") {
-							spl := strings.Split(parentHostNamespace, "/")
-							parentNamespace, parentHostname = spl[0], spl[1]
-						} else {
-							parentNamespace, parentHostname = "*", parentHostNamespace
-						}
+		// This is a bi-directional wildcard match. Only one route hostname must
+		// match for it to be allowed (but the others will be filtered at runtime).
+		// If either is empty it is treated as a wildcard which always matches.
+		if len(hostnames) == 0 {
+			hostnames = []gwv1.Hostname{"*"}
+		}
+		if len(parent.Hostnames) > 0 {
+			matched := false
+			hostMatched := false
+		out:
+			for _, routeHostname := range hostnames {
+				for _, parentHostNamespace := range parent.Hostnames {
+					var parentNamespace, parentHostname string
+					if strings.Contains(parentHostNamespace, "/") {
+						spl := strings.Split(parentHostNamespace, "/")
+						parentNamespace, parentHostname = spl[0], spl[1]
+					} else {
+						parentNamespace, parentHostname = "*", parentHostNamespace
+					}
 
-						hostnameMatch := host.Name(parentHostname).Matches(host.Name(routeHostname))
-						namespaceMatch := parentNamespace == "*" || parentNamespace == localNamespace
+					hostnameMatch := host.Name(parentHostname).Matches(host.Name(routeHostname))
+					namespaceMatch := parentNamespace == "*" || parentNamespace == localNamespace
 
-						hostMatched = hostMatched || hostnameMatch
-						if hostnameMatch && namespaceMatch {
-							matched = true
-							break out
-						}
+					hostMatched = hostMatched || hostnameMatch
+					if hostnameMatch && namespaceMatch {
+						matched = true
+						break out
 					}
 				}
-				if !matched {
-					if hostMatched {
-						return &ParentError{
-							Reason: ParentErrorNotAllowed,
-							Message: fmt.Sprintf(
-								"hostnames matched parent hostname %q, but namespace %q is not allowed by the parent",
-								parent.OriginalHostname, localNamespace,
-							),
-						}
-					}
+			}
+			if !matched {
+				if hostMatched {
 					return &ParentError{
-						Reason: ParentErrorNoHostname,
+						Reason: ParentErrorNotAllowed,
 						Message: fmt.Sprintf(
-							"no hostnames matched parent hostname %q",
-							parent.OriginalHostname,
+							"hostnames matched parent hostname %q, but namespace %q is not allowed by the parent",
+							parent.OriginalHostname, localNamespace,
 						),
 					}
+				}
+				return &ParentError{
+					Reason: ParentErrorNoHostname,
+					Message: fmt.Sprintf(
+						"no hostnames matched parent hostname %q",
+						parent.OriginalHostname,
+					),
 				}
 			}
 		}
@@ -849,13 +879,41 @@ func ReferenceAllowed(
 	if !matched {
 		return &ParentError{
 			Reason:  ParentErrorNotAllowed,
-			Message: fmt.Sprintf("kind %v is not allowed", routeKind),
+			Message: kindNotAllowedMessage(routeKind, parent, parentRef),
 		}
 	}
 	return nil
 }
 
-func extractParentReferenceInfo(ctx RouteContext, parents ParentResolver, obj controllers.Object) []RouteParentReference {
+// kindNotAllowedMessage names the rejecting parent and the kinds it does accept, e.g.
+// "kind AgentgatewayModel is not allowed by ServiceEntry default/egress (allowed kinds: HTTPRoute, GRPCRoute)".
+func kindNotAllowedMessage(routeKind schema.GroupVersionKind, parent *ParentInfo, parentRef ParentReference) string {
+	target := fmt.Sprintf("%s %s/%s", parentRef.Kind, parentRef.Namespace, parentRef.Name)
+	if parent.SectionName != "" {
+		target += fmt.Sprintf(" listener %q", parent.SectionName)
+	}
+	allowed := make([]string, 0, len(parent.AllowedKinds))
+	for _, ak := range parent.AllowedKinds {
+		allowed = append(allowed, string(ak.Kind))
+	}
+	allowedText := "none"
+	if len(allowed) > 0 {
+		allowedText = strings.Join(allowed, ", ")
+	}
+	return fmt.Sprintf("kind %s is not allowed by %s (allowed kinds: %s)", routeKind.Kind, target, allowedText)
+}
+
+func extractParentReferenceInfo(ctx RouteContext, obj controllers.Object) []RouteParentReference {
+	// Several collections resolve the parents of the same route, so use the precomputed ones.
+	_, _, kind := GetCommonRouteInfo(obj)
+	key := utils.TypedNamespacedName{Kind: kind.Kind, Namespace: obj.GetNamespace(), Name: obj.GetName()}
+	if refs := krt.FetchOne(ctx.Krt, ctx.ParentRefs, krt.FilterKey(key.String())); refs != nil {
+		return refs.Refs
+	}
+	return nil
+}
+
+func resolveParentReferenceInfo(ctx RouteContext, parents ParentResolver, obj controllers.Object) []RouteParentReference {
 	routeRefs, hostnames, kind := GetCommonRouteInfo(obj)
 	localNamespace := obj.GetNamespace()
 	allowed := ctx.References.AllowedParentReferences
@@ -909,8 +967,13 @@ func extractParentReferenceInfo(ctx RouteContext, parents ParentResolver, obj co
 		}
 	}
 	// Ensure stable order
-	slices.SortBy(parentRefs, func(a RouteParentReference) string {
-		return ParentRefString(a.OriginalReference)
+	slices.SortFunc(parentRefs, func(a, b RouteParentReference) int {
+		return cmp.Or(
+			strings.Compare(ParentRefString(a.OriginalReference), ParentRefString(b.OriginalReference)),
+			strings.Compare(a.ListenerKey, b.ListenerKey),
+			strings.Compare(ptr.OrEmpty(a.ServiceKey).String(), ptr.OrEmpty(b.ServiceKey).String()),
+			strings.Compare(a.Hostname, b.Hostname),
+		)
 	})
 	return parentRefs
 }
@@ -957,6 +1020,10 @@ type RouteParentReference struct {
 	ParentSection   gwv1.SectionName
 	Accepted        bool
 	ParentGateway   types.NamespacedName
+	// Model-serving metadata populated when an AgentgatewayModel attaches to an
+	// HTTPRoute rule. The existing model conversion still uses the resolved
+	// Gateway listeners, while this key links it to the translated route backend.
+	ModelRouterKey string
 }
 
 // FilteredReferences filters out references that are not accepted by the Parent.
@@ -1067,7 +1134,10 @@ func BuildListener(
 	ctx krt.HandlerContext,
 	secrets krt.Collection[*corev1.Secret],
 	configMaps krt.Collection[*corev1.ConfigMap],
+	clusterTrustBundles krt.Collection[*certificatesv1.ClusterTrustBundle],
 	grants ReferenceGrants,
+	references plugins.ReferenceTypes,
+	backendRefGrantMode apisettings.BackendRefGrantMode,
 	namespaces krt.Collection[*corev1.Namespace],
 	obj controllers.Object,
 	status []gwv1.ListenerStatus,
@@ -1076,8 +1146,8 @@ func BuildListener(
 	listenerIndex int,
 	portErr error,
 	forListenerSet bool,
-	enableAgentgatewayModels bool,
-) ([]string, *TLSInfo, []gwv1.ListenerStatus, bool) {
+	modelKinds []schema.GroupVersionKind,
+) ([]string, *TLSInfo, ListenerFilterResult, []gwv1.ListenerStatus, bool) {
 	listenerConditions := map[string]*Condition{
 		string(gwv1.ListenerConditionAccepted): {
 			Reason:  string(gwv1.ListenerReasonAccepted),
@@ -1100,7 +1170,7 @@ func BuildListener(
 
 	ok := true
 	gwFrontendTLS, gwBackendTLS := resolveGatewayTLS(l.Port, gw.TLS)
-	tlsInfo, err := buildTLS(ctx, secrets, configMaps, grants, gwFrontendTLS, l.TLS, obj)
+	tlsInfo, err := buildTLS(ctx, secrets, configMaps, clusterTrustBundles, grants, gwFrontendTLS, l.TLS, obj)
 	var backendTLSErr *ConfigError
 	if err == nil {
 		// Resolve backend client cert references for status/reporting. Actual backend TLS behavior
@@ -1166,8 +1236,73 @@ func BuildListener(
 		ok = false
 	}
 
-	updatedStatus := reportListenerCondition(listenerIndex, l, obj, status, listenerConditions, enableAgentgatewayModels)
-	return hostnames, tlsInfo, updatedStatus, ok
+	parentGVK := wellknown.GatewayGVK
+	if forListenerSet {
+		parentGVK = wellknown.ListenerSetGVK
+	}
+	filterCtx := RouteContext{Krt: ctx, Grants: grants, References: references, BackendRefGrantMode: backendRefGrantMode}
+	filterPolicies, filterCondition, filterErr := buildListenerFilterPolicies(filterCtx, l.Filters, obj.GetNamespace(), parentGVK)
+	filterResult := ListenerFilterResult{Policies: filterPolicies}
+	if filterErr != nil {
+		filterResult.Error = filterErr.Message
+		listenerConditions[string(filterCondition)].Error = filterErr
+		listenerConditions[string(gwv1.ListenerConditionProgrammed)].Error = &ConfigError{
+			Reason:  string(gwv1.ListenerReasonInvalid),
+			Message: filterErr.Message,
+		}
+		ok = false
+	}
+
+	updatedStatus := reportListenerCondition(listenerIndex, l, obj, status, listenerConditions, modelKinds)
+	return hostnames, tlsInfo, filterResult, updatedStatus, ok
+}
+
+// ListenerFilterResult is the translation of a listener's filters.
+type ListenerFilterResult struct {
+	Policies []*api.TrafficPolicySpec
+	// Error is set if the filters could not be translated.
+	Error string
+}
+
+// buildListenerFilterPolicies translates the listener's filters into inline listener policies, which run before route
+// selection. On failure, it returns the listener condition to report the error on.
+func buildListenerFilterPolicies(
+	ctx RouteContext,
+	filters *gwv1.ListenerFilters,
+	ns string,
+	k schema.GroupVersionKind,
+) ([]*api.TrafficPolicySpec, gwv1.ListenerConditionType, *ConfigError) {
+	if filters == nil {
+		return nil, "", nil
+	}
+	var policies []*api.TrafficPolicySpec
+	for i, f := range filters.Requests {
+		if f.Type != gwv1.ListenerFilterExternalAuth {
+			return nil, gwv1.ListenerConditionAccepted, &ConfigError{
+				Reason:  string(gwv1.ListenerReasonUnsupportedValue),
+				Message: fmt.Sprintf("filters.requests[%d]: unsupported listener filter type %q", i, f.Type),
+			}
+		}
+		if len(policies) > 0 {
+			return nil, gwv1.ListenerConditionAccepted, &ConfigError{
+				Reason:  "InvalidListenerFilter",
+				Message: fmt.Sprintf("filters.requests[%d]: at most one ExternalAuth listener filter is supported", i),
+			}
+		}
+		pol, err := CreateAgwExternalAuthFilter(ctx, f.ExternalAuth, ns, k)
+		if err != nil {
+			reason := "InvalidListenerFilterRef"
+			if err.Reason == gwv1.RouteReasonRefNotPermitted {
+				reason = string(gwv1.ListenerReasonRefNotPermitted)
+			}
+			return nil, gwv1.ListenerConditionResolvedRefs, &ConfigError{
+				Reason:  reason,
+				Message: fmt.Sprintf("filters.requests[%d]: %s", i, err.Message),
+			}
+		}
+		policies = append(policies, pol)
+	}
+	return policies, "", nil
 }
 
 func resolveGatewayTLS(port gwv1.PortNumber, gw *gwv1.GatewayTLSConfig) (*gwv1.TLSConfig, *gwv1.GatewayBackendTLS) {
@@ -1217,6 +1352,100 @@ func listenerProtocolToAgw(p gwv1.ProtocolType) (string, error) {
 	return "", fmt.Errorf("protocol %q is unsupported", p)
 }
 
+// ListenerProtocolAndTLSConfig maps a Gateway listener to its agentgateway protocol and
+// TLS configuration. The final return is false when the listener cannot be programmed,
+// either because the protocol is unsupported or because it requires TLS that is missing.
+func ListenerProtocolAndTLSConfig(obj *GatewayListener) (api.Protocol, *api.TLSConfig, bool) {
+	var tlsConfig *api.TLSConfig
+
+	// Build TLS config if needed
+	if obj.TLSInfo != nil {
+		tlsConfig = &api.TLSConfig{
+			Cert:       obj.TLSInfo.Cert,
+			PrivateKey: obj.TLSInfo.Key,
+		}
+		if obj.TLSInfo.IstioWorkloadCert {
+			tlsConfig.CertificateSource = api.TLSConfig_ISTIO_WORKLOAD
+		} else if obj.TLSInfo.DynamicCA {
+			tlsConfig.CertificateSource = api.TLSConfig_DYNAMIC_CA
+		} else if obj.TLSInfo.Spiffe {
+			tlsConfig.CertificateSource = api.TLSConfig_SPIFFE
+		}
+		if len(obj.TLSInfo.CaCert) > 0 {
+			tlsConfig.Root = obj.TLSInfo.CaCert
+		}
+		if obj.TLSInfo.IstioMutual {
+			tlsConfig.Root = nil
+			tlsConfig.MtlsMode = api.TLSConfig_STRICT
+		} else if obj.TLSInfo.IstioWorkloadCert {
+			tlsConfig.MtlsMode = api.TLSConfig_DISABLE
+		} else if obj.TLSInfo.Spiffe {
+			tlsConfig.MtlsMode = api.TLSConfig_STRICT
+		} else if obj.TLSInfo.MtlsFallbackEnabled {
+			tlsConfig.MtlsMode = api.TLSConfig_ALLOW_INSECURE_FALLBACK
+		}
+	}
+
+	switch obj.ParentInfo.Protocol {
+	case gwv1.HTTPProtocolType:
+		return api.Protocol_HTTP, nil, true
+	case gwv1.HTTPSProtocolType:
+		if tlsConfig == nil {
+			return api.Protocol_HTTPS, nil, false // TLS required but not configured
+		}
+		return api.Protocol_HTTPS, tlsConfig, true
+	case gwv1.TLSProtocolType:
+		if tlsConfig == nil {
+			if obj.ParentInfo.TLSPassthrough {
+				// For passthrough, we don't want TLS config
+				return api.Protocol_TLS, nil, true
+			} else {
+				// TLS required but not configured
+				return api.Protocol_TLS, nil, false
+			}
+		}
+		return api.Protocol_TLS, tlsConfig, true
+	case gwv1.TCPProtocolType:
+		return api.Protocol_TCP, nil, true
+	case gwv1.ProtocolType(protocol.HBONE):
+		return api.Protocol_HBONE, nil, true
+	default:
+		return api.Protocol_HTTP, nil, false // Unsupported protocol
+	}
+}
+
+// BindProtocol maps a Gateway listener protocol to the protocol of the bind it shares
+// with the other listeners on its port.
+func BindProtocol(p gwv1.ProtocolType) api.Bind_Protocol {
+	switch p {
+	case gwv1.HTTPProtocolType:
+		return api.Bind_HTTP
+	case gwv1.HTTPSProtocolType, gwv1.TLSProtocolType:
+		return api.Bind_TLS
+	case gwv1.TCPProtocolType:
+		return api.Bind_TCP
+	case gwv1.ProtocolType(protocol.HBONE):
+		// The bind protocol is not used for HBONE_GATEWAY in the data plane;
+		// the actual inner protocol is determined at runtime from the other
+		// listeners on the same port. Return HTTP as a placeholder.
+		return api.Bind_HTTP
+	default:
+		return api.Bind_HTTP
+	}
+}
+
+// TunnelProtocol maps a Gateway listener protocol to its tunnel protocol.
+// HBONE listeners use HBONE_GATEWAY mode: the proxy terminates inbound HBONE
+// and routes CONNECT requests to local binds.
+func TunnelProtocol(p gwv1.ProtocolType) api.Bind_TunnelProtocol {
+	switch p {
+	case gwv1.ProtocolType(protocol.HBONE):
+		return api.Bind_HBONE_GATEWAY
+	default:
+		return api.Bind_DIRECT
+	}
+}
+
 // dummyTls is a sentinel value to send to agentgateway to signal that it should reject TLS connects due to invalid config
 var dummyTls = &TLSInfo{
 	Cert: []byte("invalid"),
@@ -1227,27 +1456,6 @@ const (
 	gatewayTLSTerminateModeKey          = "gateway.istio.io/tls-terminate-mode"
 	agentgatewayTLSCertificateSourceKey = "agentgateway.dev/tls-certificate-source"
 )
-
-func validateTLS(certInfo *TLSInfo) *ConfigError {
-	if certInfo.IstioWorkloadCert {
-		return nil
-	}
-	if _, err := tls.X509KeyPair(certInfo.Cert, certInfo.Key); err != nil {
-		return &ConfigError{
-			Reason:  InvalidTLS,
-			Message: fmt.Sprintf("invalid certificate reference, the certificate is malformed: %v", err),
-		}
-	}
-	if certInfo.CaCert != nil {
-		if !x509.NewCertPool().AppendCertsFromPEM(certInfo.Cert) {
-			return &ConfigError{
-				Reason:  InvalidTLSCA,
-				Message: fmt.Sprintf("invalid CA certificate reference, the bundle is malformed"),
-			}
-		}
-	}
-	return nil
-}
 
 func updateError(statusErr *ConfigError, newErr *ConfigError) *ConfigError {
 	if statusErr == nil {
@@ -1263,6 +1471,7 @@ func bundleCaCertificates(
 	ctx krt.HandlerContext,
 	secrets krt.Collection[*corev1.Secret],
 	configMaps krt.Collection[*corev1.ConfigMap],
+	clusterTrustBundles krt.Collection[*certificatesv1.ClusterTrustBundle],
 	grants ReferenceGrants,
 	gw controllers.Object,
 	caCertRefs []gwv1.ObjectReference,
@@ -1273,7 +1482,7 @@ func bundleCaCertificates(
 	var statusErr *ConfigError
 
 	for _, ref := range caCertRefs {
-		cred, err := buildCaCertificateReference(ctx, ref, gw, configMaps, secrets)
+		cred, err := buildCaCertificateReference(ctx, ref, gw, configMaps, clusterTrustBundles, secrets)
 		if err != nil {
 			statusErr = updateError(statusErr, err)
 			continue
@@ -1288,7 +1497,14 @@ func bundleCaCertificates(
 		}
 
 		sameNamespace := cred.Source.Namespace == namespace
-		if !sameNamespace && !grants.SecretAllowed(ctx, GvkFromObject(gw), cred.Source, namespace) {
+		if !sameNamespace && !grants.referenceAllowed(
+			ctx,
+			GvkFromObject(gw).GroupKind(),
+			gwv1.Namespace(namespace),
+			NormalizeReference(&ref.Group, &ref.Kind, schema.GroupKind{}),
+			gwv1.Namespace(cred.Source.Namespace),
+			cred.Source.Name,
+		) {
 			statusErr = updateError(statusErr, &ConfigError{
 				Reason: InvalidListenerRefNotPermitted,
 				Message: fmt.Sprintf(
@@ -1311,6 +1527,7 @@ func buildTLS(
 	ctx krt.HandlerContext,
 	secrets krt.Collection[*corev1.Secret],
 	configMaps krt.Collection[*corev1.ConfigMap],
+	clusterTrustBundles krt.Collection[*certificatesv1.ClusterTrustBundle],
 	grants ReferenceGrants,
 	gatewayTLS *gwv1.TLSConfig,
 	tls *gwv1.ListenerTLSConfig,
@@ -1327,7 +1544,27 @@ func buildTLS(
 	switch mode {
 	case gwv1.TLSModeTerminate:
 		if tls.Options != nil {
-			switch tls.Options[gatewayTLSTerminateModeKey] {
+			terminateMode := tls.Options[gatewayTLSTerminateModeKey]
+			if tls.Options[agentgatewayTLSCertificateSourceKey] == "SPIFFE" {
+				if terminateMode != "" {
+					return dummyTls, &ConfigError{
+						Reason:  InvalidTLS,
+						Message: fmt.Sprintf("TLS certificate source SPIFFE cannot be combined with the %s termination mode", terminateMode),
+					}
+				} else if gatewayTLS != nil && gatewayTLS.Validation != nil && len(gatewayTLS.Validation.CACertificateRefs) > 0 {
+					return dummyTls, &ConfigError{
+						Reason:  InvalidTLSCA,
+						Message: "GatewayTLSConfig validation caCertificateRefs cannot be configured with SPIFFE TLS certificate source",
+					}
+				} else if len(tls.CertificateRefs) > 0 {
+					return dummyTls, &ConfigError{
+						Reason:  InvalidTLS,
+						Message: "certificateRefs cannot be configured with SPIFFE TLS certificate source",
+					}
+				}
+				return &TLSInfo{Spiffe: true}, nil
+			}
+			switch terminateMode {
 			case "ISTIO_SIMPLE":
 				return &TLSInfo{IstioWorkloadCert: true}, nil
 			case "ISTIO_MUTUAL":
@@ -1340,21 +1577,25 @@ func buildTLS(
 			// This is required in the API, should be rejected in validation
 			return dummyTls, &ConfigError{Reason: InvalidTLS, Message: "exactly 1 certificateRefs should be present for TLS termination"}
 		}
-		tlsRes, err := buildSecretReference(ctx, tls.CertificateRefs[0], gw, secrets)
-		if err != nil {
-			return dummyTls, err
+		secretRef := types.NamespacedName{
+			Name:      string(tls.CertificateRefs[0].Name),
+			Namespace: ptr.OrDefault((*string)(tls.CertificateRefs[0].Namespace), namespace),
 		}
 		// If we are going to send a cert, validate we can access it
-		sameNamespace := tlsRes.Source.Namespace == namespace
+		sameNamespace := secretRef.Namespace == namespace
 		objectKind := GvkFromObject(gw)
-		if !sameNamespace && !grants.SecretAllowed(ctx, objectKind, tlsRes.Source, namespace) {
+		if !sameNamespace && !grants.SecretAllowed(ctx, objectKind, secretRef, namespace) {
 			return dummyTls, &ConfigError{
 				Reason: InvalidListenerRefNotPermitted,
 				Message: fmt.Sprintf(
 					"certificateRef %v/%v not accessible to a Gateway in namespace %q (missing a ReferenceGrant?)",
-					tls.CertificateRefs[0].Name, tlsRes.Source.Namespace, namespace,
+					tls.CertificateRefs[0].Name, secretRef.Namespace, namespace,
 				),
 			}
+		}
+		tlsRes, err := buildSecretReference(ctx, tls.CertificateRefs[0], gw, secrets)
+		if err != nil {
+			return dummyTls, err
 		}
 
 		dynamicCA := tls.Options != nil && tls.Options[agentgatewayTLSCertificateSourceKey] == "DYNAMIC_CA"
@@ -1367,7 +1608,7 @@ func buildTLS(
 
 		if gatewayTLS != nil && gatewayTLS.Validation != nil && len(gatewayTLS.Validation.CACertificateRefs) > 0 {
 			// TODO: add 'Mode'
-			caBundle, err := bundleCaCertificates(ctx, secrets, configMaps, grants, gw, gatewayTLS.Validation.CACertificateRefs)
+			caBundle, err := bundleCaCertificates(ctx, secrets, configMaps, clusterTrustBundles, grants, gw, gatewayTLS.Validation.CACertificateRefs)
 			if caBundle == nil && err != nil {
 				return dummyTls, err
 			}
@@ -1424,6 +1665,7 @@ func buildCaCertificateReference(
 	ref gwv1.ObjectReference,
 	gw controllers.Object,
 	configMaps krt.Collection[*corev1.ConfigMap],
+	clusterTrustBundles krt.Collection[*certificatesv1.ClusterTrustBundle],
 	secrets krt.Collection[*corev1.Secret],
 ) (*SecretReference, *ConfigError) {
 	namespace := ptr.OrDefault((*string)(ref.Namespace), gw.GetNamespace())
@@ -1471,10 +1713,28 @@ func buildCaCertificateReference(
 			}
 		}
 		res.Info.CaCert = certInfo.Cert
+	case wellknown.ClusterTrustBundleGVK.GroupKind():
+		if clusterTrustBundles == nil {
+			return nil, &ConfigError{
+				Reason:  InvalidTLSCAKind,
+				Message: fmt.Sprintf("invalid CA certificate reference %v, the cluster does not serve the ClusterTrustBundle API", plainObjectReferenceString(ref)),
+			}
+		}
+		// ClusterTrustBundles are cluster scoped; keep the Gateway namespace so no ReferenceGrant is required.
+		res.Kind = wellknown.ClusterTrustBundleGVK.Kind
+		res.Source.Namespace = gw.GetNamespace()
+		bundle := ptr.Flatten(krt.FetchOne(ctx, clusterTrustBundles, krt.FilterKey(name)))
+		if bundle == nil {
+			return nil, &ConfigError{
+				Reason:  InvalidTLSCA,
+				Message: fmt.Sprintf("invalid CA certificate reference, clustertrustbundle %v not found", name),
+			}
+		}
+		res.Info.CaCert = []byte(bundle.Spec.TrustBundle)
 	default:
 		return nil, &ConfigError{
 			Reason:  InvalidTLSCAKind,
-			Message: fmt.Sprintf("invalid CA certificate reference %v, only secret and configmap are allowed", plainObjectReferenceString(ref)),
+			Message: fmt.Sprintf("invalid CA certificate reference %v, only secret, configmap, and clustertrustbundle are allowed", plainObjectReferenceString(ref)),
 		}
 	}
 
@@ -1638,7 +1898,7 @@ func GetCommonRouteInfo(spec any) ([]gwv1.ParentReference, []gwv1.Hostname, sche
 	case *gwv1.GRPCRoute:
 		return t.Spec.ParentRefs, t.Spec.Hostnames, wellknown.GRPCRouteGVK
 	case *agentgateway.AgentgatewayModel:
-		return t.Spec.ParentRefs, nil, wellknown.AgentgatewayModelGVK
+		return t.Spec.ParentRefs, nil, modelGVK(t)
 	default:
 		log.Fatalf("unknown type %T", t)
 		return nil, nil, schema.GroupVersionKind{}

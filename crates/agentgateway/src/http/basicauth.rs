@@ -3,8 +3,8 @@ use htpasswd_verify_fork::Htpasswd;
 
 use crate::http::Request;
 use crate::http::auth::AuthorizationLocation;
+use crate::proxy::ProxyError;
 use crate::proxy::dtrace::{self};
-use crate::proxy::{ProxyError, ProxyResponse};
 use crate::{apply, *};
 
 #[cfg(test)]
@@ -14,10 +14,28 @@ mod tests;
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
 	#[error("no basic authentication credentials found")]
-	Missing { realm: String },
+	Missing { realm: String, proxy: bool },
 
 	#[error("invalid credentials")]
-	InvalidCredentials { realm: String },
+	InvalidCredentials { realm: String, proxy: bool },
+}
+
+impl Error {
+	pub fn realm(&self) -> &str {
+		match self {
+			Error::Missing { realm, .. } => realm,
+			Error::InvalidCredentials { realm, .. } => realm,
+		}
+	}
+
+	/// Whether the credentials were addressed to the gateway acting as a forward proxy, which
+	/// requires a `407` + `Proxy-Authenticate` challenge instead of `401` + `WWW-Authenticate`.
+	pub fn is_proxy(&self) -> bool {
+		match self {
+			Error::Missing { proxy, .. } => *proxy,
+			Error::InvalidCredentials { proxy, .. } => *proxy,
+		}
+	}
 }
 
 /// Validation mode for Basic Auth.
@@ -67,7 +85,7 @@ fn default_realm() -> String {
 const TRACE_POLICY_KIND: &str = "basic_auth";
 
 impl BasicAuthentication {
-	/// Create a new BasicAuthentication from a file path
+	/// Create a new BasicAuthentication from htpasswd contents
 	pub fn new(
 		htpasswd: &str,
 		realm: Option<String>,
@@ -85,6 +103,7 @@ impl BasicAuthentication {
 	}
 
 	async fn verify(&self, req: &mut Request) -> Result<Option<Claims>, ProxyError> {
+		let proxy = self.authorization_location.is_proxy_header();
 		let Some(encoded_credentials) = self.authorization_location.extract(req) else {
 			// In strict mode, we require credentials
 			if self.mode == Mode::Strict {
@@ -95,6 +114,7 @@ impl BasicAuthentication {
 				);
 				return Err(ProxyError::BasicAuthenticationFailure(Error::Missing {
 					realm: self.realm.clone().unwrap_or_else(default_realm),
+					proxy,
 				}));
 			}
 			// Otherwise without credentials, don't attempt to authenticate
@@ -109,6 +129,7 @@ impl BasicAuthentication {
 		let invalid_credentials = || {
 			ProxyError::BasicAuthenticationFailure(Error::InvalidCredentials {
 				realm: self.realm.clone().unwrap_or_else(default_realm),
+				proxy,
 			})
 		};
 		let (username, password) = base64::engine::general_purpose::STANDARD
@@ -152,13 +173,10 @@ impl crate::store::RequestPolicyTrait for BasicAuthentication {
 		_client: &crate::proxy::httpproxy::PolicyClient,
 		_log: &mut crate::telemetry::log::RequestLog,
 		req: &mut Request,
-	) -> Result<crate::http::PolicyResponse, ProxyResponse> {
-		let res = self.verify(req).await.map_err(ProxyResponse::from)?;
+	) -> Result<crate::http::PolicyResponse, ProxyError> {
+		let res = self.verify(req).await?;
 		if let Some(claims) = res {
-			self
-				.authorization_location
-				.remove(req)
-				.map_err(ProxyResponse::from)?;
+			self.authorization_location.remove(req)?;
 			// Insert the claims into extensions so we can reference it later
 			req.extensions_mut().insert(claims);
 		}
@@ -199,9 +217,12 @@ pub struct LocalBasicAuth {
 }
 
 impl LocalBasicAuth {
-	pub fn try_into(self) -> anyhow::Result<BasicAuthentication> {
+	pub async fn try_into(
+		self,
+		resources: &crate::resource_manager::ResourceFetcher,
+	) -> anyhow::Result<BasicAuthentication> {
 		Ok(BasicAuthentication::new(
-			&self.htpasswd.load()?,
+			&crate::serdes::load_file_or_inline(&self.htpasswd, resources).await?,
 			self.realm,
 			self.mode,
 			self.authorization_location,

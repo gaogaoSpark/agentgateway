@@ -67,12 +67,9 @@ impl<'a, 'vars: 'a, 'rf> FunctionContext<'vars, 'rf> {
 	}
 	pub fn this_or_arg<T: FromValue<'a>>(&self) -> Result<T> {
 		match self.this() {
-			Ok(val) => Ok(val),
-			Err(_e) => self.arg(0),
+			Err(ExecutionError::MissingArgumentOrTarget) => self.arg(0),
+			other => other,
 		}
-	}
-	pub fn this_value(&self) -> Result<Value<'a>> {
-		self.this::<Value>().map(|v| v.always_materialize_owned())
 	}
 	pub fn this_or_arg_value(&self) -> Result<Value<'a>> {
 		self
@@ -881,6 +878,10 @@ mod tests {
 		[
 			("starts with true", "'foobar'.startsWith('foo') == true"),
 			("starts with false", "'foobar'.startsWith('bar') == false"),
+			(
+				"global starts with false",
+				"startsWith('foobar', 'bar') == false",
+			),
 		]
 		.iter()
 		.for_each(assert_script);
@@ -891,6 +892,10 @@ mod tests {
 		[
 			("ends with true", "'foobar'.endsWith('bar') == true"),
 			("ends with false", "'foobar'.endsWith('foo') == false"),
+			(
+				"global ends with false",
+				"endsWith('foobar', 'foo') == false",
+			),
 		]
 		.iter()
 		.for_each(assert_script);
@@ -1105,6 +1110,8 @@ mod tests {
 			("map", "{1: true, 2: true, 3: true}.contains(3) == true"),
 			("string", "'foobar'.contains('bar') == true"),
 			("bytes", "b'foobar'.contains(b'o') == true"),
+			("global string", "contains('foobar', 'zzz') == false"),
+			("global list", "contains([1, 2, 3], 4) == false"),
 		];
 
 		for (name, script) in tests {
@@ -1113,9 +1120,31 @@ mod tests {
 	}
 
 	#[test]
+	fn test_wrong_typed_receiver_does_not_fall_back() {
+		for script in [
+			"[1, 2].startsWith('zzz')",
+			"[1, 2].endsWith('zzz')",
+			"[1, 2].matches('zzz')",
+			"{'k': 1}.startsWith('zzz')",
+			"[1, 2].getFullYear()",
+		] {
+			assert!(
+				test_script(script, None).is_err(),
+				"{script} must not substitute its argument for the receiver"
+			);
+		}
+
+		assert_script(&(
+			"bare call still falls back for a typed receiver",
+			"getFullYear(timestamp('2023-05-29T00:00:00Z')) == 2023",
+		));
+	}
+
+	#[test]
 	fn test_matches() {
 		let tests = vec![
 			("string", "'foobar'.matches('^[a-zA-Z]*$') == true"),
+			("global string", "matches('foobar', '^z') == false"),
 			(
 				"map",
 				"{'1': 'abc', '2': 'def', '3': 'ghi'}.all(key, key.matches('^[a-zA-Z]*$')) == false",

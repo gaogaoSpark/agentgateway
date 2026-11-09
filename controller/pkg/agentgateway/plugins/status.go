@@ -5,10 +5,11 @@ import (
 
 	"istio.io/istio/pilot/pkg/model/kstatus"
 	"istio.io/istio/pkg/maps"
-	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/agentgateway/agentgateway/controller/pkg/reports"
 )
 
 type Condition struct {
@@ -76,7 +77,7 @@ func MergeAncestors(controllerName string, existing []gwv1.PolicyAncestorStatus,
 		trimmed = append(trimmed, existing[lastOwned+1:16]...)
 		trimmed = append(trimmed, gwv1.PolicyAncestorStatus{
 			AncestorRef: gwv1.ParentReference{
-				Group: ptr.Of(gwv1.Group("agentgateway.dev")),
+				Group: new(gwv1.Group("agentgateway.dev")),
 				Name:  "StatusSummary",
 			},
 			ControllerName: gwv1.GatewayController(controllerName),
@@ -94,13 +95,10 @@ func MergeAncestors(controllerName string, existing []gwv1.PolicyAncestorStatus,
 	return existing
 }
 
+// ParentRefEquals treats omitted and defaulted group and kind as equal, since the API server defaults them on
+// write and a stored ref must still match the one the translator builds.
 func ParentRefEquals(a, b gwv1.ParentReference) bool {
-	return ptr.Equal(a.Group, b.Group) &&
-		ptr.Equal(a.Kind, b.Kind) &&
-		a.Name == b.Name &&
-		ptr.Equal(a.Namespace, b.Namespace) &&
-		ptr.Equal(a.SectionName, b.SectionName) &&
-		ptr.Equal(a.Port, b.Port)
+	return reports.CompareParentReference(a, b) == 0
 }
 
 func SetAncestorStatus(
@@ -116,6 +114,7 @@ func SetAncestorStatus(
 	var currentConds []metav1.Condition
 	if currentAncestor != nil {
 		currentConds = currentAncestor.Conditions
+		pr = currentAncestor.AncestorRef
 	}
 	return gwv1.PolicyAncestorStatus{
 		AncestorRef:    pr,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"reflect"
 	"strings"
 
 	networkingclient "istio.io/client-go/pkg/apis/networking/v1"
@@ -117,7 +118,19 @@ func isDelegatedChildHTTPRoute(obj *gwv1.HTTPRoute) bool {
 	}
 	return false
 }
-func childAllowsParent(obj *gwv1.HTTPRoute, parentRef resolvedBinding) bool {
+func childAllowsParent(
+	krtctx krt.HandlerContext,
+	obj *gwv1.HTTPRoute,
+	parentRef resolvedBinding,
+	grants ReferenceGrants,
+	grantMode apisettings.BackendRefGrantMode,
+) bool {
+	if len(obj.Spec.ParentRefs) == 0 {
+		if obj.Namespace == parentRef.Parent.Namespace || !grantMode.RequireRouteBackendGrant() {
+			return true
+		}
+		return grants.ParentlessHTTPRouteAllowed(krtctx, parentRef.Parent.Namespace, config.NamespacedName(obj))
+	}
 	allowedParents := slices.MapFilter(obj.Spec.ParentRefs, func(ref gwv1.ParentReference) *types.NamespacedName {
 		if NormalizeReference(ref.Group, ref.Kind, wellknown.GatewayGVK.GroupKind()) != wellknown.HTTPRouteGVK.GroupKind() {
 			return nil
@@ -127,9 +140,6 @@ func childAllowsParent(obj *gwv1.HTTPRoute, parentRef resolvedBinding) bool {
 			Name:      string(ref.Name),
 		})
 	})
-	if len(allowedParents) == 0 {
-		return true
-	}
 	return slices.Contains(allowedParents, parentRef.Parent)
 }
 
@@ -181,7 +191,7 @@ func buildHTTPRouteGroupBindings(
 	// TODO: this can only get 1 layer. If we have multiple levels we will not have a binding since there is no parent.
 	raw := krt.NewManyCollection(httpRouteCol, func(krtctx krt.HandlerContext, obj *gwv1.HTTPRoute) []routeGroupBindingKey {
 		ctx := inputs.WithCtx(krtctx)
-		parentRefs := extractParentReferenceInfo(ctx, inputs.RouteParents, obj)
+		parentRefs := extractParentReferenceInfo(ctx, obj)
 		allowedParents := FilteredReferences(parentRefs)
 		bindings := make([]routeGroupBindingKey, 0)
 		seen := sets.New[string]()
@@ -232,9 +242,10 @@ func buildDelegatedHTTPRoutes(
 	})
 	findMatchingBindings := func(krtctx krt.HandlerContext, obj *gwv1.HTTPRoute) []routeGroupBindingKey {
 		candidates := krt.Fetch(krtctx, bindings, krt.FilterIndex(bindingsByNamespace, obj.Namespace))
-		return slices.Filter(candidates, func(binding routeGroupBindingKey) bool {
+		matched := slices.Filter(candidates, func(binding routeGroupBindingKey) bool {
 			return routeMatchesRouteGroup(obj, binding)
 		})
+		return slices.SortBy(matched, routeGroupBindingKey.String)
 	}
 	var resolveGateways func(krtctx krt.HandlerContext, binding routeGroupBindingKey, seen sets.Set[string]) []types.NamespacedName
 	resolveGateways = func(krtctx krt.HandlerContext, binding routeGroupBindingKey, seen sets.Set[string]) []types.NamespacedName {
@@ -250,6 +261,9 @@ func buildDelegatedHTTPRoutes(
 		}
 		gateways := sets.New[types.NamespacedName]()
 		for _, parentBinding := range findMatchingBindings(krtctx, sourceRoute) {
+			if !childAllowsParent(krtctx, sourceRoute, resolvedBinding{Parent: parentBinding.Source}, inputs.Grants, inputs.BackendRefGrantMode) {
+				continue
+			}
 			gateways.InsertAll(resolveGateways(krtctx, parentBinding, seen.Copy())...)
 		}
 		return slices.SortBy(gateways.UnsortedList(), types.NamespacedName.String)
@@ -290,7 +304,7 @@ func buildDelegatedHTTPRoutes(
 		ctx := inputs.WithCtx(krtctx)
 		var resources []agwir.AgwResource
 		for _, binding := range matchingBindings(krtctx, obj) {
-			if !childAllowsParent(obj, binding) {
+			if !childAllowsParent(krtctx, obj, binding, inputs.Grants, inputs.BackendRefGrantMode) {
 				continue
 			}
 			for n, rule := range obj.Spec.Rules {
@@ -319,16 +333,15 @@ func buildDelegatedHTTPRoutes(
 		if !isDelegatedChildHTTPRoute(obj) {
 			return nil
 		}
+		ctx := inputs.WithCtx(krtctx)
 		source := utils.TypedNamespacedName{
-			NamespacedName: types.NamespacedName{
-				Namespace: obj.Namespace,
-				Name:      obj.Name,
-			},
-			Kind: wellknown.HTTPRouteKind,
+			Namespace: obj.Namespace,
+			Name:      obj.Name,
+			Kind:      wellknown.HTTPRouteKind,
 		}
 		gateways := sets.New[types.NamespacedName]()
 		for _, binding := range matchingBindings(krtctx, obj) {
-			if !childAllowsParent(obj, binding) {
+			if !childAllowsParent(krtctx, obj, binding, inputs.Grants, inputs.BackendRefGrantMode) {
 				continue
 			}
 			gateways.Insert(binding.Gateway)
@@ -343,12 +356,13 @@ func buildDelegatedHTTPRoutes(
 				if ref == wellknown.HTTPRouteGVK.GroupKind() {
 					continue
 				}
+				if !ancestorBackendAllowed(ctx, wellknown.HTTPRouteGVK, obj.Namespace, ref, refNs, refName) {
+					continue
+				}
 				backends.Insert(utils.TypedNamespacedName{
-					NamespacedName: types.NamespacedName{
-						Namespace: defaultString(refNs, obj.Namespace),
-						Name:      string(refName),
-					},
-					Kind: ref.Kind,
+					Namespace: defaultString(refNs, obj.Namespace),
+					Name:      string(refName),
+					Kind:      ref.Kind,
 				})
 			}
 		}
@@ -453,7 +467,43 @@ func AgwRouteCollection(
 			route := obj.Spec
 			return ctx, func(yield func(AgwRoute, *reporter.RouteCondition) bool) {
 				for n, r := range route.Rules {
-					res, err := ConvertHTTPRouteToAgw(ctx, r, obj, n)
+					routerKey, modelServing, modelServingErr := modelServingRuleRouterKey(obj.Namespace, obj.Name, n, r, ctx.isModelKind)
+					if modelServing && modelServingErr == nil && modelServingRuleMatchesRoot(r) {
+						if conflicts := rootModelRouteDirectListenerConflicts(ctx, obj); len(conflicts) > 0 {
+							yield(AgwRoute{}, &reporter.RouteCondition{
+								Type:    gwv1.RouteConditionResolvedRefs,
+								Status:  metav1.ConditionFalse,
+								Reason:  "ModelRoutingConflict",
+								Message: rootModelRouteConflictMessage(conflicts),
+							})
+							return
+						}
+					}
+					conversionRule := r
+					if modelServing {
+						// AgentgatewayModel is a selector, not a conventional backend.
+						conversionRule.BackendRefs = nil
+					}
+					res, err := ConvertHTTPRouteToAgw(ctx, conversionRule, obj, n)
+					if modelServingErr != nil {
+						err = &reporter.RouteCondition{
+							Type:    gwv1.RouteConditionResolvedRefs,
+							Status:  metav1.ConditionFalse,
+							Reason:  gwv1.RouteReasonInvalidKind,
+							Message: modelServingErr.Error(),
+						}
+					}
+					if res != nil && modelServing && modelServingErr == nil {
+						res.Backends = []*api.RouteBackend{{
+							Backend: backendRef(routerKey),
+							Weight:  1,
+						}}
+						res.TrafficPolicies = append(res.TrafficPolicies, &api.TrafficPolicySpec{
+							Kind: &api.TrafficPolicySpec_UrlRewrite{UrlRewrite: &api.UrlRewrite{
+								Path: &api.UrlRewrite_Prefix{Prefix: ""},
+							}},
+						})
+					}
 					if !yield(AgwRoute{Route: res}, err) {
 						return
 					}
@@ -467,6 +517,26 @@ func AgwRouteCollection(
 		},
 	)
 	status.RegisterStatus(queue, httpRouteStatus, GetStatus)
+	modelRouters := krt.NewManyCollection(httpRoutes, func(_ krt.HandlerContext, obj agwir.AgwResource) []agwir.AgwResource {
+		route := obj.Resource.GetRoute()
+		if route == nil || len(route.Backends) != 1 {
+			return nil
+		}
+		routerKey := route.Backends[0].GetBackend().GetBackend()
+		if !strings.HasPrefix(routerKey, "/llm:router:httproute:") {
+			return nil
+		}
+		return []agwir.AgwResource{{
+			Gateway: obj.Gateway,
+			Resource: &api.Resource{Kind: &api.Resource_Backend{Backend: &api.Backend{
+				Key:  route.Key,
+				Name: &api.ResourceName{Name: route.Name.GetName(), Namespace: route.Name.GetNamespace()},
+				Kind: &api.Backend_ModelRouter{ModelRouter: &api.ModelRouterBackend{
+					RouterKey: routerKey,
+				}},
+			}}},
+		}}
+	}, krtopts.ToOptions("translator/ModelRouters")...)
 	delegatedHTTPRoutes, delegatedHTTPAncestors := buildDelegatedHTTPRoutes(httpRouteCol, httpRouteGroupBindings, inputs, krtopts)
 
 	grpcRouteStatus, grpcRoutes := createRouteCollectionGeneric(grpcRouteCol, inputs, krtopts, "translator/GRPCRoutes",
@@ -523,6 +593,7 @@ func AgwRouteCollection(
 	routes := krt.JoinCollection(
 		[]krt.Collection[agwir.AgwResource]{
 			httpRoutes,
+			modelRouters,
 			delegatedHTTPRoutes,
 			grpcRoutes,
 			tcpRoutes,
@@ -542,26 +613,26 @@ func AgwRouteCollection(
 	ancestorBackends := krt.JoinCollection([]krt.Collection[*utils.AncestorBackend]{
 		krt.NewManyCollection(httpRouteCol, func(krtctx krt.HandlerContext, obj *gwv1.HTTPRoute) []*utils.AncestorBackend {
 			ctx := inputs.WithCtx(krtctx)
-			return extractAncestorBackends(ctx, obj, "HTTPRoute", obj.Spec.Rules, func(r gwv1.HTTPRouteRule) []gwv1.HTTPBackendRef {
+			return extractAncestorBackends(ctx, obj, wellknown.HTTPRouteGVK, obj.Spec.Rules, func(r gwv1.HTTPRouteRule) []gwv1.HTTPBackendRef {
 				return r.BackendRefs
 			})
 		}, krtopts.ToOptions("translator/HTTPAncestors")...),
 		delegatedHTTPAncestors,
 		krt.NewManyCollection(grpcRouteCol, func(krtctx krt.HandlerContext, obj *gwv1.GRPCRoute) []*utils.AncestorBackend {
 			ctx := inputs.WithCtx(krtctx)
-			return extractAncestorBackends(ctx, obj, "GRPCRoute", obj.Spec.Rules, func(r gwv1.GRPCRouteRule) []gwv1.GRPCBackendRef {
+			return extractAncestorBackends(ctx, obj, wellknown.GRPCRouteGVK, obj.Spec.Rules, func(r gwv1.GRPCRouteRule) []gwv1.GRPCBackendRef {
 				return r.BackendRefs
 			})
 		}, krtopts.ToOptions("translator/GRPCAncestors")...),
 		krt.NewManyCollection(tlsRouteCol, func(krtctx krt.HandlerContext, obj *gwv1.TLSRoute) []*utils.AncestorBackend {
 			ctx := inputs.WithCtx(krtctx)
-			return extractAncestorBackends(ctx, obj, "TLSRoute", obj.Spec.Rules, func(r gwv1.TLSRouteRule) []gwv1.BackendRef {
+			return extractAncestorBackends(ctx, obj, wellknown.TLSRouteGVK, obj.Spec.Rules, func(r gwv1.TLSRouteRule) []gwv1.BackendRef {
 				return r.BackendRefs
 			})
 		}, krtopts.ToOptions("translator/TLSAncestors")...),
 		krt.NewManyCollection(tcpRouteCol, func(krtctx krt.HandlerContext, obj *gwv1.TCPRoute) []*utils.AncestorBackend {
 			ctx := inputs.WithCtx(krtctx)
-			return extractAncestorBackends(ctx, obj, "TCPRoute", obj.Spec.Rules, func(r gwv1.TCPRouteRule) []gwv1.BackendRef {
+			return extractAncestorBackends(ctx, obj, wellknown.TCPRouteGVK, obj.Spec.Rules, func(r gwv1.TCPRouteRule) []gwv1.BackendRef {
 				return r.BackendRefs
 			})
 		}, krtopts.ToOptions("translator/TCPAncestors")...),
@@ -926,7 +997,7 @@ func computeRoute[T controllers.Object, O comparable](ctx RouteContext, obj T, t
 	obj T,
 ) iter.Seq2[O, *reporter.RouteCondition],
 ) ([]RouteParentReference, ConversionResult[O]) {
-	parentRefs := extractParentReferenceInfo(ctx, ctx.RouteParents, obj)
+	parentRefs := extractParentReferenceInfo(ctx, obj)
 
 	convertRules := func() ConversionResult[O] {
 		res := ConversionResult[O]{}
@@ -969,10 +1040,67 @@ type RouteContextInputs struct {
 	ServiceEntries      krt.Collection[*networkingclient.ServiceEntry]
 	Backends            krt.Collection[*agentgateway.AgentgatewayBackend]
 	Models              krt.Collection[*agentgateway.AgentgatewayModel]
-	ModelsByNamespace   krt.Index[string, *agentgateway.AgentgatewayModel]
 	References          plugins.ReferenceTypes
 	ControllerName      string
 	BackendRefGrantMode apisettings.BackendRefGrantMode
+
+	// ParentRefs holds the resolved parent references of each route and model. Build it with RouteParentRefsCollection.
+	ParentRefs krt.Collection[RouteParentRefs]
+}
+
+// RouteParentRefsCollection resolves the parent references of each route and model, so the many collections
+// that need them resolve them once.
+func RouteParentRefsCollection(
+	inputs RouteContextInputs,
+	httpRouteCol krt.Collection[*gwv1.HTTPRoute],
+	grpcRouteCol krt.Collection[*gwv1.GRPCRoute],
+	tcpRouteCol krt.Collection[*gwv1.TCPRoute],
+	tlsRouteCol krt.Collection[*gwv1.TLSRoute],
+	models krt.Collection[*agentgateway.AgentgatewayModel],
+	krtopts krtutil.KrtOptions,
+) krt.Collection[RouteParentRefs] {
+	collections := []krt.Collection[RouteParentRefs]{
+		routeParentRefsCollection(inputs, httpRouteCol, wellknown.HTTPRouteGVK, krtopts),
+		routeParentRefsCollection(inputs, grpcRouteCol, wellknown.GRPCRouteGVK, krtopts),
+		routeParentRefsCollection(inputs, tcpRouteCol, wellknown.TCPRouteGVK, krtopts),
+		routeParentRefsCollection(inputs, tlsRouteCol, wellknown.TLSRouteGVK, krtopts),
+		routeParentRefsCollection(inputs, models, wellknown.AgentgatewayModelGVK, krtopts),
+	}
+	if inputs.Collections != nil {
+		for _, source := range inputs.Collections.ModelSources {
+			collections = append(collections, routeParentRefsCollection(inputs, source.Models, source.GVK, krtopts))
+		}
+	}
+	return krt.JoinCollection(collections, krtopts.ToOptions("translator/RouteParentRefs")...)
+}
+
+// RouteParentRefs holds the resolved parent references of a route, so the many collections that
+// need them resolve them once.
+type RouteParentRefs struct {
+	Route utils.TypedNamespacedName
+	Refs  []RouteParentReference
+}
+
+func (r RouteParentRefs) ResourceName() string {
+	return r.Route.String()
+}
+
+func (r RouteParentRefs) Equals(other RouteParentRefs) bool {
+	return r.Route == other.Route && reflect.DeepEqual(r.Refs, other.Refs)
+}
+
+func routeParentRefsCollection[T controllers.Object](
+	inputs RouteContextInputs,
+	col krt.Collection[T],
+	kind schema.GroupVersionKind,
+	krtopts krtutil.KrtOptions,
+) krt.Collection[RouteParentRefs] {
+	return krt.NewCollection(col, func(krtctx krt.HandlerContext, obj T) *RouteParentRefs {
+		return &RouteParentRefs{
+			Route: utils.TypedNamespacedName{Kind: kind.Kind, NamespacedName: config.NamespacedName(obj)},
+			Refs:  resolveParentReferenceInfo(inputs.WithCtx(krtctx), inputs.RouteParents, obj),
+		}
+	}, krtopts.ToOptions("translator/"+kind.Kind+"ParentRefs")...)
 }
 
 func (i RouteContextInputs) WithCtx(krtctx krt.HandlerContext) RouteContext {
@@ -1015,25 +1143,21 @@ func gatewayRouteAttachmentCollection[T controllers.Object](
 			NamespacedName: config.NamespacedName(obj),
 		}
 
-		parentRefs := extractParentReferenceInfo(ctx, inputs.RouteParents, obj)
+		parentRefs := extractParentReferenceInfo(ctx, obj)
 		return slices.MapFilter(FilteredReferences(parentRefs), func(e RouteParentReference) **plugins.RouteAttachment {
-			if e.ParentKey.Kind == wellknown.ListenerSetGVK.Kind {
-				return new(&plugins.RouteAttachment{
-					From:         from,
-					To:           e.ParentKey,
-					Gateway:      e.ParentGateway,
-					ListenerName: string(e.ParentSection),
-				})
-			}
-			if e.ParentGateway.Name == "" {
+			parentKind := NormalizeReference(e.OriginalReference.Group, e.OriginalReference.Kind, wellknown.GatewayGVK.GroupKind())
+			if e.ParentGateway.Name == "" && parentKind != wellknown.ListenerSetGVK.GroupKind() {
 				return nil
 			}
+			parent := utils.TypedNamespacedName{Kind: wellknown.GatewayGVK.Kind, NamespacedName: e.ParentGateway}
+			switch parentKind {
+			case wellknown.GatewayGVK.GroupKind(), wellknown.ServiceGVK.GroupKind(), wellknown.ServiceEntryGVK.GroupKind():
+			default:
+				parent = e.ParentKey
+			}
 			return new(&plugins.RouteAttachment{
-				From: from,
-				To: utils.TypedNamespacedName{
-					Kind:           wellknown.GatewayGVK.Kind,
-					NamespacedName: e.ParentGateway,
-				},
+				From:         from,
+				To:           parent,
 				Gateway:      e.ParentGateway,
 				ListenerName: string(e.ParentSection),
 			})
@@ -1051,8 +1175,8 @@ func delegatedGatewayRouteAttachmentCountCollection(
 		//ctx := inputs.WithCtx(krtctx)
 		n := obj.Resource.GetRoute().GetName()
 		from := utils.TypedNamespacedName{
-			Kind:           wellknown.HTTPRouteKind,
-			NamespacedName: types.NamespacedName{Namespace: n.Namespace, Name: n.Name},
+			Kind:      wellknown.HTTPRouteKind,
+			Namespace: n.Namespace, Name: n.Name,
 		}
 		return []*plugins.RouteAttachment{{
 			From: from,
@@ -1066,31 +1190,30 @@ func delegatedGatewayRouteAttachmentCountCollection(
 	}, opts.ToOptions("translator/DelegatedHTTPRoute/count")...)
 }
 
-func extractAncestorBackends[T controllers.Object, RT, BT any](ctx RouteContext, obj T, kind string, rules []RT, extract func(RT) []BT) []*utils.AncestorBackend {
+func extractAncestorBackends[T controllers.Object, RT, BT any](ctx RouteContext, obj T, sourceGVK schema.GroupVersionKind, rules []RT, extract func(RT) []BT) []*utils.AncestorBackend {
 	source := utils.TypedNamespacedName{
-		NamespacedName: types.NamespacedName{
-			Namespace: obj.GetNamespace(),
-			Name:      obj.GetName(),
-		},
-		Kind: kind,
+		Namespace: obj.GetNamespace(),
+		Name:      obj.GetName(),
+		Kind:      sourceGVK.Kind,
 	}
 	gateways := sets.Set[types.NamespacedName]{}
-	for _, parent := range FilteredReferences(extractParentReferenceInfo(ctx, ctx.RouteParents, obj)) {
+	for _, parent := range FilteredReferences(extractParentReferenceInfo(ctx, obj)) {
 		gateways.Insert(parent.ParentGateway)
 	}
 	backends := sets.Set[utils.TypedNamespacedName]{}
 	for _, r := range rules {
 		for _, b := range extract(r) {
 			ref, refNs, refName := GetBackendRef(b)
-			if ref == wellknown.HTTPRouteGVK.GroupKind() {
+			if ref == wellknown.HTTPRouteGVK.GroupKind() || ctx.isModelKind(ref) {
+				continue
+			}
+			if !ancestorBackendAllowed(ctx, sourceGVK, obj.GetNamespace(), ref, refNs, refName) {
 				continue
 			}
 			be := utils.TypedNamespacedName{
-				NamespacedName: types.NamespacedName{
-					Namespace: defaultString(refNs, obj.GetNamespace()),
-					Name:      string(refName),
-				},
-				Kind: ref.Kind,
+				Namespace: defaultString(refNs, obj.GetNamespace()),
+				Name:      string(refName),
+				Kind:      ref.Kind,
 			}
 			backends.Insert(be)
 		}
@@ -1108,6 +1231,47 @@ func extractAncestorBackends[T controllers.Object, RT, BT any](ctx RouteContext,
 		}
 	}
 	return res
+}
+
+// ListenerFilterAncestorBackends returns the backends referenced by the filters of a Gateway's listeners, including
+// those attached through ListenerSets.
+func ListenerFilterAncestorBackends(ctx RouteContext, gateway types.NamespacedName, listeners []*GatewayListener) []*utils.AncestorBackend {
+	source := utils.TypedNamespacedName{NamespacedName: gateway, Kind: wellknown.GatewayGVK.Kind}
+	backends := sets.Set[utils.TypedNamespacedName]{}
+	for _, l := range listeners {
+		if l.Filters == nil {
+			continue
+		}
+		sourceGVK := wellknown.GatewayGVK
+		if l.ParentObject.Kind == wellknown.ListenerSetGVK.Kind {
+			sourceGVK = wellknown.ListenerSetGVK
+		}
+		for _, f := range l.Filters.Requests {
+			if f.ExternalAuth == nil {
+				continue
+			}
+			b := f.ExternalAuth.BackendRef
+			ref := NormalizeReference(b.Group, b.Kind, wellknown.ServiceGVK.GroupKind())
+			if !ancestorBackendAllowed(ctx, sourceGVK, l.ParentObject.Namespace, ref, b.Namespace, b.Name) {
+				continue
+			}
+			backends.Insert(utils.TypedNamespacedName{
+				Namespace: defaultString(b.Namespace, l.ParentObject.Namespace),
+				Name:      string(b.Name),
+				Kind:      ref.Kind,
+			})
+		}
+	}
+	return slices.Map(slices.SortBy(backends.UnsortedList(), utils.TypedNamespacedName.String), func(be utils.TypedNamespacedName) *utils.AncestorBackend {
+		return &utils.AncestorBackend{Gateway: gateway, Backend: be, Source: source}
+	})
+}
+
+func ancestorBackendAllowed(ctx RouteContext, sourceGVK schema.GroupVersionKind, sourceNamespace string, ref schema.GroupKind, refNamespace *gwv1.Namespace, refName gwv1.ObjectName) bool {
+	if refNamespace == nil || string(*refNamespace) == sourceNamespace {
+		return true
+	}
+	return ctx.Grants.BackendAllowed(ctx.Krt, sourceGVK, refName, *refNamespace, sourceNamespace, ref, ctx.BackendRefGrantMode)
 }
 
 func GetBackendRef[I any](spec I) (schema.GroupKind, *gwv1.Namespace, gwv1.ObjectName) {

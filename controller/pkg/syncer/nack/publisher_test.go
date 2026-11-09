@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -30,10 +29,8 @@ func TestPublisher_PublishNack(t *testing.T) {
 
 	// Ensure involved objects exist so UID lookups succeed
 	gw := &gwv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      testGateway.Name,
-			Namespace: testGateway.Namespace,
-		},
+		Name:      testGateway.Name,
+		Namespace: testGateway.Namespace,
 	}
 
 	fakeClient := fake.NewClient(t, gw)
@@ -46,14 +43,24 @@ func TestPublisher_PublishNack(t *testing.T) {
 
 	fakeClient.WaitForCacheSync("test-publisher", ctx.Done(), publisher.HasSynced)
 
-	publisher.PublishNack(&testNackEvent)
-
-	select {
-	case event := <-fakeRecorder.Events:
-		assert.Contains(t, event, "Warning")
-		assert.Contains(t, event, ReasonNack)
-		assert.Contains(t, event, testErrorMessage)
-	default:
-		t.Fatal("Expected event to be recorded but none was found")
+	for _, tt := range []struct {
+		name    string
+		reason  string
+		publish func()
+	}{
+		{name: "rejection", reason: ReasonNack, publish: func() { publisher.PublishNack(&testNackEvent) }},
+		{name: "warning", reason: "AgentGatewayConfigWarning", publish: func() { publisher.PublishWarning(testGateway, testErrorMessage) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.publish()
+			select {
+			case event := <-fakeRecorder.Events:
+				assert.Contains(t, event, "Warning")
+				assert.Contains(t, event, tt.reason)
+				assert.Contains(t, event, testErrorMessage)
+			default:
+				t.Fatal("Expected event to be recorded but none was found")
+			}
+		})
 	}
 }

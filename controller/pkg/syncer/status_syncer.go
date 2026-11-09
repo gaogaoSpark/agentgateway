@@ -18,9 +18,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	inf "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwxv1a1 "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
 	"github.com/agentgateway/agentgateway/controller/pkg/apiclient"
+	"github.com/agentgateway/agentgateway/controller/pkg/reports"
 	"github.com/agentgateway/agentgateway/controller/pkg/syncer/status"
 	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
@@ -43,6 +45,7 @@ type AgentGwStatusSyncer struct {
 
 	agentgatewayPolicies StatusSyncer[*agentgateway.AgentgatewayPolicy, gwv1.PolicyStatus]
 	agentgatewayBackends StatusSyncer[*agentgateway.AgentgatewayBackend, agentgateway.AgentgatewayBackendStatus]
+	agentgatewayModels   StatusSyncer[*agentgateway.AgentgatewayModel, *agentgateway.AgentgatewayModelStatus]
 
 	// Configuration
 	controllerName string
@@ -59,6 +62,7 @@ type AgentGwStatusSyncer struct {
 	tcpRoutes          StatusSyncer[*gwv1.TCPRoute, *gwv1.TCPRouteStatus]
 	tlsRoutes          StatusSyncer[*gwv1.TLSRoute, *gwv1.TLSRouteStatus]
 	backendTLSPolicies StatusSyncer[*gwv1.BackendTLSPolicy, gwv1.PolicyStatus]
+	xBackends          StatusSyncer[*gwxv1a1.XBackend, *gwxv1a1.BackendStatus]
 	inferencePools     StatusSyncer[*inf.InferencePool, inf.InferencePoolStatus]
 
 	extraAgwResourceStatusHandlers map[schema.GroupVersionKind]ResourceStatusSyncer
@@ -72,6 +76,7 @@ func NewAgwStatusSyncer(
 	cacheSyncs []cache.InformerSynced,
 	extraHandlers map[schema.GroupVersionKind]ResourceStatusSyncer,
 	enableInference bool,
+	enableXBackend bool,
 ) *AgentGwStatusSyncer {
 	f := kclient.Filter{ObjectFilter: client.ObjectFilter()}
 	syncer := &AgentGwStatusSyncer{
@@ -92,6 +97,17 @@ func NewAgwStatusSyncer(
 					Status: gwv1.PolicyStatus{
 						Ancestors: s.Ancestors,
 					},
+				}
+			},
+		},
+		agentgatewayModels: StatusSyncer[*agentgateway.AgentgatewayModel, *agentgateway.AgentgatewayModelStatus]{
+			Name:           "agentgatewayModel",
+			ControllerName: controllerName,
+			Client:         kclient.NewFilteredDelayed[*agentgateway.AgentgatewayModel](client, wellknown.AgentgatewayModelGVR, f),
+			Build: func(om metav1.ObjectMeta, s *agentgateway.AgentgatewayModelStatus) *agentgateway.AgentgatewayModel {
+				return &agentgateway.AgentgatewayModel{
+					ObjectMeta: om,
+					Status:     *s,
 				}
 			},
 		},
@@ -183,10 +199,21 @@ func NewAgwStatusSyncer(
 			},
 		},
 	}
+	if enableXBackend {
+		syncer.xBackends = StatusSyncer[*gwxv1a1.XBackend, *gwxv1a1.BackendStatus]{
+			Name:           "xBackend",
+			ControllerName: controllerName,
+			Client:         kclient.NewFilteredDelayed[*gwxv1a1.XBackend](client, wellknown.XBackendGVR, f),
+			Build: func(om metav1.ObjectMeta, s *gwxv1a1.BackendStatus) *gwxv1a1.XBackend {
+				return &gwxv1a1.XBackend{ObjectMeta: om, Status: *s}
+			},
+		}
+	}
 	if enableInference {
 		syncer.inferencePools = StatusSyncer[*inf.InferencePool, inf.InferencePoolStatus]{
-			Name:   "inferencePools",
-			Client: kclient.NewFilteredDelayed[*inf.InferencePool](client, wellknown.InferencePoolGVR, f),
+			Name:           "inferencePools",
+			ControllerName: controllerName,
+			Client:         kclient.NewFilteredDelayed[*inf.InferencePool](client, wellknown.InferencePoolGVR, f),
 			Build: func(om metav1.ObjectMeta, s inf.InferencePoolStatus) *inf.InferencePool {
 				return &inf.InferencePool{
 					ObjectMeta: om,
@@ -222,7 +249,15 @@ func (s *AgentGwStatusSyncer) Start(ctx context.Context) error {
 		s.backendTLSPolicies.Client.HasSynced,
 		s.agentgatewayBackends.Client.HasSynced,
 		s.agentgatewayPolicies.Client.HasSynced,
+		s.agentgatewayModels.Client.HasSynced,
 	)
+	if s.xBackends.Client != nil {
+		s.client.WaitForCacheSync(
+			"agent gateway status clients",
+			ctx.Done(),
+			s.xBackends.Client.HasSynced,
+		)
+	}
 	if s.inferencePools.Client != nil {
 		s.client.WaitForCacheSync(
 			"agent gateway status clients",
@@ -260,8 +295,14 @@ func (s *AgentGwStatusSyncer) SyncStatus(ctx context.Context, resource status.Re
 		s.agentgatewayPolicies.ApplyStatus(ctx, resource, statusObj)
 	case wellknown.AgentgatewayBackendGVK:
 		s.agentgatewayBackends.ApplyStatus(ctx, resource, statusObj)
+	case wellknown.AgentgatewayModelGVK:
+		s.agentgatewayModels.ApplyStatus(ctx, resource, statusObj)
 	case wellknown.BackendTLSPolicyGVK:
 		s.backendTLSPolicies.ApplyStatus(ctx, resource, statusObj)
+	case wellknown.XBackendGVK:
+		if s.xBackends.Client != nil {
+			s.xBackends.ApplyStatus(ctx, resource, statusObj)
+		}
 	case wellknown.InferencePoolGVK:
 		if s.inferencePools.Client != nil {
 			s.inferencePools.ApplyStatus(ctx, resource, statusObj)
@@ -369,6 +410,27 @@ func (s StatusSyncer[O, S]) ApplyStatus(ctx context.Context, obj status.Resource
 				merged.Parents = mergeRouteParentStatuses(s.ControllerName, cur.Status.Parents, desired.Parents)
 				mergedAny = &merged
 			}
+		case *agentgateway.AgentgatewayModelStatus:
+			cur, ok := any(current).(*agentgateway.AgentgatewayModel)
+			if ok {
+				merged := *desired
+				merged.Parents = mergeRouteParentStatuses(s.ControllerName, cur.Status.Parents, desired.Parents)
+				mergedAny = &merged
+			}
+		case inf.InferencePoolStatus:
+			cur, ok := any(current).(*inf.InferencePool)
+			if ok {
+				merged := desired
+				merged.Parents = mergeInferencePoolParentStatuses(s.ControllerName, cur.Status.Parents, desired.Parents)
+				mergedAny = merged
+			}
+		case *gwxv1a1.BackendStatus:
+			cur, ok := any(current).(*gwxv1a1.XBackend)
+			if ok {
+				merged := *desired
+				merged.Ancestors = mergeXBackendAncestorStatuses(s.ControllerName, cur.Status.Ancestors, desired.Ancestors)
+				mergedAny = &merged
+			}
 		}
 
 		merged, ok := mergedAny.(S)
@@ -379,18 +441,13 @@ func (s StatusSyncer[O, S]) ApplyStatus(ctx context.Context, obj status.Resource
 			return nil
 		}
 
-		// Prefer the latest resourceVersion to avoid avoidable conflicts.
-		// Conflicts are still handled (and expected), but using the latest RV reduces churn.
-		rv := obj.ResourceVersion
-		if crv := current.GetResourceVersion(); crv != "" {
-			rv = crv
-		}
+		rv := current.GetResourceVersion()
 
 		// Pass only the status and minimal part of ObjectMetadata to find the resource and validate it.
 		// Passing Spec is ignored by the API server but has costs.
 		// Passing ResourceVersion is important to ensure we are not writing stale data. The collection is responsible for
 		// re-enqueuing a resource if it ends up being rejected due to stale ResourceVersion.
-		_, err := s.Client.UpdateStatus(s.Build(metav1.ObjectMeta{
+		err := s.Client.UpdateStatusNoResponse(s.Build(metav1.ObjectMeta{
 			Name:            obj.Name,
 			Namespace:       obj.Namespace,
 			ResourceVersion: rv,
@@ -420,66 +477,50 @@ func (s StatusSyncer[O, S]) ApplyStatus(ctx context.Context, obj status.Resource
 	}
 }
 
+func mergeXBackendAncestorStatuses(ourControllerName string, existing, desired []gwxv1a1.BackendAncestorStatus) []gwxv1a1.BackendAncestorStatus {
+	return reports.MergeOwnedStatuses(existing, desired,
+		func(a gwxv1a1.BackendAncestorStatus) bool { return string(a.ControllerName) == ourControllerName },
+		func(a, b gwxv1a1.BackendAncestorStatus) bool {
+			return reports.CompareParentReference(a.AncestorRef, b.AncestorRef) == 0
+		},
+		func(a, b gwxv1a1.BackendAncestorStatus) int {
+			return reports.CompareParentReference(a.AncestorRef, b.AncestorRef)
+		},
+	)
+}
+
 func mergePolicyAncestorStatuses(ourControllerName string, existing []gwv1.PolicyAncestorStatus, desired []gwv1.PolicyAncestorStatus) []gwv1.PolicyAncestorStatus {
-	out := make([]gwv1.PolicyAncestorStatus, 0, len(existing)+len(desired))
-
-	// Preserve any entries not owned by our controller.
-	for _, a := range existing {
-		if string(a.ControllerName) != ourControllerName {
-			out = append(out, a)
-		}
-	}
-
-	// Only add entries owned by our controller from the desired status.
-	// This ensures we can clear stale entries by publishing an empty desired list.
-	ours := make([]gwv1.PolicyAncestorStatus, 0, len(desired))
-	for _, a := range desired {
-		if string(a.ControllerName) == ourControllerName {
-			ours = append(ours, a)
-		}
-	}
-
-	// Ensure stable ordering of our entries so status doesn't flap due to map/set iteration upstream.
-	slices.SortFunc(ours, func(a, b gwv1.PolicyAncestorStatus) int {
-		if c := cmp.Compare(string(a.ControllerName), string(b.ControllerName)); c != 0 {
-			return c
-		}
-		return compareParentReference(a.AncestorRef, b.AncestorRef)
-	})
-
-	out = append(out, ours...)
-	return out
+	return reports.MergeOwnedStatuses(existing, desired,
+		func(a gwv1.PolicyAncestorStatus) bool { return string(a.ControllerName) == ourControllerName },
+		func(a, b gwv1.PolicyAncestorStatus) bool {
+			return reports.CompareParentReference(a.AncestorRef, b.AncestorRef) == 0
+		},
+		func(a, b gwv1.PolicyAncestorStatus) int {
+			return reports.CompareParentReference(a.AncestorRef, b.AncestorRef)
+		},
+	)
 }
 
 func mergeRouteParentStatuses(ourControllerName string, existing []gwv1.RouteParentStatus, desired []gwv1.RouteParentStatus) []gwv1.RouteParentStatus {
-	out := make([]gwv1.RouteParentStatus, 0, len(existing)+len(desired))
+	return reports.MergeOwnedStatuses(existing, desired,
+		func(a gwv1.RouteParentStatus) bool { return string(a.ControllerName) == ourControllerName },
+		func(a, b gwv1.RouteParentStatus) bool {
+			return reports.CompareParentReference(a.ParentRef, b.ParentRef) == 0
+		},
+		func(a, b gwv1.RouteParentStatus) int { return reports.CompareParentReference(a.ParentRef, b.ParentRef) },
+	)
+}
 
-	// Preserve any entries not owned by our controller.
-	for _, a := range existing {
-		if string(a.ControllerName) != ourControllerName {
-			out = append(out, a)
-		}
-	}
-
-	// Only add entries owned by our controller from the desired status.
-	// This ensures we can clear stale entries by publishing an empty desired list.
-	ours := make([]gwv1.RouteParentStatus, 0, len(desired))
-	for _, a := range desired {
-		if string(a.ControllerName) == ourControllerName {
-			ours = append(ours, a)
-		}
-	}
-
-	// Ensure stable ordering of our entries so status doesn't flap due to map/set iteration upstream.
-	slices.SortFunc(ours, func(a, b gwv1.RouteParentStatus) int {
-		if c := cmp.Compare(string(a.ControllerName), string(b.ControllerName)); c != 0 {
-			return c
-		}
-		return compareParentReference(a.ParentRef, b.ParentRef)
-	})
-
-	out = append(out, ours...)
-	return out
+func mergeInferencePoolParentStatuses(ourControllerName string, existing []inf.ParentStatus, desired []inf.ParentStatus) []inf.ParentStatus {
+	return reports.MergeOwnedStatuses(existing, desired,
+		func(a inf.ParentStatus) bool { return string(a.ControllerName) == ourControllerName },
+		func(a, b inf.ParentStatus) bool {
+			return reports.CompareInferencePoolParentReference(a.ParentRef, b.ParentRef) == 0
+		},
+		func(a, b inf.ParentStatus) int {
+			return reports.CompareInferencePoolParentReference(a.ParentRef, b.ParentRef)
+		},
+	)
 }
 
 func mergeGatewayStatus(existing gwv1.GatewayStatus, desired gwv1.GatewayStatus) gwv1.GatewayStatus {
@@ -492,6 +533,7 @@ func mergeGatewayStatus(existing gwv1.GatewayStatus, desired gwv1.GatewayStatus)
 
 func mergeGatewayConditions(existing []metav1.Condition, desired []metav1.Condition) []metav1.Condition {
 	out := append([]metav1.Condition(nil), desired...)
+	preserveDeploymentFailedGatewayProgrammedCondition(&out, existing, desired)
 	existingAccepted := meta.FindStatusCondition(existing, string(gwv1.GatewayConditionAccepted))
 	desiredAccepted := meta.FindStatusCondition(desired, string(gwv1.GatewayConditionAccepted))
 	selectedAccepted := selectGatewayAcceptedCondition(existingAccepted, desiredAccepted)
@@ -506,6 +548,26 @@ func mergeGatewayConditions(existing []metav1.Condition, desired []metav1.Condit
 	}
 
 	return out
+}
+
+func preserveDeploymentFailedGatewayProgrammedCondition(
+	out *[]metav1.Condition,
+	existing []metav1.Condition,
+	desired []metav1.Condition,
+) {
+	existingProgrammed := meta.FindStatusCondition(existing, string(gwv1.GatewayConditionProgrammed))
+	if existingProgrammed == nil ||
+		existingProgrammed.Status != metav1.ConditionFalse ||
+		existingProgrammed.Reason != string(reports.GatewayReasonDeploymentFailed) {
+		return
+	}
+
+	desiredProgrammed := meta.FindStatusCondition(desired, string(gwv1.GatewayConditionProgrammed))
+	if desiredProgrammed != nil &&
+		(!isGatewayProgrammedDefaultSuccess(desiredProgrammed) || desiredProgrammed.ObservedGeneration > existingProgrammed.ObservedGeneration) {
+		return
+	}
+	replaceStatusCondition(out, *existingProgrammed)
 }
 
 func selectGatewayAcceptedCondition(existingAccepted, desiredAccepted *metav1.Condition) *metav1.Condition {
@@ -621,63 +683,6 @@ func mergeGatewayAddresses(existing []gwv1.GatewayStatusAddress, desired []gwv1.
 	})
 
 	return out
-}
-
-func compareParentReference(a, b gwv1.ParentReference) int {
-	// ParentReference includes pointer fields with defaults. Canonicalize those defaults so nil vs explicitly-set
-	// default values don't introduce ordering churn.
-	if c := cmp.Compare(parentRefGroupOrDefault(a.Group), parentRefGroupOrDefault(b.Group)); c != 0 {
-		return c
-	}
-	if c := cmp.Compare(parentRefKindOrDefault(a.Kind), parentRefKindOrDefault(b.Kind)); c != 0 {
-		return c
-	}
-	if c := cmp.Compare(derefStringPtr(a.Namespace), derefStringPtr(b.Namespace)); c != 0 {
-		return c
-	}
-	if c := cmp.Compare(string(a.Name), string(b.Name)); c != 0 {
-		return c
-	}
-	if c := cmp.Compare(derefStringPtr(a.SectionName), derefStringPtr(b.SectionName)); c != 0 {
-		return c
-	}
-	return comparePortNumberPtr(a.Port, b.Port)
-}
-
-func parentRefGroupOrDefault(g *gwv1.Group) string {
-	if g == nil {
-		// ParentReference.Group default.
-		return "gateway.networking.k8s.io"
-	}
-	return string(*g)
-}
-
-func parentRefKindOrDefault(k *gwv1.Kind) string {
-	if k == nil {
-		// ParentReference.Kind default.
-		return "Gateway"
-	}
-	return string(*k)
-}
-
-func derefStringPtr[S ~string](p *S) string {
-	if p == nil {
-		return ""
-	}
-	return string(*p)
-}
-
-func comparePortNumberPtr(a, b *gwv1.PortNumber) int {
-	switch {
-	case a == nil && b == nil:
-		return 0
-	case a == nil:
-		return -1
-	case b == nil:
-		return 1
-	default:
-		return cmp.Compare(int(*a), int(*b))
-	}
 }
 
 func addressTypeOrDefault(t *gwv1.AddressType) string {

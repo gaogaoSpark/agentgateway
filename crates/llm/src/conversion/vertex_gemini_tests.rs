@@ -7,7 +7,12 @@ fn req(v: Value) -> types::completions::Request {
 }
 
 fn to_gemini(v: Value) -> Value {
-	let bytes = from_completions::translate(&req(v), None).expect("translate ok");
+	let bytes = from_completions::translate(&req(v), true).expect("translate ok");
+	serde_json::from_slice(&bytes).expect("valid json")
+}
+
+fn to_gemini_api(v: Value) -> Value {
+	let bytes = from_completions::translate(&req(v), false).expect("translate ok");
 	serde_json::from_slice(&bytes).expect("valid json")
 }
 
@@ -70,7 +75,7 @@ fn gs_url_without_extension_or_hint_is_rejected() {
 				{ "type": "image_url", "image_url": { "url": "gs://bucket/object" } }
 			]}]
 		})),
-		None,
+		true,
 	);
 	assert!(
 		err.is_err(),
@@ -90,6 +95,163 @@ fn gs_url_uses_explicit_mime_hint() {
 	assert_eq!(
 		g["contents"][0]["parts"][0]["fileData"]["mimeType"],
 		"image/webp"
+	);
+}
+
+// ---------- Request: content parts / files ----------
+
+fn file_content(file: Value) -> Value {
+	json!({
+		"model": "gemini-2.5-flash",
+		"messages": [{ "role": "user", "content": [
+			{ "type": "text", "text": "What is this document about?" },
+			{ "type": "file", "file": file }
+		]}]
+	})
+}
+
+#[test]
+fn file_data_url_becomes_inline_data() {
+	let g = to_gemini(file_content(json!({
+		"filename": "report.pdf",
+		"file_data": "data:application/pdf;base64,JVBERi0xLjQK"
+	})));
+	let part = &g["contents"][0]["parts"][1];
+	assert_eq!(part["inlineData"]["mimeType"], "application/pdf");
+	assert_eq!(part["inlineData"]["data"], "JVBERi0xLjQK");
+}
+
+#[test]
+fn file_gs_uri_takes_mime_from_filename() {
+	// The gs:// object has no extension, so the mime can only come from `filename`.
+	let g = to_gemini(file_content(json!({
+		"filename": "report.pdf",
+		"file_data": "gs://bucket/object"
+	})));
+	let part = &g["contents"][0]["parts"][1];
+	assert_eq!(part["fileData"]["fileUri"], "gs://bucket/object");
+	assert_eq!(part["fileData"]["mimeType"], "application/pdf");
+}
+
+#[test]
+fn file_gs_uri_without_extension_or_hint_is_rejected() {
+	let err = from_completions::translate(
+		&req(file_content(json!({
+			"file_data": "gs://bucket/object"
+		}))),
+		true,
+	);
+	assert!(
+		err.is_err(),
+		"extension-less gs:// file with no MIME hint must be rejected before egress"
+	);
+}
+
+#[test]
+fn data_url_without_media_type_falls_back_to_filename() {
+	let g = to_gemini(file_content(json!({
+		"filename": "report.pdf",
+		"file_data": "data:;base64,JVBERi0xLjQK"
+	})));
+	assert_eq!(
+		g["contents"][0]["parts"][1]["inlineData"]["mimeType"],
+		"application/pdf"
+	);
+}
+
+#[test]
+fn data_url_without_media_type_or_filename_is_rejected() {
+	let err = from_completions::translate(
+		&req(file_content(
+			json!({ "file_data": "data:;base64,JVBERi0xLjQK" }),
+		)),
+		true,
+	);
+	assert!(
+		err.is_err(),
+		"an empty mimeType is rejected by Vertex, so it must not be sent"
+	);
+}
+
+#[test]
+fn raw_base64_file_data_takes_mime_from_filename() {
+	let g = to_gemini(file_content(json!({
+		"filename": "report.pdf",
+		"file_data": "JVBERi0xLjQK"
+	})));
+	let part = &g["contents"][0]["parts"][1];
+	assert_eq!(part["inlineData"]["mimeType"], "application/pdf");
+	assert_eq!(part["inlineData"]["data"], "JVBERi0xLjQK");
+}
+
+#[test]
+fn raw_base64_file_data_without_a_mime_source_is_rejected() {
+	let err = from_completions::translate(
+		&req(file_content(json!({ "file_data": "JVBERi0xLjQK" }))),
+		true,
+	);
+	assert!(
+		err.is_err(),
+		"raw base64 with no filename or hint cannot yield the mimeType Vertex requires"
+	);
+}
+
+#[test]
+fn file_id_holding_a_gs_uri_becomes_file_data() {
+	// Some clients put a bucket URI in `file_id` rather than `file_data`; Vertex can fetch
+	// that directly, so it is honoured instead of being treated as an opaque OpenAI id.
+	let g = to_gemini(file_content(json!({ "file_id": "gs://bucket/report.pdf" })));
+	let part = &g["contents"][0]["parts"][1];
+	assert_eq!(part["fileData"]["fileUri"], "gs://bucket/report.pdf");
+	assert_eq!(part["fileData"]["mimeType"], "application/pdf");
+}
+
+#[test]
+fn file_id_is_rejected_rather_than_dropped() {
+	// Vertex has no OpenAI Files store, so an opaque file_id cannot be resolved. It must
+	// error rather than silently vanish from the request (#3117).
+	let err = from_completions::translate(
+		&req(file_content(json!({ "file_id": "file-abc123" }))),
+		true,
+	);
+	let err = err.expect_err("opaque file_id must be rejected");
+	// Load-bearing: classify_ai_request maps UnsupportedConversion to 400, InvalidResponse to 503.
+	assert!(
+		matches!(err, crate::AIError::UnsupportedConversion(_)),
+		"bad client input must be a request error, got {err:?}"
+	);
+	assert!(
+		format!("{err:?}").contains("file_id"),
+		"error should name the field: {err:?}"
+	);
+}
+
+#[test]
+fn file_part_without_data_or_id_is_rejected() {
+	let err = from_completions::translate(
+		&req(file_content(json!({ "filename": "report.pdf" }))),
+		true,
+	);
+	assert!(
+		err.is_err(),
+		"a file part carrying no payload must be rejected"
+	);
+}
+
+#[test]
+fn rejected_signed_url_omits_query_from_error() {
+	let err = from_completions::translate(
+		&req(file_content(json!({
+			"file_id": "https://storage.googleapis.com/bucket/object?X-Goog-Signature=secret"
+		}))),
+		true,
+	)
+	.expect_err("extension-less URL without a MIME hint must be rejected");
+	let msg = err.to_string();
+	assert!(!msg.contains("secret"), "{msg}");
+	assert!(
+		msg.contains("https://storage.googleapis.com/bucket/object"),
+		"{msg}"
 	);
 }
 
@@ -113,7 +275,7 @@ fn http_image_url_is_rejected() {
 				{ "type": "image_url", "image_url": { "url": "https://example.com/cat.png" } }
 			]}]
 		})),
-		None,
+		true,
 	);
 	assert!(err.is_err(), "http(s) image_url must be rejected");
 }
@@ -185,6 +347,11 @@ fn vertex_omits_tool_call_id_on_function_parts() {
 
 	let fr = &g["contents"][2]["parts"][0]["functionResponse"];
 	assert_eq!(fr["name"], "get_weather");
+	assert_eq!(
+		g["contents"][2]["parts"].as_array().unwrap().len(),
+		1,
+		"functionResponse must not have sibling parts"
+	);
 	assert!(
 		fr.get("id").is_none(),
 		"functionResponse must not carry `id`: Vertex rejects it"
@@ -401,8 +568,8 @@ fn response_format_json_object_sets_mime_only() {
 	assert!(g["generationConfig"].get("responseSchema").is_none());
 }
 
-/// Gemini's responseSchema subset rejects $defs/$ref/additionalProperties,
-/// so the translator must inline the $ref, drop $defs, and strip additionalProperties before egress.
+/// Gemini's responseSchema subset rejects $defs/$ref, so the translator must inline the $ref and
+/// drop $defs before egress. additionalProperties is supported and must be preserved.
 #[test]
 fn response_format_inlines_pydantic_defs_and_refs() {
 	let g = to_gemini(json!({
@@ -447,10 +614,6 @@ fn response_format_inlines_pydantic_defs_and_refs() {
 	assert!(
 		!s.contains("$defs"),
 		"Vertex rejects $defs in responseSchema: {s}"
-	);
-	assert!(
-		!s.contains("additionalProperties"),
-		"Gemini rejects additionalProperties: {s}"
 	);
 	// The referenced CalendarEvent must be inlined where the $ref was.
 	assert_eq!(schema["properties"]["events"]["items"]["type"], "object");
@@ -530,10 +693,6 @@ fn response_format_inlines_real_dialog_question_schema() {
 	);
 	assert!(!s.contains("$defs"), "Vertex rejects $defs: {s}");
 	assert!(
-		!s.contains("additionalProperties"),
-		"Gemini rejects additionalProperties: {s}"
-	);
-	assert!(
 		!s.contains("\"type\":\"null\""),
 		"anyOf null branches must collapse to nullable; Gemini has no null type: {s}"
 	);
@@ -557,9 +716,9 @@ fn response_schema(schema: Value) -> Value {
 	g["generationConfig"]["responseSchema"].clone()
 }
 
-// Case 1: additionalProperties must be dropped at every level, not just the top.
+// Case 1: additionalProperties: false must be preserved at every level (Gemini supports it).
 #[test]
-fn gemini_schema_drops_nested_additional_properties() {
+fn gemini_schema_preserves_additional_properties_false() {
 	let s = response_schema(json!({
 		"type": "object",
 		"additionalProperties": false,
@@ -571,10 +730,13 @@ fn gemini_schema_drops_nested_additional_properties() {
 			}
 		}
 	}));
-	let txt = serde_json::to_string(&s).unwrap();
-	assert!(
-		!txt.contains("additionalProperties"),
-		"additionalProperties must be stripped everywhere: {txt}"
+	assert_eq!(
+		s["additionalProperties"], false,
+		"top-level additionalProperties: false must be preserved: {s}"
+	);
+	assert_eq!(
+		s["properties"]["inner"]["additionalProperties"], false,
+		"nested additionalProperties: false must be preserved: {s}"
 	);
 }
 
@@ -618,6 +780,7 @@ fn tool_parameters_inline_defs_and_refs() {
 		!txt.contains("$defs"),
 		"tool parameters must drop $defs: {txt}"
 	);
+	// Unlike responseSchema on Vertex, the tool path strips additionalProperties (preserve_ap=false).
 	assert!(
 		!txt.contains("additionalProperties"),
 		"tool parameters must drop additionalProperties: {txt}"
@@ -718,31 +881,247 @@ fn gemini_schema_converts_const_to_enum() {
 	);
 }
 
-// Case 5: only `enum` and `date-time` string formats are safe; others (uri, email, int64, uuid, ...)
-// must be stripped.
+// Case 4b: JSON Schema `oneOf` is how tagged unions are expressed (zod, TypeBox, OpenAPI). Gemini's
+// Schema proto only has `any_of`; it silently ignores `oneOf` rather than rejecting it, and the
+// normalizer used to strip it, so the node lost its type and Gemini returned empty objects.
+// `oneOf` must be rewritten to `anyOf` with every member intact.
 #[test]
-fn gemini_schema_strips_unsupported_formats_keeps_datetime() {
+fn gemini_schema_rewrites_oneof_to_anyof() {
 	let s = response_schema(json!({
+		"type": "object",
+		"required": ["events"],
+		"properties": {
+			"events": {
+				"type": "array",
+				"items": {
+					"oneOf": [
+						{
+							"type": "object",
+							"required": ["kind", "x", "y"],
+							"properties": {
+								"kind": { "type": "string", "enum": ["click"] },
+								"x": { "type": "integer" },
+								"y": { "type": "integer" }
+							}
+						},
+						{
+							"type": "object",
+							"required": ["kind", "key"],
+							"properties": {
+								"kind": { "type": "string", "enum": ["keypress"] },
+								"key": { "type": "string" }
+							}
+						}
+					]
+				}
+			}
+		}
+	}));
+	let txt = serde_json::to_string(&s).unwrap();
+	assert!(!txt.contains("oneOf"), "oneOf must be rewritten: {txt}");
+	let items = &s["properties"]["events"]["items"];
+	let any_of = items["anyOf"]
+		.as_array()
+		.unwrap_or_else(|| panic!("oneOf must become anyOf, not be dropped: {txt}"));
+	assert_eq!(any_of.len(), 2, "both branches must survive: {txt}");
+	assert_eq!(any_of[0]["properties"]["kind"]["enum"][0], "click", "{txt}");
+	assert_eq!(any_of[0]["properties"]["x"]["type"], "integer", "{txt}");
+	assert_eq!(
+		any_of[1]["properties"]["kind"]["enum"][0], "keypress",
+		"{txt}"
+	);
+	assert_eq!(any_of[1]["properties"]["key"]["type"], "string", "{txt}");
+}
+
+// Case 4c: the same rewrite must apply on the tool-parameters path. This is the exact payload from
+// agentgateway/agentgateway#3880, where Gemini answered `{"events":[{},{}]}`.
+#[test]
+fn tool_parameters_rewrite_oneof_to_anyof() {
+	let g = to_gemini(json!({
+		"model": "gemini-2.5-flash",
+		"tool_choice": "required",
+		"messages": [{
+			"role": "user",
+			"content": "The user clicked at (10, 20), then pressed Enter. Record both events."
+		}],
+		"tools": [{
+			"type": "function",
+			"function": {
+				"name": "record_events",
+				"parameters": {
+					"type": "object",
+					"required": ["events"],
+					"properties": {
+						"events": {
+							"type": "array",
+							"items": {
+								"oneOf": [
+									{
+										"type": "object",
+										"required": ["kind", "x", "y"],
+										"properties": {
+											"kind": { "type": "string", "enum": ["click"] },
+											"x": { "type": "integer" },
+											"y": { "type": "integer" }
+										}
+									},
+									{
+										"type": "object",
+										"required": ["kind", "key"],
+										"properties": {
+											"kind": { "type": "string", "enum": ["keypress"] },
+											"key": { "type": "string" }
+										}
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		}]
+	}));
+	let params = &g["tools"][0]["functionDeclarations"][0]["parameters"];
+	let txt = serde_json::to_string(params).unwrap();
+	assert!(!txt.contains("oneOf"), "oneOf must be rewritten: {txt}");
+	let items = &params["properties"]["events"]["items"];
+	assert_ne!(
+		items,
+		&json!({}),
+		"items must not collapse to an empty schema: {txt}"
+	);
+	let any_of = items["anyOf"]
+		.as_array()
+		.unwrap_or_else(|| panic!("oneOf must become anyOf, not be dropped: {txt}"));
+	assert_eq!(any_of.len(), 2, "both branches must survive: {txt}");
+	assert_eq!(any_of[0]["type"], "object", "{txt}");
+	assert_eq!(any_of[1]["type"], "object", "{txt}");
+}
+
+// Case 4d: Pydantic emits a discriminated union as `{oneOf: [{$ref}, {$ref}], discriminator: {...}}`.
+// The refs inside the rewritten members must still be inlined, the sibling description kept, and
+// the unsupported `discriminator` dropped.
+#[test]
+fn gemini_schema_rewrites_oneof_of_refs() {
+	let s = response_schema(json!({
+		"$defs": {
+			"Click": {
+				"type": "object",
+				"properties": { "kind": { "const": "click" }, "x": { "type": "integer" } },
+				"required": ["kind", "x"]
+			},
+			"Keypress": {
+				"type": "object",
+				"properties": { "kind": { "const": "keypress" }, "key": { "type": "string" } },
+				"required": ["kind", "key"]
+			}
+		},
+		"type": "object",
+		"properties": {
+			"event": {
+				"oneOf": [{ "$ref": "#/$defs/Click" }, { "$ref": "#/$defs/Keypress" }],
+				"discriminator": { "propertyName": "kind" },
+				"description": "what happened"
+			}
+		}
+	}));
+	let txt = serde_json::to_string(&s).unwrap();
+	assert!(!txt.contains("oneOf"), "oneOf must be rewritten: {txt}");
+	assert!(
+		!txt.contains("$ref"),
+		"refs inside oneOf must be inlined: {txt}"
+	);
+	assert!(!txt.contains("$defs"), "must drop $defs: {txt}");
+	assert!(
+		!txt.contains("discriminator"),
+		"Gemini has no discriminator: {txt}"
+	);
+	let event = &s["properties"]["event"];
+	assert_eq!(
+		event["description"], "what happened",
+		"sibling description must be preserved: {txt}"
+	);
+	let any_of = event["anyOf"]
+		.as_array()
+		.unwrap_or_else(|| panic!("oneOf must become anyOf, not be dropped: {txt}"));
+	assert_eq!(any_of.len(), 2, "both branches must survive: {txt}");
+	assert_eq!(any_of[0]["properties"]["kind"]["enum"][0], "click", "{txt}");
+	assert_eq!(any_of[0]["properties"]["x"]["type"], "integer", "{txt}");
+	assert_eq!(
+		any_of[1]["properties"]["kind"]["enum"][0], "keypress",
+		"{txt}"
+	);
+	assert_eq!(any_of[1]["properties"]["key"]["type"], "string", "{txt}");
+}
+
+// Case 5: string formats pass through to Gemini.
+#[test]
+fn gemini_schema_keeps_formats() {
+	let schema = json!({
 		"type": "object",
 		"additionalProperties": false,
 		"properties": {
-			"link": { "type": "string", "format": "uri" },
 			"when": { "type": "string", "format": "date-time" },
+			"day": { "type": "string", "format": "date" },
+			"at": { "type": "string", "format": "time" },
+			"id": { "type": "string", "format": "uuid" },
+			"mail": { "type": "string", "format": "email" },
 			"big": { "type": "integer", "format": "int64" }
 		}
+	});
+	for is_vertex in [true, false] {
+		let g = from_completions::translate(
+			&req(json!({
+				"model": "gemini-2.5-flash",
+				"messages": [{ "role": "user", "content": "x" }],
+				"response_format": {
+					"type": "json_schema",
+					"json_schema": { "name": "T", "strict": true, "schema": schema }
+				}
+			})),
+			is_vertex,
+		)
+		.expect("translate ok");
+		let g: Value = serde_json::from_slice(&g).expect("valid json");
+		let props = &g["generationConfig"]["responseSchema"]["properties"];
+		for (field, format) in [
+			("when", "date-time"),
+			("day", "date"),
+			("at", "time"),
+			("id", "uuid"),
+			("mail", "email"),
+			("big", "int64"),
+		] {
+			assert_eq!(
+				props[field]["format"], format,
+				"is_vertex={is_vertex}: {props}"
+			);
+		}
+	}
+}
+
+#[test]
+fn tool_parameters_keep_string_formats() {
+	let g = to_gemini_api(json!({
+		"model": "gemini-2.5-flash",
+		"messages": [{ "role": "user", "content": "x" }],
+		"tools": [{
+			"type": "function",
+			"function": {
+				"name": "book",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"day": { "type": "string", "format": "date" },
+						"id": { "type": "string", "format": "uuid" }
+					}
+				}
+			}
+		}]
 	}));
-	assert!(
-		s["properties"]["link"].get("format").is_none(),
-		"unsupported string format must be dropped: {s}"
-	);
-	assert_eq!(
-		s["properties"]["when"]["format"], "date-time",
-		"date-time format must be kept: {s}"
-	);
-	assert!(
-		s["properties"]["big"].get("format").is_none(),
-		"unsupported numeric format must be dropped: {s}"
-	);
+	let props = &g["tools"][0]["functionDeclarations"][0]["parameters"]["properties"];
+	assert_eq!(props["day"]["format"], "date", "{props}");
+	assert_eq!(props["id"]["format"], "uuid", "{props}");
 }
 
 // Case 6: JSON Schema `type` arrays are not allowed. A `null` member becomes `nullable`; a genuine
@@ -789,10 +1168,66 @@ fn gemini_schema_array_without_items_gets_items() {
 	);
 }
 
-// Case 8: Dict[str, X] emits a typed `additionalProperties` schema. Gemini does not support it, so
-// it must be dropped (the open value typing is lost; that is the documented trade-off).
+// Case 8: minItems/maxItems on array types must be preserved so callers can enforce response
+// length constraints (e.g. "return exactly 3 items"). They were previously stripped because they
+// were absent from ALLOWED_SCHEMA_FIELDS.
 #[test]
-fn gemini_schema_drops_open_dict_additional_properties() {
+fn gemini_schema_preserves_array_length_constraints() {
+	let s = response_schema(json!({
+		"type": "object",
+		"properties": {
+			"tags": {
+				"type": "array",
+				"items": { "type": "string" },
+				"minItems": 2,
+				"maxItems": 5
+			}
+		}
+	}));
+	assert_eq!(
+		s["properties"]["tags"]["minItems"], 2,
+		"minItems must be preserved: {s}"
+	);
+	assert_eq!(
+		s["properties"]["tags"]["maxItems"], 5,
+		"maxItems must be preserved: {s}"
+	);
+}
+
+// Case 9: minProperties/maxProperties constrain the number of keys on an object. Like minItems/
+// maxItems they were absent from ALLOWED_SCHEMA_FIELDS and were silently stripped.
+#[test]
+fn gemini_schema_preserves_object_property_count_constraints() {
+	let s = response_schema(json!({
+		"type": "object",
+		"minProperties": 1,
+		"maxProperties": 4,
+		"properties": { "a": { "type": "string" } }
+	}));
+	assert_eq!(
+		s["minProperties"], 1,
+		"minProperties must be preserved: {s}"
+	);
+	assert_eq!(
+		s["maxProperties"], 4,
+		"maxProperties must be preserved: {s}"
+	);
+}
+
+// Case 10: example provides a sample value for a schema node and is passed through to Gemini.
+#[test]
+fn gemini_schema_preserves_example() {
+	let s = response_schema(json!({
+		"type": "string",
+		"example": "hello"
+	}));
+	assert_eq!(s["example"], "hello", "example must be preserved: {s}");
+}
+
+// Case 11: Dict[str, X] emits a typed `additionalProperties` schema. Gemini supports it, so both
+// the boolean false form and the Schema-object form must be preserved.
+#[test]
+fn gemini_schema_preserves_open_dict_additional_properties() {
 	let s = response_schema(json!({
 		"type": "object",
 		"additionalProperties": false,
@@ -800,10 +1235,101 @@ fn gemini_schema_drops_open_dict_additional_properties() {
 			"meta": { "type": "object", "additionalProperties": { "type": "string" } }
 		}
 	}));
+	assert_eq!(
+		s["additionalProperties"], false,
+		"top-level additionalProperties: false must be preserved: {s}"
+	);
+	assert_eq!(
+		s["properties"]["meta"]["additionalProperties"]["type"], "string",
+		"Schema-object form of additionalProperties must be preserved: {s}"
+	);
+}
+
+// Case 11b: Dict[str, Model] puts a $ref under additionalProperties. Now that the key survives,
+// the subtree must be normalized too — $defs is stripped at the root, so an un-inlined $ref here
+// would egress dangling and Vertex 400s.
+#[test]
+fn gemini_schema_inlines_ref_under_additional_properties() {
+	let s = response_schema(json!({
+		"$defs": {
+			"Person": {
+				"type": "object",
+				"properties": { "name": { "type": "string" } },
+				"required": ["name"]
+			}
+		},
+		"type": "object",
+		"properties": {
+			"people": { "type": "object", "additionalProperties": { "$ref": "#/$defs/Person" } }
+		}
+	}));
 	let txt = serde_json::to_string(&s).unwrap();
 	assert!(
-		!txt.contains("additionalProperties"),
-		"typed additionalProperties (open dict) must be dropped: {txt}"
+		!txt.contains("$ref"),
+		"$ref under additionalProperties must be inlined: {txt}"
+	);
+	assert_eq!(
+		s["properties"]["people"]["additionalProperties"]["properties"]["name"]["type"], "string",
+		"the inlined Person must keep its properties: {s}"
+	);
+}
+
+// Case 11c: Dict[str, Optional[str]] puts an anyOf null branch under additionalProperties. It must
+// collapse to nullable like anywhere else; Gemini has no null type.
+#[test]
+fn gemini_schema_normalizes_nullable_under_additional_properties() {
+	let s = response_schema(json!({
+		"type": "object",
+		"properties": {
+			"meta": {
+				"type": "object",
+				"additionalProperties": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+			}
+		}
+	}));
+	let txt = serde_json::to_string(&s).unwrap();
+	assert!(
+		!txt.contains("\"type\":\"null\""),
+		"null branch under additionalProperties must collapse to nullable: {txt}"
+	);
+}
+
+// Case 11d: an empty-object additionalProperties means "anything goes" and must stay empty — the
+// typeless default must not rewrite it into {"type":"object"}.
+#[test]
+fn gemini_schema_leaves_empty_additional_properties_alone() {
+	let s = response_schema(json!({
+		"type": "object",
+		"properties": { "meta": { "type": "object", "additionalProperties": {} } }
+	}));
+	assert_eq!(
+		s["properties"]["meta"]["additionalProperties"],
+		json!({}),
+		"empty additionalProperties must stay empty: {s}"
+	);
+}
+
+// Case 11e: the Gemini API (generativelanguage.googleapis.com) rejects additionalProperties in
+// responseSchema, unlike Vertex AI. With is_vertex=false the key must be stripped.
+#[test]
+fn gemini_api_response_schema_strips_additional_properties() {
+	let g = to_gemini_api(json!({
+		"model": "gemini-2.5-flash",
+		"messages": [{ "role": "user", "content": "x" }],
+		"response_format": {
+			"type": "json_schema",
+			"json_schema": { "name": "T", "strict": true, "schema": {
+				"type": "object",
+				"properties": { "answer": { "type": "string", "additionalProperties": false } },
+				"required": ["answer"],
+				"additionalProperties": false
+			}}
+		}
+	}));
+	let s = serde_json::to_string(&g["generationConfig"]["responseSchema"]).unwrap();
+	assert!(
+		!s.contains("additionalProperties"),
+		"Gemini API responseSchema must not contain additionalProperties: {s}"
 	);
 }
 
@@ -1015,16 +1541,99 @@ fn reasoning_effort_maps_to_thinking_level_on_gemini_3() {
 }
 
 #[test]
-fn reasoning_effort_maps_to_thinking_budget_on_gemini_25() {
+fn reasoning_effort_maps_to_thinking_level_on_gemma_4() {
+	// Gemma 4 on the Gemini API only supports the binary `minimal` (off) / `high` (on)
+	// thinking levels and rejects thinkingBudget with "Thinking budget is not supported
+	// for this model." (agentgateway#4148). `none` maps to `minimal` because omitting
+	// thinkingConfig leaves Gemma 4 thinking enabled. Matching is by family substring,
+	// so any gemma-4-* variant (including a `models/` prefix) takes this path.
+	// Full Gemma 4 family as documented, plus a `models/`-prefixed variant to prove
+	// matching is by family substring rather than exact model id.
+	for model in [
+		"gemma-4-e2b-it",
+		"gemma-4-e4b-it",
+		"gemma-4-26b-a4b-it",
+		"gemma-4-31b-it",
+		"models/gemma-4-31b-it",
+	] {
+		for (effort, level) in [
+			("none", "minimal"),
+			("minimal", "minimal"),
+			("low", "minimal"),
+			("medium", "high"),
+			("high", "high"),
+			("xhigh", "high"),
+			("max", "high"),
+		] {
+			let g = to_gemini(json!({
+				"model": model,
+				"messages": [{ "role": "user", "content": "x" }],
+				"reasoning_effort": effort
+			}));
+			let tc = &g["generationConfig"]["thinkingConfig"];
+			assert_eq!(tc["thinkingLevel"], level, "{model} effort={effort}: {g}");
+			assert!(
+				tc.get("thinkingBudget").is_none(),
+				"{model} effort={effort} must not send thinkingBudget: {g}"
+			);
+		}
+	}
+}
+
+#[test]
+fn reasoning_effort_maps_to_thinking_level_on_gemini_4() {
+	// Gemini 4 (e.g. gemini-4-argon) rejects the legacy numeric thinkingBudget
+	// ("Thinking budget is not supported for this model. Use thinkingLevel
+	// instead.") and supports low/medium/high but has no `minimal` level, so
+	// `minimal` clamps up to `low`.
+	for (effort, level) in [
+		("minimal", "low"),
+		("low", "low"),
+		("medium", "medium"),
+		("high", "high"),
+		("xhigh", "high"),
+		("max", "high"),
+	] {
+		let g = to_gemini(json!({
+			"model": "gemini-4-argon",
+			"messages": [{ "role": "user", "content": "x" }],
+			"reasoning_effort": effort
+		}));
+		let tc = &g["generationConfig"]["thinkingConfig"];
+		assert_eq!(tc["thinkingLevel"], level, "effort={effort}: {g}");
+		assert!(
+			tc.get("thinkingBudget").is_none(),
+			"effort={effort} must not send thinkingBudget: {g}"
+		);
+	}
+}
+
+#[test]
+fn reasoning_effort_none_omits_thinking_config_on_gemini_4() {
+	// Gemini 4 has no off level, so `none` keeps the default behavior of
+	// omitting thinkingConfig instead of sending an unsupported `minimal`.
 	let g = to_gemini(json!({
-		"model": "gemini-2.5-flash",
+		"model": "gemini-4-argon",
 		"messages": [{ "role": "user", "content": "x" }],
-		"reasoning_effort": "high"
+		"reasoning_effort": "none"
 	}));
-	assert_eq!(
-		g["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-		4096
-	);
+	let gc = g.get("generationConfig");
+	assert!(gc.is_none() || gc.unwrap().get("thinkingConfig").is_none());
+}
+
+#[test]
+fn reasoning_effort_maps_to_thinking_budget_on_gemini_25() {
+	for (effort, budget) in [("high", 4096), ("xhigh", 8192), ("max", 16384)] {
+		let g = to_gemini(json!({
+			"model": "gemini-2.5-flash",
+			"messages": [{ "role": "user", "content": "x" }],
+			"reasoning_effort": effort
+		}));
+		assert_eq!(
+			g["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+			budget
+		);
+	}
 }
 
 #[test]
@@ -1153,19 +1762,20 @@ fn usage_maps_cached_and_reasoning_tokens() {
 
 #[test]
 fn cel_usage_fields_match_usage_metadata() {
-	// The CEL/log token fields (via to_llm_response) must equal Gemini's usageMetadata exactly,
-	// so rate limiting and telemetry see native counts rather than shim numbers.
+	// The CEL/log token fields (via to_llm_response) come from Gemini's usageMetadata, with
+	// output normalized to the cross-provider convention: candidates + thoughts (Gemini
+	// reports them disjointly, other providers include reasoning in output).
 	let r = llm_resp(json!({
 		"candidates": [{ "content": { "role": "model", "parts": [{ "text": "x" }] },
 			"finishReason": "STOP" }],
 		"usageMetadata": {
-			"promptTokenCount": 100, "candidatesTokenCount": 50, "totalTokenCount": 150,
+			"promptTokenCount": 100, "candidatesTokenCount": 50, "totalTokenCount": 170,
 			"cachedContentTokenCount": 30, "thoughtsTokenCount": 20
 		}
 	}));
 	assert_eq!(r.input_tokens, Some(100));
-	assert_eq!(r.output_tokens, Some(50));
-	assert_eq!(r.total_tokens, Some(150));
+	assert_eq!(r.output_tokens, Some(70));
+	assert_eq!(r.total_tokens, Some(170));
 	assert_eq!(r.cached_input_tokens, Some(30));
 	assert_eq!(r.reasoning_tokens, Some(20));
 }
@@ -1284,7 +1894,8 @@ fn streaming_trailing_usage_chunk_has_empty_choices() {
 	.unwrap();
 	assert!(c["choices"].as_array().unwrap().is_empty());
 	assert_eq!(c["usage"]["prompt_tokens"], 5);
-	assert_eq!(c["usage"]["completion_tokens"], 2);
+	// completion_tokens includes thoughts (OpenAI semantics); the breakdown stays in details.
+	assert_eq!(c["usage"]["completion_tokens"], 3);
 	assert_eq!(c["usage"]["total_tokens"], 7);
 	assert_eq!(
 		c["usage"]["completion_tokens_details"]["reasoning_tokens"],
@@ -1324,4 +1935,222 @@ fn streaming_usage_suppressed_on_interim_content_chunks() {
 	.unwrap();
 	assert_eq!(c2["usage"]["total_tokens"], 7);
 	assert_eq!(c2["choices"][0]["finish_reason"], "stop");
+}
+
+// ---------- Native Gemini inbound: SSE passthrough with usage extraction ----------
+
+mod passthrough {
+	use std::sync::{Arc, Mutex};
+
+	use http_body_util::BodyExt;
+
+	use super::*;
+	use crate::{
+		CacheTokenConvention, InputFormat, LLMInfo, LLMRequest, LLMResponse, LogContentFields,
+		StreamingUsageGuard, StreamingUsageReporter,
+	};
+
+	struct Capture(Arc<Mutex<LLMInfo>>);
+
+	impl StreamingUsageReporter for Capture {
+		fn update(&self, f: &mut dyn FnMut(&mut LLMInfo)) {
+			f(&mut self.0.lock().unwrap())
+		}
+		fn report_usage(&mut self) {}
+	}
+
+	fn captured_info() -> Arc<Mutex<LLMInfo>> {
+		Arc::new(Mutex::new(LLMInfo {
+			request: LLMRequest {
+				input_tokens: None,
+				input_format: InputFormat::Gemini,
+				cache_convention: CacheTokenConvention::pending(),
+				request_model: "gemini-2.5-flash".into(),
+				original_model: None,
+				provider: "gcp.vertex_ai".into(),
+				streaming: true,
+				params: Default::default(),
+				prompt: None,
+				provider_state: None,
+			},
+			response: LLMResponse::default(),
+		}))
+	}
+
+	#[tokio::test]
+	async fn passthrough_stream_forwards_bytes_and_extracts_final_usage() {
+		// Cumulative usageMetadata on every chunk; the last SSE event carries the totals.
+		let input = concat!(
+			"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"reason\",\"thought\":true},{\"text\":\"Hel\"}]}}],",
+			"\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":1,\"totalTokenCount\":8},",
+			"\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"r1\",\"someNewField\":true}\n\n",
+			"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"lo\"}]},\"finishReason\":\"STOP\"}],",
+			"\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":4,\"totalTokenCount\":13,\"thoughtsTokenCount\":2},",
+			"\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"r1\"}\n\n",
+		);
+		let captured = captured_info();
+		let out = passthrough_stream(
+			agent_http::Body::from(input),
+			1024 * 1024,
+			StreamingUsageGuard::new(Box::new(Capture(captured.clone()))),
+			LogContentFields {
+				completion: true,
+				tool_calls: false,
+			},
+		)
+		.collect()
+		.await
+		.expect("collect stream")
+		.to_bytes();
+
+		assert_eq!(
+			out.as_ref(),
+			input.as_bytes(),
+			"stream must pass through byte-for-byte"
+		);
+		let info = captured.lock().unwrap();
+		assert_eq!(info.response.input_tokens, Some(7));
+		assert_eq!(
+			info.response.output_tokens,
+			Some(6),
+			"last event wins; candidates + thoughts"
+		);
+		assert_eq!(info.response.total_tokens, Some(13));
+		assert_eq!(info.response.reasoning_tokens, Some(2));
+		assert_eq!(
+			info.response.provider_model.as_deref(),
+			Some("gemini-2.5-flash")
+		);
+		assert!(info.response.first_token.is_some());
+		assert_eq!(
+			info.response.completion,
+			Some(vec!["Hello".to_string()]),
+			"visible text accumulates across chunks, thought text excluded"
+		);
+	}
+
+	#[tokio::test]
+	async fn passthrough_stream_keeps_usage_from_before_disconnect() {
+		// Simulates an early cut: only the first (interim) event arrives.
+		let input = concat!(
+			"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]}}],",
+			"\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":1,\"totalTokenCount\":8}}\n\n",
+		);
+		let captured = captured_info();
+		let out = passthrough_stream(
+			agent_http::Body::from(input),
+			1024 * 1024,
+			StreamingUsageGuard::new(Box::new(Capture(captured.clone()))),
+			LogContentFields::default(),
+		)
+		.collect()
+		.await
+		.expect("collect stream")
+		.to_bytes();
+
+		assert_eq!(out.as_ref(), input.as_bytes());
+		let info = captured.lock().unwrap();
+		assert_eq!(info.response.input_tokens, Some(7));
+		assert_eq!(info.response.output_tokens, Some(1));
+		assert_eq!(info.response.total_tokens, Some(8));
+		assert_eq!(
+			info.response.completion, None,
+			"completion logging disabled"
+		);
+	}
+
+	fn body_from_frames(frames: &[&str]) -> agent_http::Body {
+		let frames: Vec<Result<bytes::Bytes, std::convert::Infallible>> = frames
+			.iter()
+			.map(|f| Ok(bytes::Bytes::copy_from_slice(f.as_bytes())))
+			.collect();
+		agent_http::Body::from_stream(futures_util::stream::iter(frames))
+	}
+
+	async fn run_passthrough(body: agent_http::Body, captured: &Arc<Mutex<LLMInfo>>) -> bytes::Bytes {
+		passthrough_stream(
+			body,
+			1024 * 1024,
+			StreamingUsageGuard::new(Box::new(Capture(captured.clone()))),
+			LogContentFields {
+				completion: true,
+				tool_calls: false,
+			},
+		)
+		.collect()
+		.await
+		.expect("collect stream")
+		.to_bytes()
+	}
+
+	/// Real Vertex chunking splits SSE events across TCP frames; the passthrough must reassemble
+	/// events for usage extraction without altering what the client receives.
+	#[tokio::test]
+	async fn passthrough_stream_reassembles_events_split_across_frames() {
+		let frames = [
+			"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hel\"}]}}],",
+			"\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":1,\"totalTokenCount\":8},",
+			"\"modelVersion\":\"gemini-2.5-flash\"}\n",
+			"\ndata: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[",
+			"{\"functionCall\":{\"name\":\"get_weather\",\"id\":\"fc_1\",\"args\":{\"city\":\"Berlin\"}},",
+			"\"thoughtSignature\":\"sig\"},{\"text\":\"lo\"}]},\"finishReason\":\"STOP\"}],",
+			"\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":5,\"totalTokenCount\":12}}\n\n",
+		];
+		let captured = captured_info();
+		let out = run_passthrough(body_from_frames(&frames), &captured).await;
+
+		assert_eq!(out.as_ref(), frames.concat().as_bytes());
+		let info = captured.lock().unwrap();
+		assert_eq!(info.response.output_tokens, Some(5));
+		assert_eq!(info.response.total_tokens, Some(12));
+		assert_eq!(info.response.completion, Some(vec!["Hello".to_string()]));
+	}
+
+	/// An unparseable event must not poison the stream: the bytes still reach the client and the
+	/// usage from the events around it is still recorded.
+	#[tokio::test]
+	async fn passthrough_stream_tolerates_malformed_events() {
+		let input = concat!(
+			"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]}}],",
+			"\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":1,\"totalTokenCount\":8}}\n\n",
+			"data: {not json at all\n\n",
+			"data: {\"candidates\":[{\"finishReason\":\"STOP\"}],",
+			"\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":2,\"totalTokenCount\":9}}\n\n",
+		);
+		let captured = captured_info();
+		let out = run_passthrough(agent_http::Body::from(input), &captured).await;
+
+		assert_eq!(out.as_ref(), input.as_bytes());
+		let info = captured.lock().unwrap();
+		assert_eq!(info.response.total_tokens, Some(9), "last valid event wins");
+		assert_eq!(info.response.completion, Some(vec!["Hi".to_string()]));
+	}
+
+	/// A body that never completes an SSE event — the JSON-array variant Google serves without
+	/// `alt=sse`, or a stream cut mid-event — surfaces as a stream error at EOF rather than as a
+	/// silently-truncated success. Same strict `json_passthrough` behaviour as the completions,
+	/// messages, and responses passthroughs; requests are what keep it unreachable, since
+	/// `process_gemini_request` rejects `:streamGenerateContent` without `alt=sse` with a 400.
+	#[tokio::test]
+	async fn passthrough_stream_errors_on_bodies_that_are_not_sse() {
+		let non_sse = r#"[{"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]}}]}]"#;
+		let truncated = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\"";
+		for input in [non_sse, truncated] {
+			let captured = captured_info();
+			let err = passthrough_stream(
+				agent_http::Body::from(input),
+				1024 * 1024,
+				StreamingUsageGuard::new(Box::new(Capture(captured.clone()))),
+				LogContentFields::default(),
+			)
+			.collect()
+			.await
+			.expect_err("a body with no complete SSE event must not report success");
+			assert!(
+				err.to_string().contains("unexpected end of stream"),
+				"{err}"
+			);
+			assert_eq!(captured.lock().unwrap().response.total_tokens, None);
+		}
+	}
 }

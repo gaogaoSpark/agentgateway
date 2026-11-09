@@ -90,10 +90,8 @@ wIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQBtestcertdata
 					"deployment should reference the session key Secret from env")
 				assert.Contains(t, outputYaml, "name: gw-session-key",
 					"deployment should reference the controller-managed session key Secret")
-				assert.Contains(t, outputYaml, "kind: Secret",
-					"rendered objects should include the controller-managed session key Secret")
-				assert.Contains(t, outputYaml, "type: Opaque",
-					"session key Secret should use the opaque Secret type")
+				assert.NotContains(t, outputYaml, "kind: Secret",
+					"the session key Secret is created directly, not applied with the rendered objects")
 				assert.Contains(t, outputYaml, "checksum/session-key: 2a8abfa8cb9906290437854193ca6bca41d4d4e26d1d454bd66a35158095e737",
 					"deployment pod template should roll when the managed session key changes")
 			},
@@ -137,6 +135,10 @@ wIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQBtestcertdata
 		{
 			Name:      "agentgateway with params level Istio configuration",
 			InputFile: "agentgateway-istio",
+			Settings: &apisettings.Settings{
+				IstioRevision:  "1-30",
+				IstioCaAddress: "https://custom-ca.istio-system.svc:15012",
+			},
 			Validate: func(t *testing.T, outputYaml string) {
 				t.Helper()
 				assert.Contains(t, outputYaml, "CLUSTER_ID",
@@ -562,6 +564,10 @@ wIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQBtestcertdata
 			InputFile: "agentgateway-gateway-addresses",
 		},
 		{
+			Name:      "agentgateway with Cluster routability address",
+			InputFile: "agentgateway-gateway-addresses-cluster-routability",
+		},
+		{
 			Name:      "agentgateway with name exactly 63 characters",
 			InputFile: "agentgateway-long-gateway-name-exactly-63-chars",
 		},
@@ -574,16 +580,29 @@ wIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQBtestcertdata
 			InputFile: "agentgateway-model-catalog-configmap",
 			Validate: func(t *testing.T, outputYaml string) {
 				t.Helper()
-				assert.Contains(t, outputYaml, "MODEL_CATALOG_PATHS",
-					"deployment should set MODEL_CATALOG_PATHS to the mounted ConfigMap file path")
+				assert.Contains(t, outputYaml, "modelCatalog:",
+					"generated config should include the model catalog")
 				assert.Contains(t, outputYaml, "/etc/agentgateway/model-catalog/my-model-costs/my-model-costs.json",
-					"MODEL_CATALOG_PATHS should point to the ConfigMap mount path")
+					"config.modelCatalog should point to the ConfigMap mount path")
 				assert.Contains(t, outputYaml, "mountPath: /etc/agentgateway/model-catalog/my-model-costs",
 					"deployment should have a directory volume mount for the model catalog ConfigMap so kubelet's atomic symlink swap on update is visible")
 				assert.NotContains(t, outputYaml, "subPath: my-model-costs.json",
 					"model catalog ConfigMap must not be mounted via subPath, since subPath mounts never receive ConfigMap updates")
 				assert.Contains(t, outputYaml, "name: my-model-costs",
 					"deployment volumes should reference the model catalog ConfigMap by name")
+			},
+		},
+		{
+			Name:      "agentgateway with SPIFFE (default CSI socket source)",
+			InputFile: "agentgateway-spiffe",
+			Validate: func(t *testing.T, outputYaml string) {
+				t.Helper()
+				assert.Contains(t, outputYaml, "spiffe:\n        endpoint: unix:///spiffe-workload-api/spire-agent.sock",
+					"ConfigMap should set config.spiffe.endpoint to the default CSI mount path/socket")
+				assert.Contains(t, outputYaml, "driver: csi.spiffe.io",
+					"deployment should mount the SPIFFE CSI driver volume by default")
+				assert.Contains(t, outputYaml, "name: spiffe-workload-api",
+					"deployment should have a volume + mount for the SPIFFE Workload API socket")
 			},
 		},
 		{
@@ -615,6 +634,7 @@ wIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQBtestcertdata
 
 	for _, tt := range tests {
 		t.Run(tt.Name, func(t *testing.T) {
+			t.Parallel()
 			objs := tester.GetObjects(t, tt, scheme, dir)
 			fakeClient := fake.NewClient(t, objs...)
 			tester.RunHelmChartTest(t, tt, scheme, dir, fakeClient, objs)

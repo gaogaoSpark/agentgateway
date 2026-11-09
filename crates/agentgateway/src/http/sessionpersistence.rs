@@ -1,8 +1,5 @@
 use crate::*;
 
-#[apply(schema_ser!)]
-pub struct Policy {}
-
 #[apply(schema!)]
 #[serde(tag = "t")]
 pub enum SessionState {
@@ -38,6 +35,10 @@ pub struct MCPSessionState {
 	/// This is mostly for logging/etc purposes
 	#[serde(default, rename = "r", skip_serializing_if = "Option::is_none")]
 	random_identifier: Option<String>,
+	/// Backend that issued the session. If set, resuming requires it to match the serving backend.
+	/// Only set with AES encoding, since base64 session IDs would expose backend names to clients.
+	#[serde(default, rename = "k", skip_serializing_if = "Option::is_none")]
+	pub backend: Option<String>,
 }
 
 fn session_id() -> String {
@@ -45,7 +46,7 @@ fn session_id() -> String {
 }
 
 impl MCPSessionState {
-	pub fn new(sessions: Vec<MCPSession>) -> Self {
+	pub fn new(sessions: Vec<MCPSession>, backend: Option<String>) -> Self {
 		let random_identifier = if sessions.iter().any(|s| s.session.is_none()) {
 			Some(session_id())
 		} else {
@@ -54,6 +55,7 @@ impl MCPSessionState {
 		Self {
 			sessions,
 			random_identifier,
+			backend,
 		}
 	}
 }
@@ -118,6 +120,9 @@ impl Serialize for Encoder {
 
 impl Encoder {
 	pub fn encrypt(&self, plaintext: &str) -> Result<String, Error> {
+		self.encrypt_bytes(plaintext.as_bytes())
+	}
+	pub fn encrypt_bytes(&self, plaintext: &[u8]) -> Result<String, Error> {
 		match self {
 			Encoder::Base64(e) => Ok(e.encrypt(plaintext)),
 			Encoder::Aes(e) => e.encrypt(plaintext).map_err(Into::into),
@@ -141,7 +146,7 @@ mod base64 {
 	pub struct Encoder;
 
 	impl Encoder {
-		pub fn encrypt(&self, plaintext: &str) -> String {
+		pub fn encrypt(&self, plaintext: &[u8]) -> String {
 			URL_SAFE_NO_PAD.encode(plaintext)
 		}
 		pub fn decrypt(&self, encoded: &str) -> Result<Vec<u8>, base64::DecodeError> {
@@ -151,56 +156,40 @@ mod base64 {
 }
 
 mod aes {
-	use aws_lc_rs::aead::{AES_256_GCM, Aad, Nonce, RandomizedNonceKey};
 	use base64::Engine;
 	use base64::engine::general_purpose::STANDARD;
 
+	use crate::crypto::aead::{AeadError, Aes256Gcm};
+
 	#[derive(Debug)]
 	pub struct Encoder {
-		key: RandomizedNonceKey,
+		key: Aes256Gcm,
 	}
 
 	impl Encoder {
 		/// Create from a 32-byte key
 		pub fn new(key: &[u8]) -> Result<Self, Error> {
-			let key = RandomizedNonceKey::new(&AES_256_GCM, key).map_err(|_| Error::InvalidKey)?;
+			let key = Aes256Gcm::new(key).map_err(|_| Error::InvalidKey)?;
 			Ok(Self { key })
 		}
 
 		/// Encrypt and base64 encode
-		pub fn encrypt(&self, plaintext: &str) -> Result<String, Error> {
-			let mut in_out: Vec<u8> = plaintext.as_bytes().to_vec();
-			// Seal automatically generates a random nonce and prepends it
-			let nonce = self
+		pub fn encrypt(&self, plaintext: &[u8]) -> Result<String, Error> {
+			let sealed = self
 				.key
-				.seal_in_place_append_tag(Aad::empty(), &mut in_out)
+				.seal(plaintext)
 				.map_err(|_| Error::EncryptionFailed)?;
-
-			// Format: nonce || ciphertext+tag
-			let mut result = nonce.as_ref().to_vec();
-			result.extend_from_slice(&in_out);
-			// Base64 encode
-			Ok(STANDARD.encode(&result))
+			// Format: nonce || ciphertext+tag, base64 encoded
+			Ok(STANDARD.encode(&sealed))
 		}
 
 		/// Decode and decrypt
 		pub fn decrypt(&self, encoded: &str) -> Result<Vec<u8>, Error> {
-			// Base64 decode
 			let data = STANDARD.decode(encoded).map_err(|_| Error::InvalidFormat)?;
-			if data.len() < 12 {
-				return Err(Error::InvalidFormat);
-			}
-
-			// Extract nonce and ciphertext
-			let (nonce_bytes, ciphertext) = data.split_at(12);
-			let nonce =
-				Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| Error::InvalidFormat)?;
-			let mut in_out = ciphertext.to_vec();
-			let plaintext = self
-				.key
-				.open_in_place(nonce, Aad::empty(), &mut in_out)
-				.map_err(|_| Error::DecryptionFailed)?;
-			Ok(plaintext.to_vec())
+			self.key.open(&data).map_err(|e| match e {
+				AeadError::InvalidFormat => Error::InvalidFormat,
+				_ => Error::DecryptionFailed,
+			})
 		}
 	}
 

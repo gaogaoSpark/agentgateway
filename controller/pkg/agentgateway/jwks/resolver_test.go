@@ -6,7 +6,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"istio.io/istio/pkg/kube/krt"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwv1b1 "sigs.k8s.io/gateway-api/apis/v1beta1"
@@ -14,9 +13,36 @@ import (
 	apisettings "github.com/agentgateway/agentgateway/controller/api/settings"
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/jwks"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/testutils"
 	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
+
+func TestResolverURLWithPolicyBackendGrants(t *testing.T) {
+	for _, kind := range []jwks.OwnerKind{jwks.OwnerKindPolicy, jwks.OwnerKindBackend} {
+		t.Run(string(kind), func(t *testing.T) {
+			resolver := jwks.NewResolver(
+				remotehttp.NewResolver(remotehttp.Inputs{}),
+				nil,
+				apisettings.BackendRefGrantModeRouteAndPolicy,
+			)
+			const url = "https://issuer.example.com/.well-known/jwks.json"
+			owner := jwks.RemoteJwksOwner{
+				ID: jwks.JwksOwnerID{
+					Kind: kind, Namespace: "demo", Name: "demo-jwt",
+				},
+				DefaultNamespace: "demo",
+				Remote: agentgateway.RemoteJWKS{
+					PolicyBackendEndpoint: agentgateway.PolicyBackendEndpoint{URL: new(url)},
+				},
+			}
+			resolved, err := resolver.ResolveOwner(krt.TestingDummyContext{}, owner)
+			require.NoError(t, err)
+			require.Equal(t, owner.ID, resolved.OwnerID)
+			require.Equal(t, url, resolved.Target.Target.URL)
+		})
+	}
+}
 
 func TestResolverBackendRefGrant(t *testing.T) {
 	const (
@@ -95,8 +121,8 @@ func TestResolverBackendRefGrant(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			inputs := []any{&corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{Name: string(targetName), Namespace: targetNS},
-				Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 80}}},
+				Name: string(targetName), Namespace: targetNS,
+				Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 80}}},
 			}}
 			if tt.grant != nil {
 				inputs = append(inputs, tt.grant)
@@ -116,11 +142,13 @@ func TestResolverBackendRefGrant(t *testing.T) {
 				},
 				DefaultNamespace: tt.ownerNS,
 				Remote: agentgateway.RemoteJWKS{
-					JwksPath: "keys",
-					BackendRef: gwv1.BackendObjectReference{
-						Name:      gwv1.ObjectName(targetName),
-						Namespace: tt.refNamespace,
-						Port:      new(gwv1.PortNumber(80)),
+					JwksPath: new(agentgateway.LongString("keys")),
+					PolicyBackendEndpoint: agentgateway.PolicyBackendEndpoint{
+						BackendRef: &gwv1.BackendObjectReference{
+							Name:      targetName,
+							Namespace: tt.refNamespace,
+							Port:      new(gwv1.PortNumber(80)),
+						},
 					},
 				},
 			})
@@ -136,7 +164,7 @@ func TestResolverBackendRefGrant(t *testing.T) {
 
 func referenceGrant(namespace string, source schema.GroupKind, sourceNamespace string, targetName *gwv1b1.ObjectName) *gwv1b1.ReferenceGrant {
 	return &gwv1b1.ReferenceGrant{
-		ObjectMeta: metav1.ObjectMeta{Name: "allow-jwks", Namespace: namespace},
+		Name: "allow-jwks", Namespace: namespace,
 		Spec: gwv1b1.ReferenceGrantSpec{
 			From: []gwv1b1.ReferenceGrantFrom{{
 				Group:     gwv1b1.Group(source.Group),

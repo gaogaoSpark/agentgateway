@@ -1,15 +1,21 @@
 use std::fmt::Display;
+use std::time::Instant;
 
+use anyhow::Context;
+use serde::Serialize;
 use serde_json::Value;
 use sqlx::types::Json;
-use sqlx::{PgPool, Postgres, QueryBuilder, Row};
+use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Row};
+use tracing::{error, info, warn};
 
 use super::{
-	AnalyticsGroup, AnalyticsSummaryRequest, AnalyticsSummaryResponse, AnalyticsTimeBucket,
-	GenAiEntry, GetRequest, GetResponse, GroupBy, GroupByField, LogEntry, LogFilters, PayloadEntry,
-	SearchRequest, SearchResponse, StoredRequestLog, StoredRequestLogPayload, TailRequest,
-	TailResponse, TimeRange, UsageEntry, analytics_window, attr_filter_values, decode_cursor,
-	encode_cursor, limit, promoted_attribute_column,
+	ANALYTICS_TOTALS_SELECT, AnalyticsSummaryRequest, AnalyticsSummaryResponse, AnalyticsTimeBucket,
+	AnalyticsTotals, GenAiEntry, GetRequest, GetResponse, GroupBy, GroupByField, LogEntry,
+	LogFilters, MIGRATIONS_TABLE, OUTPUT_TOKENS_PER_SECOND_BOUNDS, PayloadEntry, SearchRequest,
+	SearchResponse, StoredRequestLog, StoredRequestLogPayload, TTFT_BOUNDS_MS, TailRequest,
+	TailResponse, TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values,
+	decode_cursor, encode_cursor, groups_from_buckets, histogram_bucket_sql, limit,
+	promoted_attribute_column, prompt_preview, turn_kind,
 };
 
 pub struct PostgresLogStore {
@@ -17,10 +23,11 @@ pub struct PostgresLogStore {
 }
 
 const ANALYTICS_FILTER_OPTION_LIMIT: i64 = 500;
+const SCHEMA_LOCK_TIMEOUT: &str = "10s";
 
 impl PostgresLogStore {
 	pub async fn from_pool(pool: PgPool) -> anyhow::Result<Self> {
-		sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+		migrate(&pool).await?;
 		Ok(Self { pool })
 	}
 
@@ -83,17 +90,10 @@ impl PostgresLogStore {
 	}
 
 	pub async fn get(&self, request: GetRequest) -> anyhow::Result<GetResponse> {
-		let row = if request.include_payload {
-			sqlx::query(SELECT_LOG_WITH_PAYLOAD_BY_ID)
-				.bind(request.id)
-				.fetch_optional(&self.pool)
-				.await?
-		} else {
-			sqlx::query(SELECT_LOG_BY_ID)
-				.bind(request.id)
-				.fetch_optional(&self.pool)
-				.await?
-		};
+		let row = sqlx::query(SELECT_LOG_BY_ID)
+			.bind(request.id)
+			.fetch_optional(&self.pool)
+			.await?;
 		let log = row
 			.map(|row| row_to_log(row, true, request.include_payload))
 			.transpose()?;
@@ -119,7 +119,9 @@ impl PostgresLogStore {
 			qb.push(", ");
 			push_group_select(&mut qb, &request.group_by);
 		}
-		qb.push(", COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0)::BIGINT AS total_tokens, COALESCE(SUM(cost), 0.0)::DOUBLE PRECISION AS cost FROM request_logs WHERE 1=1");
+		qb.push(", ");
+		qb.push(ANALYTICS_TOTALS_SELECT);
+		qb.push(" FROM request_logs WHERE 1=1");
 		push_filters(&mut qb, Some(&time_range), &request.filters);
 		qb.push(" GROUP BY bucket_index");
 		if !request.group_by.is_empty() {
@@ -249,6 +251,50 @@ impl PostgresLogStore {
 	}
 }
 
+async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+	let started = Instant::now();
+	info!(
+		lock_timeout = SCHEMA_LOCK_TIMEOUT,
+		"initializing request log database schema"
+	);
+
+	// Use one connection for all migration work, then close it so the session-scoped
+	// lock_timeout and any advisory lock left behind after an error cannot leak into the pool.
+	let mut connection = pool
+		.acquire()
+		.await
+		.context("failed to acquire connection for request log database migration")?;
+	connection.close_on_drop();
+	sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+		.bind(SCHEMA_LOCK_TIMEOUT)
+		.execute(&mut *connection)
+		.await
+		.context("failed to configure request log database migration lock timeout")?;
+
+	let mut migrator = sqlx_macros::migrate!("./src/telemetry/log_store/postgres_migrations");
+	// Keep request-log migrations independent from any other SQLx-managed schema that
+	// may share this database.
+	migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
+	let result = migrator.run(&mut *connection).await;
+	if let Err(err) = connection.close().await {
+		warn!(
+			?err,
+			"failed to close request log database migration connection"
+		);
+	}
+
+	match result {
+		Ok(()) => {
+			info!(elapsed = ?started.elapsed(), "request log database schema is ready");
+			Ok(())
+		},
+		Err(err) => {
+			error!(?err, elapsed = ?started.elapsed(), "failed to migrate request log database schema");
+			Err(err).context("failed to migrate request log database schema")
+		},
+	}
+}
+
 fn push_request_log_copy_row(buf: &mut String, record: &StoredRequestLog) -> anyhow::Result<()> {
 	let mut first = true;
 	push_copy_text_column(buf, &mut first, Some(&record.id));
@@ -266,12 +312,17 @@ fn push_request_log_copy_row(buf: &mut String, record: &StoredRequestLog) -> any
 	push_copy_display_column(buf, &mut first, record.input_tokens);
 	push_copy_display_column(buf, &mut first, record.output_tokens);
 	push_copy_display_column(buf, &mut first, record.total_tokens);
+	push_copy_display_column(buf, &mut first, record.cache_read_input_tokens);
+	push_copy_display_column(buf, &mut first, record.cache_creation_input_tokens);
+	push_copy_display_column(buf, &mut first, record.reasoning_tokens);
+	push_copy_display_column(buf, &mut first, record.time_to_first_token_ms);
+	push_copy_display_column(buf, &mut first, record.time_per_output_token_ms);
 	push_copy_display_column(buf, &mut first, record.cost);
 	push_copy_text_column(buf, &mut first, record.agentgateway_user.as_deref());
 	push_copy_text_column(buf, &mut first, record.agentgateway_group.as_deref());
 	push_copy_text_column(buf, &mut first, record.user_agent_name.as_deref());
 	push_copy_display_column(buf, &mut first, Some(record.has_payload));
-	push_copy_text_column(buf, &mut first, Some(record.attributes_json.as_ref()));
+	push_copy_serialized_json_column(buf, &mut first, &record.attributes_json)?;
 	buf.push('\n');
 	Ok(())
 }
@@ -306,6 +357,20 @@ fn push_copy_display_column<T: Display>(buf: &mut String, first: &mut bool, valu
 	}
 }
 
+fn push_copy_serialized_json_column(
+	buf: &mut String,
+	first: &mut bool,
+	value: &str,
+) -> anyhow::Result<()> {
+	if value.contains(r"\u0000") {
+		let value: Value = serde_json::from_str(value)?;
+		push_copy_json_column(buf, first, Some(&value))?;
+	} else {
+		push_copy_text_column(buf, first, Some(value));
+	}
+	Ok(())
+}
+
 fn push_copy_json_column(
 	buf: &mut String,
 	first: &mut bool,
@@ -316,8 +381,30 @@ fn push_copy_json_column(
 		buf.push_str(r"\N");
 		return Ok(());
 	};
-	push_copy_escaped(buf, &serde_json::to_string(value)?);
+	let mut json = Vec::new();
+	value.serialize(&mut serde_json::Serializer::with_formatter(
+		&mut json,
+		NulReplacingFormatter,
+	))?;
+	push_copy_escaped(buf, std::str::from_utf8(&json)?);
 	Ok(())
+}
+
+// JSONB cannot store U+0000, and a single such value fails the whole COPY.
+// Write it as U+FFFD instead, wherever it appears in a string or key.
+struct NulReplacingFormatter;
+
+impl serde_json::ser::Formatter for NulReplacingFormatter {
+	fn write_char_escape<W: ?Sized + std::io::Write>(
+		&mut self,
+		writer: &mut W,
+		char_escape: serde_json::ser::CharEscape,
+	) -> std::io::Result<()> {
+		match char_escape {
+			serde_json::ser::CharEscape::AsciiControl(0) => writer.write_all(br"\ufffd"),
+			other => serde_json::ser::CompactFormatter.write_char_escape(writer, other),
+		}
+	}
 }
 
 fn push_copy_column_separator(buf: &mut String, first: &mut bool) {
@@ -328,9 +415,11 @@ fn push_copy_column_separator(buf: &mut String, first: &mut bool) {
 	}
 }
 
+// Postgres TEXT cannot store U+0000; replace it with U+FFFD rather than failing the COPY.
 fn push_copy_escaped(buf: &mut String, value: &str) {
 	for ch in value.chars() {
 		match ch {
+			'\0' => buf.push(char::REPLACEMENT_CHARACTER),
 			'\\' => buf.push_str(r"\\"),
 			'\n' => buf.push_str(r"\n"),
 			'\r' => buf.push_str(r"\r"),
@@ -338,23 +427,6 @@ fn push_copy_escaped(buf: &mut String, value: &str) {
 			_ => buf.push(ch),
 		}
 	}
-}
-
-fn groups_from_buckets(buckets: &[AnalyticsTimeBucket]) -> Vec<AnalyticsGroup> {
-	let mut groups = std::collections::BTreeMap::<String, AnalyticsGroup>::new();
-	for bucket in buckets {
-		let key = serde_json::to_string(&bucket.group).unwrap_or_default();
-		let group = groups.entry(key).or_insert_with(|| AnalyticsGroup {
-			group: bucket.group.clone(),
-			requests: 0,
-			total_tokens: 0,
-			cost: 0.0,
-		});
-		group.requests += bucket.requests;
-		group.total_tokens += bucket.total_tokens;
-		group.cost += bucket.cost;
-	}
-	groups.into_values().collect()
 }
 
 fn analytics_filter_option_map() -> std::collections::BTreeMap<String, Vec<String>> {
@@ -469,6 +541,17 @@ fn push_group_select(qb: &mut QueryBuilder<Postgres>, group_by: &[GroupBy]) {
 			GroupByField::HttpStatus => {
 				qb.push(format!("http_status::TEXT AS g{idx}"));
 			},
+			GroupByField::Ttft => {
+				let bucket = histogram_bucket_sql("time_to_first_token_ms", TTFT_BOUNDS_MS);
+				qb.push(format!("{bucket} AS g{idx}"));
+			},
+			GroupByField::OutputTokensPerSecond => {
+				let bucket = histogram_bucket_sql(
+					"1000.0 / NULLIF(time_per_output_token_ms, 0)",
+					OUTPUT_TOKENS_PER_SECOND_BOUNDS,
+				);
+				qb.push(format!("{bucket} AS g{idx}"));
+			},
 			GroupByField::Attributes => {
 				if let Some(column) = group.key.as_deref().and_then(promoted_attribute_column) {
 					qb.push(format!("{column} AS g{idx}"));
@@ -500,9 +583,7 @@ fn row_to_analytics_bucket(
 	Ok(AnalyticsTimeBucket {
 		start: from + chrono::Duration::seconds(bucket_index * bucket_seconds),
 		group,
-		requests: row.try_get("requests")?,
-		total_tokens: row.try_get("total_tokens")?,
-		cost: row.try_get("cost")?,
+		totals: AnalyticsTotals::from_row(&row)?,
 	})
 }
 
@@ -512,9 +593,14 @@ fn row_to_log(
 	include_payload: bool,
 ) -> anyhow::Result<LogEntry> {
 	let attributes: Json<Value> = row.try_get("attributes_json")?;
+	let request_prompt: Option<Json<Value>> = row.try_get("request_prompt_json")?;
+	let response_completion: Option<Json<Value>> = row.try_get("response_completion_json")?;
+	let prompt_preview = prompt_preview(request_prompt.as_ref().map(|value| &value.0));
+	let turn = TurnEntry {
+		input: turn_kind(request_prompt.as_ref().map(|value| &value.0)),
+		output: turn_kind(response_completion.as_ref().map(|value| &value.0)),
+	};
 	let payload = if include_payload {
-		let request_prompt: Option<Json<Value>> = row.try_get("request_prompt_json")?;
-		let response_completion: Option<Json<Value>> = row.try_get("response_completion_json")?;
 		Some(PayloadEntry {
 			request_prompt: request_prompt.map(|v| v.0),
 			response_completion: response_completion.map(|v| v.0),
@@ -531,6 +617,8 @@ fn row_to_log(
 		span_id: row.try_get("span_id")?,
 		http_status: row.try_get("http_status")?,
 		error: row.try_get("error")?,
+		prompt_preview,
+		turn,
 		gen_ai: GenAiEntry {
 			operation_name: row.try_get("gen_ai_operation_name")?,
 			provider_name: row.try_get("gen_ai_provider_name")?,
@@ -559,6 +647,8 @@ fn group_key(group: &GroupBy) -> String {
 			.key
 			.clone()
 			.unwrap_or_else(|| "attributes".to_string()),
+		GroupByField::Ttft => "ttft".to_string(),
+		GroupByField::OutputTokensPerSecond => "outputTokensPerSecond".to_string(),
 	}
 }
 
@@ -566,8 +656,9 @@ const COPY_REQUEST_LOGS: &str = r#"
 COPY request_logs (
 	id, started_at, completed_at, duration_ms, trace_id, span_id, http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
-	input_tokens, output_tokens, total_tokens, cost, agentgateway_user, agentgateway_group,
-	user_agent_name, has_payload, attributes_json
+	input_tokens, output_tokens, total_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+	reasoning_tokens, time_to_first_token_ms, time_per_output_token_ms, cost, agentgateway_user,
+	agentgateway_group, user_agent_name, has_payload, attributes_json
 ) FROM STDIN
 "#;
 
@@ -575,63 +666,17 @@ const COPY_REQUEST_LOG_PAYLOADS: &str = r#"
 COPY request_log_payloads (log_id, request_prompt_json, response_completion_json) FROM STDIN
 "#;
 
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS request_logs (
-	id TEXT PRIMARY KEY,
-	started_at TIMESTAMPTZ NOT NULL,
-	completed_at TIMESTAMPTZ NOT NULL,
-	duration_ms BIGINT NOT NULL,
-	trace_id TEXT,
-	span_id TEXT,
-	http_status INTEGER,
-	error TEXT,
-	gen_ai_operation_name TEXT,
-	gen_ai_provider_name TEXT,
-	gen_ai_request_model TEXT,
-	gen_ai_response_model TEXT,
-	input_tokens BIGINT,
-	output_tokens BIGINT,
-	total_tokens BIGINT,
-	cost DOUBLE PRECISION,
-	agentgateway_user TEXT,
-	agentgateway_group TEXT,
-	user_agent_name TEXT,
-	has_payload BOOLEAN NOT NULL,
-	attributes_json JSONB NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS request_log_payloads (
-	log_id TEXT PRIMARY KEY REFERENCES request_logs(id) ON DELETE CASCADE,
-	request_prompt_json JSONB,
-	response_completion_json JSONB
-);
-
-CREATE INDEX IF NOT EXISTS idx_request_logs_completed_at ON request_logs(completed_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_request_logs_http_status_completed_at ON request_logs(http_status, completed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_request_logs_gen_ai_completed_at ON request_logs(gen_ai_provider_name, gen_ai_request_model, completed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_request_logs_request_model_completed_at ON request_logs(gen_ai_request_model, completed_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_request_logs_user_completed_at ON request_logs(agentgateway_user, completed_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_request_logs_group_completed_at ON request_logs(agentgateway_group, completed_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_request_logs_user_agent_completed_at ON request_logs(user_agent_name, completed_at DESC, id DESC);
-"#;
-
 const SELECT_LOGS: &str = r#"
 SELECT id, started_at, completed_at, duration_ms, trace_id, span_id, http_status::BIGINT AS http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
-	input_tokens, output_tokens, total_tokens, cost, has_payload, attributes_json
+	input_tokens, output_tokens, total_tokens, cost, has_payload, attributes_json,
+	request_prompt_json, response_completion_json
 FROM request_logs
+LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
 "#;
 
 const SELECT_LOG_BY_ID: &str = r#"
 SELECT id, started_at, completed_at, duration_ms, trace_id, span_id, http_status::BIGINT AS http_status, error,
-	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
-	input_tokens, output_tokens, total_tokens, cost, has_payload, attributes_json
-FROM request_logs
-WHERE request_logs.id = $1
-"#;
-
-const SELECT_LOG_WITH_PAYLOAD_BY_ID: &str = r#"
-SELECT request_logs.id, started_at, completed_at, duration_ms, trace_id, span_id, http_status::BIGINT AS http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
 	input_tokens, output_tokens, total_tokens, cost, has_payload, attributes_json,
 	request_prompt_json, response_completion_json
@@ -639,3 +684,49 @@ FROM request_logs
 LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
 WHERE request_logs.id = $1
 "#;
+
+#[cfg(test)]
+mod tests {
+	use serde_json::json;
+
+	use super::*;
+
+	fn copy_json(value: &Value) -> String {
+		let mut buf = String::new();
+		push_copy_json_column(&mut buf, &mut true, Some(value)).unwrap();
+		buf
+	}
+
+	#[test]
+	fn copy_json_replaces_nul() {
+		assert_eq!(
+			copy_json(&json!({"role": "user", "content": "a\u{0}b"})),
+			r#"{"role":"user","content":"a\\ufffdb"}"#
+		);
+		assert_eq!(copy_json(&json!({"k\u{0}": 1})), r#"{"k\\ufffd":1}"#);
+		// A literal backslash followed by "u0000" is not a NUL.
+		assert_eq!(copy_json(&json!("\\u0000")), r#""\\\\u0000""#);
+		assert_eq!(copy_json(&json!("\\\u{0}")), r#""\\\\\\ufffd""#);
+		assert_eq!(copy_json(&json!("tab\there")), r#""tab\\there""#);
+	}
+
+	#[test]
+	fn copy_attributes_replaces_nul() {
+		for (attributes, expected) in [
+			(r#"{"k\u0000":"a\u0000b"}"#, r#"{"k\\ufffd":"a\\ufffdb"}"#),
+			(r#"{"literal":"\\u0000"}"#, r#"{"literal":"\\\\u0000"}"#),
+			(r#"{"value":"ordinary"}"#, r#"{"value":"ordinary"}"#),
+		] {
+			let mut buf = String::new();
+			push_copy_serialized_json_column(&mut buf, &mut true, attributes).unwrap();
+			assert_eq!(buf, expected);
+		}
+	}
+
+	#[test]
+	fn copy_text_replaces_nul() {
+		let mut buf = String::new();
+		push_copy_text_column(&mut buf, &mut true, Some("a\0b\tc"));
+		assert_eq!(buf, "a\u{fffd}b\\tc");
+	}
+}

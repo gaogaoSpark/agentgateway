@@ -2,6 +2,9 @@
 .claude
 .codex
 /target
+/build
+/.github/rust-cache/
+/.github/rust-cache-state/
 .vscode
 .idea
 .run
@@ -9,6 +12,7 @@
 .venv
 .env
 .env.*
+!.env.example
 *.local
 var/
 controller/_output
@@ -17,15 +21,12 @@ controller/testbox
 
 # JavaScript / TypeScript dependencies and generated artifacts
 node_modules/
-**/node_modules/
-ui2/out/
-ui2/dist/
-ui2/.vite/
-ui/out/
-ui/public/*-schema.json
+ui/dist/
 ui/src/cel.d.ts
 ui/src/gateway-admin.d.ts
 ui/src/gateway-config.d.ts
+ui/src/generated/cel-schema.json
+ui/src/generated/schema.json
 coverage/
 test-results/
 **/test-results/
@@ -33,8 +34,6 @@ playwright-report/
 **/playwright-report/
 **/*.tsbuildinfo
 npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
 pnpm-debug.log*
 cfg.yaml
 
@@ -45,3 +44,5 @@ cfg.yaml
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+/tools/.bin/

@@ -8,10 +8,18 @@ import (
 	"istio.io/istio/pkg/test"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/agentgateway/agentgateway/controller/pkg/utils/helmutils"
 	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
 
-var AgentgatewayControllerName = wellknown.DefaultAgwControllerName
+var (
+	AgentgatewayControllerName           = wellknown.DefaultAgwControllerName
+	AgentgatewayClassName                = wellknown.DefaultAgwClassName
+	AgentgatewayControllerDeploymentName = helmutils.AgentgatewayChartName
+	agentgatewayBackendGVK               = wellknown.AgentgatewayBackendGVK
+	agentgatewayParametersGVK            = wellknown.AgentgatewayParametersGVK
+	agentgatewayPolicyGVK                = wellknown.AgentgatewayPolicyGVK
+)
 
 var configureTest = func(t *testing.T) {}
 

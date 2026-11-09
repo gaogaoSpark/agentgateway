@@ -266,6 +266,7 @@ impl PartialOrd for Value<'_> {
 			(Value::UInt(a), Value::UInt(b)) => Some(a.cmp(b)),
 			(Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
 			(Value::String(a), Value::String(b)) => Some(a.as_ref().cmp(b.as_ref())),
+			(Value::Bytes(a), Value::Bytes(b)) => Some(a.as_ref().cmp(b.as_ref())),
 			(Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
 			(Value::Null, Value::Null) => Some(Ordering::Equal),
 
@@ -605,6 +606,9 @@ impl<'a> Value<'a> {
 				}
 				let left: Value<'a> = resolve(left_op)?;
 				if select.test {
+					if let Value::Dynamic(d) = &left {
+						return Ok(Value::Bool(d.field(&select.field).is_some()));
+					}
 					match left.always_materialize().as_ref() {
 						Value::Map(map) => {
 							let b = map.contains_key(&KeyRef::String(select.field.as_str().into()));
@@ -1006,7 +1010,10 @@ impl<'a> Value<'a> {
 		ctx: &'vars Context,
 		resolver: &'rf dyn VariableResolver<'vars>,
 	) -> ResolveResult<'a> {
-		let mut map = hashbrown::HashMap::with_capacity(map_expr.entries.len());
+		let mut map = crate::types::map::IndexMap::with_capacity_and_hasher(
+			map_expr.entries.len(),
+			Default::default(),
+		);
 		for entry in map_expr.entries.iter() {
 			let (k, v, is_optional) = match &entry.expr {
 				EntryExpr::StructField(_) => panic!("WAT?"),
@@ -1184,6 +1191,12 @@ impl<'a> ops::Add<Value<'a>> for Value<'a> {
 				res.push_str(r.as_ref());
 				Ok(Value::String(res.into()))
 			},
+			(Value::Bytes(l), Value::Bytes(r)) => {
+				let mut res = Vec::with_capacity(l.as_ref().len() + r.as_ref().len());
+				res.extend_from_slice(l.as_ref());
+				res.extend_from_slice(r.as_ref());
+				Ok(Value::Bytes(BytesValue::Owned(res.into())))
+			},
 
 			(Value::Duration(l), Value::Duration(r)) => l
 				.checked_add(&r)
@@ -1355,7 +1368,7 @@ fn try_bool(val: ResolveResult) -> Result<bool, ExecutionError> {
 mod tests {
 	use std::collections::HashMap;
 
-	use crate::context::{MapResolver, VariableResolver};
+	use crate::context::{MapResolver, SingleVarResolver};
 	use crate::objects::{Key, ListValue, Value};
 	use crate::parser::Expression;
 	use crate::{Context, ExecutionError, Program};
@@ -1428,6 +1441,14 @@ mod tests {
 	}
 
 	#[test]
+	fn test_bytes_compare() {
+		let program =
+			Program::compile(r#"b"a" < b"b" && b"a" <= b"a" && b"b" > b"a" && b"b" >= b"b""#).unwrap();
+		let context = Context::default();
+		assert_eq!(program.execute(&context).unwrap(), true.into());
+	}
+
+	#[test]
 	fn test_invalid_compare() {
 		let context = Context::default();
 
@@ -1474,6 +1495,14 @@ mod tests {
 			"'foo' + 10",
 			ExecutionError::UnsupportedBinaryOperator("add", "foo".into(), Value::Int(10)),
 		);
+	}
+
+	#[test]
+	fn test_add_bytes() {
+		let program = Program::compile(r#"b"a" + b"b""#).unwrap();
+		let context = Context::default();
+		let value = program.execute(&context).unwrap();
+		assert_eq!(value, Value::from(b"ab".to_vec()));
 	}
 
 	#[test]
@@ -1634,33 +1663,13 @@ mod tests {
 		}
 	}
 
-	struct CompositeResolver<'a, 'rf> {
-		base: &'rf dyn VariableResolver<'a>,
-		name: &'a str,
-		val: Value<'a>,
-	}
-
-	impl<'a, 'rf> VariableResolver<'a> for CompositeResolver<'a, 'rf> {
-		fn resolve(&self, expr: &str) -> Option<Value<'a>> {
-			if expr == self.name {
-				Some(self.val.clone())
-			} else {
-				self.base.resolve(expr)
-			}
-		}
-	}
-
 	#[test]
 	fn test_function_identifier() {
 		fn with<'a, 'rf, 'b>(ftx: &'b mut crate::FunctionContext<'a, 'rf>) -> crate::ResolveResult<'a> {
 			let this = ftx.this.as_ref().unwrap();
 			let ident = ftx.ident(0)?;
 			let expr: &'a Expression = ftx.expr(1)?;
-			let resolver = CompositeResolver::<'a, 'rf> {
-				base: ftx.variables,
-				name: ident,
-				val: this.clone(),
-			};
+			let resolver = SingleVarResolver::new(ftx.variables, ident, this.clone());
 			let v = Value::resolve(expr, ftx.ptx, &resolver)?;
 			Ok(v)
 		}
@@ -1740,6 +1749,55 @@ mod tests {
 					_ => None,
 				}
 			}
+		}
+
+		/// Reports whether `materialize()` was called, so a test can assert that
+		/// an operation stayed on the lazy `field()` path.
+		#[derive(Debug, Default)]
+		struct CountingDynamic {
+			materialized: std::sync::atomic::AtomicUsize,
+		}
+
+		impl DynamicType for CountingDynamic {
+			fn materialize(&self) -> Value<'_> {
+				self
+					.materialized
+					.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				let mut map = vector_map::VecMap::with_capacity(1);
+				map.insert(crate::objects::KeyRef::from("field"), Value::from("value"));
+				Value::Map(crate::objects::MapValue::Borrow(map))
+			}
+
+			fn field(&self, field: &str) -> Option<Value<'_>> {
+				match field {
+					"field" => Some(Value::from("value")),
+					_ => None,
+				}
+			}
+		}
+
+		#[test]
+		fn test_has_over_dynamic_does_not_materialize() {
+			let value = CountingDynamic::default();
+
+			let mut vars = MapResolver::new();
+			vars.add_variable_from_value("mine", Value::Dynamic(DynamicValue::new(&value)));
+			let ctx = Context::default();
+			for (src, want) in [("has(mine.field)", true), ("has(mine.missing)", false)] {
+				let prog = Program::compile(src).unwrap();
+				assert_eq!(
+					Ok(Value::Bool(want)),
+					prog.execute_with(&ctx, &vars),
+					"{src}"
+				);
+			}
+			assert_eq!(
+				0,
+				value
+					.materialized
+					.load(std::sync::atomic::Ordering::Relaxed),
+				"has() should answer from field(), not by materializing the value"
+			);
 		}
 
 		#[test]
@@ -2212,7 +2270,7 @@ mod tests {
 				.enable_optional_syntax(true)
 				.parse(r#"{"a": 1, "b": 2, ?"c": optional.of(3)}"#)
 				.expect("Must parse");
-			let mut expected_map = hashbrown::HashMap::new();
+			let mut expected_map = crate::types::map::IndexMap::default();
 			expected_map.insert("a".into(), Value::Int(1));
 			expected_map.insert("b".into(), Value::Int(2));
 			expected_map.insert("c".into(), Value::Int(3));
@@ -2225,7 +2283,7 @@ mod tests {
 				.enable_optional_syntax(true)
 				.parse(r#"{"a": 1, "b": 2, ?"c": optional.none()}"#)
 				.expect("Must parse");
-			let mut expected_map = hashbrown::HashMap::new();
+			let mut expected_map = crate::types::map::IndexMap::default();
 			expected_map.insert("a".into(), Value::Int(1));
 			expected_map.insert("b".into(), Value::Int(2));
 			assert_eq!(
@@ -2237,7 +2295,7 @@ mod tests {
 				.enable_optional_syntax(true)
 				.parse(r#"{"a": 1, ?"b": optional.none(), ?"c": optional.of(3)}"#)
 				.expect("Must parse");
-			let mut expected_map = hashbrown::HashMap::new();
+			let mut expected_map = crate::types::map::IndexMap::default();
 			expected_map.insert("a".into(), Value::Int(1));
 			expected_map.insert("c".into(), Value::Int(3));
 			assert_eq!(
@@ -2249,7 +2307,7 @@ mod tests {
 				.enable_optional_syntax(true)
 				.parse(r#"{"a": 1, ?"b": mymap[?"missing"]}"#)
 				.expect("Must parse");
-			let mut expected_map = hashbrown::HashMap::new();
+			let mut expected_map = crate::types::map::IndexMap::default();
 			expected_map.insert("a".into(), Value::Int(1));
 			assert_eq!(
 				Value::resolve(&expr, &ctx, &map_vars),
@@ -2260,7 +2318,7 @@ mod tests {
 				.enable_optional_syntax(true)
 				.parse(r#"{"x": 10, ?"y": mymap[?"a"]}"#)
 				.expect("Must parse");
-			let mut expected_map = hashbrown::HashMap::new();
+			let mut expected_map = crate::types::map::IndexMap::default();
 			expected_map.insert("x".into(), Value::Int(10));
 			expected_map.insert("y".into(), Value::Int(1));
 			assert_eq!(
@@ -2275,7 +2333,7 @@ mod tests {
 			assert_eq!(
 				Value::resolve(&expr, &ctx, &empty_vars),
 				Ok(Value::Map(MapValue::Owned(Arc::from(
-					hashbrown::HashMap::new()
+					crate::types::map::IndexMap::default()
 				)))),
 			);
 		}

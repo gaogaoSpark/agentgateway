@@ -20,6 +20,33 @@ use crate::*;
 #[path = "route_test.rs"]
 mod tests;
 
+/// Strips a path prefix using segment-aware matching per the Gateway API spec.
+///
+/// The prefix is matched at a path segment boundary: after stripping the prefix,
+/// the remainder must either be empty or start with '/'. A trailing '/' in the
+/// prefix is ignored (except for the root prefix "/").
+///
+/// Returns the remainder of the path after stripping the prefix, or None if the
+/// path does not start with the given prefix at a segment boundary.
+///
+/// # Examples
+/// ```ignore
+/// assert_eq!(strip_path_prefix("/foo/bar", "/foo"), Some("/bar"));
+/// assert_eq!(strip_path_prefix("/foo", "/foo"), Some(""));
+/// assert_eq!(strip_path_prefix("/foo/", "/foo"), Some("/"));
+/// assert_eq!(strip_path_prefix("/foobar", "/foo"), None);
+/// assert_eq!(strip_path_prefix("/anything", "/"), Some("/anything"));
+/// ```
+pub(crate) fn strip_path_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+	let prefix = prefix.trim_end_matches('/');
+	let rest = path.strip_prefix(prefix)?;
+	if prefix.is_empty() || rest.is_empty() || rest.starts_with('/') {
+		Some(rest)
+	} else {
+		None
+	}
+}
+
 /// Check if a RouteMatch matches the given request (path, method, headers, query).
 fn matches_request(m: &RouteMatch, request: &Request) -> bool {
 	let request_path =
@@ -35,14 +62,7 @@ fn matches_request(m: &RouteMatch, request: &Request) -> bool {
 			.map(|m| m.start() == 0 && m.end() == request_path.len())
 			.unwrap_or(false),
 		PathMatch::Invalid => false,
-		PathMatch::PathPrefix(p) => {
-			let p = p.trim_end_matches('/');
-			let Some(suffix) = request_path.trim_end_matches('/').strip_prefix(p) else {
-				return false;
-			};
-			// TODO this is not right!!
-			suffix.is_empty() || suffix.starts_with('/')
-		},
+		PathMatch::PathPrefix(p) => strip_path_prefix(request_path, p.as_str()).is_some(),
 	};
 	if !path_matches {
 		return false;
@@ -184,7 +204,7 @@ pub fn select_best_route(
 			));
 			(def, Cow::Owned(svc.hostname.to_string()))
 		} else {
-			(None, Cow::Borrowed(host))
+			(None, lowercase_host(host))
 		};
 	let listener_routes = {
 		let binds = stores.read_binds();
@@ -223,8 +243,8 @@ pub fn select_best_route_group(
 	rg: &RouteSet,
 	request: &Request,
 ) -> Option<(Arc<Route>, PathMatch)> {
-	let host = http::get_host(request).ok()?;
-	for hnm in agent::HostnameMatch::all_matches(host) {
+	let host = lowercase_host(http::get_host(request).ok()?);
+	for hnm in agent::HostnameMatch::all_matches(&host) {
 		let mut candidates = rg.get_hostname(&hnm);
 		let best_match = candidates.find(|(_, m)| matches_request(m, request));
 		if let Some((route, matcher)) = best_match {
@@ -232,6 +252,16 @@ pub fn select_best_route_group(
 		}
 	}
 	None
+}
+
+// Hostnames are case-insensitive (RFC 9110 4.2.3) and route hostnames are indexed lowercase.
+// Only the lookup key is lowercased; the request's Host is forwarded unmodified.
+fn lowercase_host(host: &str) -> Cow<'_, str> {
+	if host.bytes().any(|b| b.is_ascii_uppercase()) {
+		Cow::Owned(host.to_ascii_lowercase())
+	} else {
+		Cow::Borrowed(host)
+	}
 }
 
 pub fn best_match_for_route(route: &Route, request: &Request) -> Option<PathMatch> {
@@ -289,7 +319,7 @@ fn get_path_rank(path: &PathMatch) -> u8 {
 fn get_path_length(path: &PathMatch) -> usize {
 	match path {
 		PathMatch::Exact(p) | PathMatch::PathPrefix(p) => p.len(),
-		PathMatch::Regex(r) => r.as_str().len(),
+		PathMatch::Regex(r) => PathMatch::regex_pattern(r).len(),
 		// Because this can never match, its rank is irrelevant
 		PathMatch::Invalid => 0,
 	}

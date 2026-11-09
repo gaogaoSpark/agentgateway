@@ -3,6 +3,7 @@ use ::http::header::{ACCEPT, CONTENT_TYPE};
 use anyhow::anyhow;
 use futures::StreamExt;
 use headers::HeaderMapExt;
+use http_body_util::BodyExt as _;
 use rmcp::model::{
 	ClientJsonRpcMessage, ClientNotification, ClientRequest, JsonRpcRequest, ServerJsonRpcMessage,
 };
@@ -72,6 +73,14 @@ impl Client {
 		ctx: &IncomingRequestContext,
 	) -> Result<StreamableHttpPostResponse, ClientError> {
 		let message = ClientJsonRpcMessage::notification(req);
+		self.send_message(message, ctx).await
+	}
+
+	pub async fn send_client_message(
+		&self,
+		message: ClientJsonRpcMessage,
+		ctx: &IncomingRequestContext,
+	) -> Result<StreamableHttpPostResponse, ClientError> {
 		self.send_message(message, ctx).await
 	}
 	async fn send_message(

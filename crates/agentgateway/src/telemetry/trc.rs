@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_core::telemetry::ValueBag;
-use http::Version;
+use futures_util::future::BoxFuture;
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
 use opentelemetry::trace::{SpanContext, SpanId, SpanKind, Status, TraceId, TraceState};
 use opentelemetry::{InstrumentationScope, Key, KeyValue, TraceFlags};
+use opentelemetry_http::HttpError;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{
@@ -22,7 +23,7 @@ use crate::types::agent::{BackendTrafficPolicy, SimpleBackendReference, TracingC
 
 #[derive(Clone, Debug)]
 pub struct Tracer {
-	pub provider: SdkTracerProvider,
+	pub provider: super::NonBlockingDrop<SdkTracerProvider>,
 	pub processor: SharedSpanProcessor,
 	pub fields: Arc<LoggingFields>,
 	pub(crate) filter: Option<Arc<cel::Expression>>,
@@ -98,18 +99,20 @@ pub fn new_trace_processor(
 	SharedSpanProcessor::new(processor)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn trace_span_data(
 	name: impl Into<std::borrow::Cow<'static, str>>,
 	span_kind: SpanKind,
 	span: &TraceParent,
-	parent: Option<&TraceParent>,
+	parent: Option<(&TraceParent, bool)>,
 	start_time: std::time::SystemTime,
 	end_time: std::time::SystemTime,
 	attributes: Vec<KeyValue>,
+	status: Status,
 ) -> SpanData {
-	let parent_span_id = parent
-		.map(|parent| SpanId::from(parent.span_id))
-		.unwrap_or(SpanId::INVALID);
+	let (parent_span_id, parent_span_is_remote) = parent
+		.map(|(parent, remote)| (SpanId::from(parent.span_id), remote))
+		.unwrap_or((SpanId::INVALID, false));
 	SpanData {
 		span_context: SpanContext::new(
 			TraceId::from(span.trace_id),
@@ -119,7 +122,7 @@ pub fn trace_span_data(
 			TraceState::default(),
 		),
 		parent_span_id,
-		parent_span_is_remote: parent.is_some(),
+		parent_span_is_remote,
 		span_kind,
 		name: name.into(),
 		start_time,
@@ -128,7 +131,7 @@ pub fn trace_span_data(
 		dropped_attributes_count: 0,
 		events: SpanEvents::default(),
 		links: SpanLinks::default(),
-		status: Status::default(),
+		status,
 		instrumentation_scope: InstrumentationScope::builder("agentgateway").build(),
 	}
 }
@@ -152,13 +155,6 @@ pub struct DeprecatedConfig {
 	pub random_sampling: Option<Arc<cel::Expression>>,
 	pub client_sampling: Option<Arc<cel::Expression>>,
 	pub path: String,
-}
-
-mod semconv {
-	use opentelemetry::Key;
-
-	pub static PROTOCOL_VERSION: Key = Key::from_static_str("network.protocol.version");
-	pub static URL_SCHEME: Key = Key::from_static_str("url.scheme");
 }
 
 impl Tracer {
@@ -264,7 +260,7 @@ impl Tracer {
 			(provider, processor)
 		};
 		Ok(Tracer {
-			provider,
+			provider: super::NonBlockingDrop::new(provider),
 			processor,
 			fields,
 			filter: config.filter.clone(),
@@ -280,15 +276,19 @@ impl Tracer {
 		request: &RequestLog,
 		end: &agent_core::Timestamp,
 		cel_exec: &CelLoggingExecutor,
+		protocol_span_name: Option<&str>,
 		attrs: &[(&str, Option<ValueBag<'v>>)],
 	) {
 		let mut attributes = attrs
 			.iter()
 			.filter(|(k, _)| !self.fields.has(k))
+			.filter(|(k, _)| *k != "error")
 			.filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
 			.map(|(k, v)| KeyValue::new(Key::new(k.to_string()), to_otel(v)))
 			.collect_vec();
-		let out_span = request.outgoing_span.as_ref().unwrap();
+		let Some(out_span) = request.outgoing_span.as_ref() else {
+			return;
+		};
 		if !out_span.is_sampled() {
 			return;
 		}
@@ -297,19 +297,6 @@ impl Tracer {
 		}
 		let start = request.start.as_system_time();
 		let end = end.as_system_time();
-
-		// For now we only accept HTTP(?)
-		attributes.push(KeyValue::new(semconv::URL_SCHEME.clone(), "http"));
-		// Otel spec has a special format here
-		match &request.version {
-			Some(Version::HTTP_11) => {
-				attributes.push(KeyValue::new(semconv::PROTOCOL_VERSION.clone(), "1.1"));
-			},
-			Some(Version::HTTP_2) => {
-				attributes.push(KeyValue::new(semconv::PROTOCOL_VERSION.clone(), "2"));
-			},
-			_ => {},
-		}
 
 		attributes.reserve(self.fields.add.len());
 
@@ -327,24 +314,51 @@ impl Tracer {
 			}
 		}
 
-		let span_name = span_name.unwrap_or_else(|| match (&request.method, &request.path_match) {
-			(Some(method), Some(path_match)) => {
-				format!("{method} {path_match}")
-			},
-			_ => "unknown".to_string(),
+		let span_name = span_name.unwrap_or_else(|| {
+			protocol_span_name.map(str::to_owned).unwrap_or_else(|| {
+				match (&request.method, &request.path_match) {
+					(Some(method), Some(path_match)) => format!("{method} {path_match}"),
+					_ => "unknown".to_string(),
+				}
+			})
 		});
+		let status = request_span_status(request, &mut attributes);
 
-		let out_span = request.outgoing_span.as_ref().unwrap();
 		self.processor.emit(trace_span_data(
 			span_name,
 			SpanKind::Server,
 			out_span,
-			request.incoming_span.as_ref(),
+			request.incoming_span.as_ref().map(|parent| (parent, true)),
 			start,
 			end,
 			attributes,
+			status,
 		));
 	}
+}
+
+fn request_span_status(request: &RequestLog, attributes: &mut Vec<KeyValue>) -> Status {
+	let (error_type, description) = if let Some(error) = &request.error {
+		(
+			request
+				.reason
+				.map(|reason| reason.to_string())
+				.unwrap_or_else(|| "_OTHER".to_string()),
+			error.clone(),
+		)
+	} else if let Some(status) = request.status.filter(http::StatusCode::is_server_error) {
+		(status.as_u16().to_string(), String::new())
+	} else {
+		return Status::default();
+	};
+
+	if !attributes
+		.iter()
+		.any(|attribute| attribute.key.as_str() == "error.type")
+	{
+		attributes.push(KeyValue::new("error.type", error_type));
+	}
+	Status::error(description)
 }
 
 /// Policy-aware OTLP gRPC exporter that routes via `GrpcReferenceChannel`, ensuring
@@ -458,39 +472,59 @@ pub(crate) struct PolicyOtelHttpClient {
 	pub(crate) policies: Vec<BackendTrafficPolicy>,
 }
 
-#[async_trait::async_trait]
 impl opentelemetry_http::HttpClient for PolicyOtelHttpClient {
-	async fn send_bytes(
+	fn send_bytes<'a, 'fut>(
+		&'a self,
+		request: http::Request<bytes::Bytes>,
+	) -> BoxFuture<'fut, Result<http::Response<bytes::Bytes>, HttpError>>
+	where
+		'a: 'fut,
+		Self: 'fut,
+	{
+		self.send_bytes_inner(request)
+	}
+}
+
+impl PolicyOtelHttpClient {
+	// Build the future outside async_trait's outlives bounds so rustc can reuse the
+	// Send proof for PolicyClient. See rust-lang/rust#157595.
+	fn send_bytes_inner(
 		&self,
 		request: http::Request<bytes::Bytes>,
-	) -> Result<http::Response<bytes::Bytes>, Box<dyn std::error::Error + Send + Sync + 'static>> {
-		let client = self.policy_client.clone();
-		let backend_ref = self.backend_ref.clone();
-		let policies = self.policies.clone();
-		let handle = self.runtime.clone();
+	) -> BoxFuture<'_, Result<http::Response<bytes::Bytes>, HttpError>> {
+		Box::pin(async move {
+			let client = self.policy_client.clone();
+			let backend_ref = self.backend_ref.clone();
+			let policies = self.policies.clone();
+			let handle = self.runtime.clone();
 
-		let (mut head, body_bytes) = request.into_parts();
-		let mut uri_parts = head.uri.into_parts();
-		uri_parts.scheme = None;
-		uri_parts.authority = None;
-		head.uri = http::Uri::from_parts(uri_parts).map_err(Box::new)?;
-		let req = crate::http::Request::from_parts(head, crate::http::Body::from(body_bytes));
+			let (mut head, body_bytes) = request.into_parts();
+			let mut uri_parts = head.uri.into_parts();
+			uri_parts.scheme = None;
+			uri_parts.authority = None;
+			head.uri = http::Uri::from_parts(uri_parts).map_err(Box::new)?;
+			let req = crate::http::Request::from_parts(head, crate::http::Body::from(body_bytes));
 
-		let resp = handle
-			.spawn(async move {
-				client
-					.call_reference_with_policies(req, &backend_ref, &policies)
-					.await
-					.map_err(Box::new)
-			})
-			.await
-			.map_err(Box::new)??;
+			handle
+				.spawn(async move {
+					let resp = client
+						.call_reference_with_policies_untraced(req, &backend_ref, &policies)
+						.await
+						.map_err(Box::new)?;
 
-		use http_body_util::BodyExt as _;
-		let (parts, body) = resp.into_parts();
-		let collected = body.collect().await.map_err(Box::new)?;
-		let bytes = collected.to_bytes();
-		Ok(http::Response::from_parts(parts, bytes))
+					// Release the body and extension pool guards on the Tokio runtime.
+					use http_body_util::BodyExt as _;
+					let (mut parts, body) = resp.into_parts();
+					parts.extensions.clear();
+					let collected = body.collect().await.map_err(Box::new)?;
+					Ok::<_, Box<dyn std::error::Error + Send + Sync>>(http::Response::from_parts(
+						parts,
+						collected.to_bytes(),
+					))
+				})
+				.await
+				.map_err(Box::new)?
+		})
 	}
 }
 
@@ -669,8 +703,11 @@ mod traceparent {
 			}
 		}
 		pub fn insert_header(&self, req: &mut Request) {
+			self.insert_headers(req.headers_mut());
+		}
+		pub fn insert_headers(&self, headers: &mut ::http::HeaderMap) {
 			let hv = hyper::header::HeaderValue::from_bytes(format!("{self:?}").as_bytes()).unwrap();
-			req.headers_mut().insert(TRACEPARENT, hv);
+			headers.insert(TRACEPARENT, hv);
 		}
 		pub fn from_request(req: &Request) -> Option<Self> {
 			req
@@ -693,6 +730,14 @@ mod traceparent {
 		}
 		pub fn is_sampled(&self) -> bool {
 			(self.flags & 0x01) == 0x01
+		}
+		/// Only touches the sampled bit, so any other flags from the parent survive.
+		pub fn set_sampled(&mut self, sampled: bool) {
+			if sampled {
+				self.flags |= 0x01;
+			} else {
+				self.flags &= !0x01;
+			}
 		}
 	}
 
@@ -757,7 +802,7 @@ mod tests {
 	use prometheus_client::registry::Registry;
 
 	use super::*;
-	use crate::llm::cost::ModelCatalog;
+	use crate::llm::catalog::ModelCatalog;
 	use crate::telemetry::log::{
 		CelLogging, CelLoggingExecutor, LoggingFields, MetricFields, RequestLog,
 	};
@@ -824,7 +869,7 @@ mod tests {
 			.build();
 		(
 			Tracer {
-				provider,
+				provider: crate::telemetry::NonBlockingDrop::new(provider),
 				processor,
 				fields: Arc::new(LoggingFields::default()),
 				filter: None,
@@ -841,10 +886,15 @@ mod tests {
 			otlp_filter: None,
 			otlp_fields: LoggingFields::default(),
 			metric_fields: MetricFields::default(),
+			standard_attributes: LoggingFields::default(),
 			database_fields: LoggingFields::default(),
 		};
 		let mut registry = Registry::default();
-		let metrics = Arc::new(Metrics::new(&mut registry, Default::default()));
+		let metrics = Arc::new(Metrics::new(
+			&mut registry,
+			Default::default(),
+			Default::default(),
+		));
 		RequestLog::new(
 			cel,
 			metrics,
@@ -879,6 +929,7 @@ mod tests {
 		let otlp_fields = LoggingFields::default();
 		let metric_fields = Arc::new(MetricFields::default());
 		let database_fields = LoggingFields::default();
+		let standard_attributes = LoggingFields::default();
 		let cel_exec = CelLoggingExecutor {
 			executor: crate::cel::Executor::new_empty(),
 			filter: &filter,
@@ -886,10 +937,11 @@ mod tests {
 			otlp_filter: &otlp_filter,
 			otlp_fields: &otlp_fields,
 			metric_fields: &metric_fields,
+			standard_attributes: &standard_attributes,
 			database_fields: &database_fields,
 		};
 
-		tracer.send(&request, &Timestamp::now(), &cel_exec, &[]);
+		tracer.send(&request, &Timestamp::now(), &cel_exec, None, &[]);
 		let _ = tracer.provider.force_flush();
 
 		let spans = exporter.finished_spans();
@@ -901,6 +953,207 @@ mod tests {
 		assert_eq!(span.parent_span_id, incoming.span_id.into());
 		assert!(span.parent_span_is_remote);
 		assert!(span.links.iter().next().is_none());
+	}
+
+	/// A span forced by `parentNotSampled` reflects that decision in its own flags, and stays a
+	/// child of the unsampled remote parent.
+	#[test]
+	fn send_exports_forced_span_from_unsampled_parent() {
+		let (tracer, exporter) = test_tracer();
+		let mut request = test_request_log();
+		request.method = Some(http::Method::GET);
+		request.path_match = Some(strng::new("/trace"));
+
+		let incoming = TraceParent::new();
+		let mut outgoing = incoming.new_span();
+		outgoing.set_sampled(true);
+		assert!(!incoming.is_sampled());
+		request.incoming_span = Some(incoming.clone());
+		request.outgoing_span = Some(outgoing.clone());
+
+		let filter = None;
+		let fields = LoggingFields::default();
+		let otlp_filter = None;
+		let otlp_fields = LoggingFields::default();
+		let metric_fields = Arc::new(MetricFields::default());
+		let database_fields = LoggingFields::default();
+		let standard_attributes = LoggingFields::default();
+		let cel_exec = CelLoggingExecutor {
+			executor: crate::cel::Executor::new_empty(),
+			filter: &filter,
+			fields: &fields,
+			otlp_filter: &otlp_filter,
+			otlp_fields: &otlp_fields,
+			metric_fields: &metric_fields,
+			standard_attributes: &standard_attributes,
+			database_fields: &database_fields,
+		};
+
+		tracer.send(&request, &Timestamp::now(), &cel_exec, None, &[]);
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		assert_eq!(spans.len(), 1);
+		let span = &spans[0];
+		assert_eq!(span.span_context.trace_id(), outgoing.trace_id.into());
+		assert_eq!(span.span_context.span_id(), outgoing.span_id.into());
+		assert_eq!(span.parent_span_id, incoming.span_id.into());
+		assert!(span.parent_span_is_remote);
+		assert!(span.span_context.is_sampled());
+	}
+
+	#[test]
+	fn send_skips_export_when_not_sampled() {
+		let (tracer, exporter) = test_tracer();
+		let mut request = test_request_log();
+		let outgoing = TraceParent::new();
+		assert!(!outgoing.is_sampled());
+		request.outgoing_span = Some(outgoing);
+
+		let filter = None;
+		let fields = LoggingFields::default();
+		let otlp_filter = None;
+		let otlp_fields = LoggingFields::default();
+		let metric_fields = Arc::new(MetricFields::default());
+		let database_fields = LoggingFields::default();
+		let standard_attributes = LoggingFields::default();
+		let cel_exec = CelLoggingExecutor {
+			executor: crate::cel::Executor::new_empty(),
+			filter: &filter,
+			fields: &fields,
+			otlp_filter: &otlp_filter,
+			otlp_fields: &otlp_fields,
+			metric_fields: &metric_fields,
+			standard_attributes: &standard_attributes,
+			database_fields: &database_fields,
+		};
+
+		tracer.send(&request, &Timestamp::now(), &cel_exec, None, &[]);
+		let _ = tracer.provider.force_flush();
+
+		assert!(exporter.finished_spans().is_empty());
+	}
+
+	fn test_llm_request() -> crate::llm::LLMRequest {
+		crate::llm::LLMRequest {
+			input_tokens: None,
+			input_format: crate::llm::InputFormat::Responses,
+			cache_convention: Default::default(),
+			request_model: "test-model".into(),
+			original_model: None,
+			provider: "test-provider".into(),
+			streaming: false,
+			params: Default::default(),
+			prompt: None,
+			provider_state: None,
+		}
+	}
+
+	#[test]
+	fn send_exports_gen_ai_server_error_status() {
+		let (tracer, exporter) = test_tracer();
+		let mut request = test_request_log();
+		request.status = Some(http::StatusCode::INTERNAL_SERVER_ERROR);
+		request.llm_request = Some(test_llm_request());
+		let mut outgoing = TraceParent::new();
+		outgoing.flags = 1;
+		request.outgoing_span = Some(outgoing);
+
+		let filter = None;
+		let fields = LoggingFields::default();
+		let otlp_filter = None;
+		let otlp_fields = LoggingFields::default();
+		let metric_fields = Arc::new(MetricFields::default());
+		let database_fields = LoggingFields::default();
+		let standard_attributes = LoggingFields::default();
+		let cel_exec = CelLoggingExecutor {
+			executor: crate::cel::Executor::new_empty(),
+			filter: &filter,
+			fields: &fields,
+			otlp_filter: &otlp_filter,
+			otlp_fields: &otlp_fields,
+			metric_fields: &metric_fields,
+			standard_attributes: &standard_attributes,
+			database_fields: &database_fields,
+		};
+
+		tracer.send(&request, &Timestamp::now(), &cel_exec, None, &[]);
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		assert_eq!(spans.len(), 1);
+		assert_eq!(spans[0].status, Status::error(""));
+		assert!(
+			spans[0]
+				.attributes
+				.contains(&KeyValue::new("error.type", "500"))
+		);
+	}
+
+	#[test]
+	fn request_span_classifies_http_and_gen_ai_errors() {
+		for (status, gen_ai, expected, expected_error_type) in [
+			(http::StatusCode::OK, false, Status::default(), None),
+			(
+				http::StatusCode::TOO_MANY_REQUESTS,
+				false,
+				Status::default(),
+				None,
+			),
+			(
+				http::StatusCode::TOO_MANY_REQUESTS,
+				true,
+				Status::default(),
+				None,
+			),
+			(
+				http::StatusCode::INTERNAL_SERVER_ERROR,
+				false,
+				Status::error(""),
+				Some("500"),
+			),
+		] {
+			let mut request = test_request_log();
+			request.status = Some(status);
+			if gen_ai {
+				request.llm_request = Some(test_llm_request());
+			}
+			let mut attributes = Vec::new();
+
+			assert_eq!(
+				request_span_status(&request, &mut attributes),
+				expected,
+				"status {status}, gen_ai {gen_ai}",
+			);
+			assert_eq!(
+				attributes
+					.iter()
+					.find(|attribute| attribute.key.as_str() == "error.type")
+					.map(|attribute| attribute.value.as_str().into_owned()),
+				expected_error_type.map(str::to_string),
+			);
+		}
+	}
+
+	#[test]
+	fn request_span_preserves_recorded_error_and_custom_error_type() {
+		let mut request = test_request_log();
+		request.error = Some("connection failed".to_string());
+		request.reason = Some(crate::proxy::ProxyResponseReason::UpstreamFailure);
+		let mut attributes = vec![KeyValue::new("error.type", "custom")];
+
+		assert_eq!(
+			request_span_status(&request, &mut attributes),
+			Status::error("connection failed"),
+		);
+		assert_eq!(
+			attributes
+				.iter()
+				.filter(|attribute| attribute.key.as_str() == "error.type")
+				.count(),
+			1,
+		);
+		assert!(attributes.contains(&KeyValue::new("error.type", "custom")));
 	}
 
 	#[test]
@@ -929,7 +1182,7 @@ mod tests {
 		}
 
 		let mcp = crate::mcp::MCPInfo {
-			method_name: Some("tools/call".to_string()),
+			method_name: Some(strng::literal!("tools/call")),
 			..Default::default()
 		};
 
@@ -937,7 +1190,15 @@ mod tests {
 		{
 			let req_snap = snapshot_request(&mut req(::http::Method::GET), true);
 			let resp_snap = snapshot_response(&mut resp(405));
-			let exec = Executor::new_logger(Some(&req_snap), Some(&resp_snap), None, None, None, None);
+			let exec = Executor::new_logger(
+				Some(&req_snap),
+				Some(&resp_snap),
+				None,
+				None,
+				None,
+				None,
+				None,
+			);
 			assert!(!should_export_span(Some(&keep_expr), &exec));
 		}
 
@@ -950,6 +1211,7 @@ mod tests {
 				Some(&resp_snap),
 				None,
 				Some(&mcp),
+				None,
 				None,
 				None,
 			);
@@ -967,6 +1229,7 @@ mod tests {
 				Some(&mcp),
 				None,
 				None,
+				None,
 			);
 			assert!(should_export_span(Some(&keep_expr), &exec));
 		}
@@ -975,7 +1238,15 @@ mod tests {
 		{
 			let req_snap = snapshot_request(&mut req(::http::Method::GET), true);
 			let resp_snap = snapshot_response(&mut resp(200));
-			let exec = Executor::new_logger(Some(&req_snap), Some(&resp_snap), None, None, None, None);
+			let exec = Executor::new_logger(
+				Some(&req_snap),
+				Some(&resp_snap),
+				None,
+				None,
+				None,
+				None,
+				None,
+			);
 			assert!(should_export_span(Some(&keep_expr), &exec));
 		}
 
@@ -983,7 +1254,7 @@ mod tests {
 		// Under keep-semantics, eval errors fail closed (the span is dropped).
 		{
 			let req_snap = snapshot_request(&mut req(::http::Method::GET), true);
-			let exec = Executor::new_logger(Some(&req_snap), None, None, None, None, None);
+			let exec = Executor::new_logger(Some(&req_snap), None, None, None, None, None, None);
 			assert!(!should_export_span(Some(&keep_expr), &exec));
 		}
 

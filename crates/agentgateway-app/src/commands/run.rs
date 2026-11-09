@@ -7,7 +7,7 @@ use agentgateway::types::agent::ListenerTarget;
 use agentgateway::{BackendConfig, Config, ConfigStoreMode, LoggingFormat, client, serdes};
 use tracing::{error, info};
 
-use crate::{RunArgs, read_config_contents};
+use crate::{RunArgs, read_config_contents, running_in_kubernetes};
 
 pub(crate) fn execute(args: RunArgs) -> anyhow::Result<()> {
 	let RunArgs {
@@ -23,7 +23,7 @@ pub(crate) fn execute(args: RunArgs) -> anyhow::Result<()> {
 		return Ok(());
 	}
 	if version_long {
-		println!("{}", version::BuildInfo::new());
+		println!("{}", build_info());
 		return Ok(());
 	}
 	if let Some(copy_self) = copy_self {
@@ -38,7 +38,7 @@ pub(crate) fn execute(args: RunArgs) -> anyhow::Result<()> {
 			if validate_only {
 				return validate(contents, local_config_source).await;
 			}
-			let mut config = agentgateway::config::parse_config(contents, local_config_source)?;
+			let mut config = agentgateway::config::parse_config(contents, local_config_source.clone())?;
 			// Capture the admin/runtime handle to ensure some background tasks (e.g., OTLP exporters created from dataplane
 			// policy initialization) run on the admin runtime rather than the dataplane runtime.
 			config.admin_runtime_handle = Some(tokio::runtime::Handle::current());
@@ -46,29 +46,52 @@ pub(crate) fn execute(args: RunArgs) -> anyhow::Result<()> {
 				&config.logging.level,
 				config.logging.format == LoggingFormat::Json,
 			);
-			info!("version: {}", version::BuildInfo::new());
-			info!(
-				"running with config: {}",
-				serdes::yamlviajson::to_string(&config)?
-			);
+			if running_in_kubernetes() {
+				// These logs are 100s of lines. Handy when not used interactively, but for standalone usage
+				// they are just obscuring useful information.
+				info!("version: {}", build_info());
+				info!("running with config: {}", serdes::yaml::to_string(&config)?);
+			} else {
+				info!("version: {}", version::BuildInfo::new().version);
+			}
+			let database_pool = match config.database.as_ref() {
+				Some(database) => Some(
+					agentgateway::database::DatabasePool::connect_with_max_connections(
+						&database.url,
+						database.max_connections,
+					)
+					.await?,
+				),
+				None => None,
+			};
+			if let Some(pool) = database_pool.clone() {
+				config.budget_policy.initialize(pool).await?;
+			}
 			let config_resource_store = if config.storage.mode == ConfigStoreMode::Hybrid {
-				let database = config
-					.database
-					.as_ref()
-					.expect("hybrid config store requires config.database");
-				Some(agentgateway::config_store::setup(database).await?)
+				Some(
+					agentgateway::config_store::ConfigResourceStore::from_pool(
+						database_pool
+							.clone()
+							.expect("hybrid config store requires config.database"),
+					)
+					.await?,
+				)
 			} else {
 				None
 			};
+			agentgateway::config::ensure_session_key(
+				&mut config,
+				local_config_source.as_ref(),
+				config_resource_store.as_ref(),
+			)
+			.await?;
 			let request_log_store = match config.logging.database.as_ref() {
 				Some(cfg) => {
-					let pool = config_resource_store.as_ref().and_then(|store| {
-						config
-							.database
-							.as_ref()
-							.filter(|database| cfg == *database)
-							.map(|_| store.pool())
-					});
+					let pool = config
+						.database
+						.as_ref()
+						.filter(|database| cfg == *database)
+						.and(database_pool.clone());
 					match agentgateway::telemetry::log_store::setup_with_pool(cfg, pool).await {
 						Ok(store) => Some(store),
 						Err(err) => {
@@ -79,12 +102,23 @@ pub(crate) fn execute(args: RunArgs) -> anyhow::Result<()> {
 				},
 				None => None,
 			};
-			let result = proxy(Arc::new(config), config_resource_store).await;
+			let config = Arc::new(config);
+			let result = proxy(config.clone(), config_resource_store).await;
+			if let Err(err) = config.budget_policy.flush().await {
+				error!(?err, "failed to flush budget usage during shutdown");
+			}
 			if let Some(request_log_store) = request_log_store {
 				request_log_store.shutdown_and_wait().await;
 			}
 			result
 		})
+}
+
+fn build_info() -> version::BuildInfo {
+	version::BuildInfo::new().with_crypto(
+		agentgateway::crypto::CRYPTO_BACKEND,
+		agentgateway::crypto::provider().fips(),
+	)
 }
 
 #[cfg(not(target_env = "musl"))]
@@ -171,7 +205,8 @@ async fn proxy(
 	cfg: Arc<Config>,
 	config_resource_store: Option<agentgateway::config_store::ConfigResourceStore>,
 ) -> anyhow::Result<()> {
-	let bound = agentgateway::app::run(cfg, config_resource_store).await?;
+	let bound =
+		agentgateway::app::run_with_ui_assets(cfg, config_resource_store, &crate::UI_ASSETS).await?;
 	spawn_readiness(&bound);
 	bound.wait_termination().await
 }

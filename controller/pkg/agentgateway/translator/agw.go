@@ -178,8 +178,8 @@ func CreateAgwResponseHeadersFilter(filter *gwv1.HTTPHeaderFilter) *api.HeaderMo
 	}
 }
 
-// CreateAgwRewriteFilter creates an agw TrafficPolicySpec based on a HTTPURLRewriteFilter
-func CreateAgwRewriteFilter(filter *gwv1.HTTPURLRewriteFilter) *api.TrafficPolicySpec {
+// CreateAgwRewriteFilter creates an agw UrlRewrite based on a HTTPURLRewriteFilter
+func CreateAgwRewriteFilter(filter *gwv1.HTTPURLRewriteFilter) *api.UrlRewrite {
 	if filter == nil {
 		return nil
 	}
@@ -196,14 +196,10 @@ func CreateAgwRewriteFilter(filter *gwv1.HTTPURLRewriteFilter) *api.TrafficPolic
 		case gwv1.PrefixMatchHTTPPathModifier:
 			ff.Path = &api.UrlRewrite_Prefix{Prefix: strings.TrimSuffix(*filter.Path.ReplacePrefixMatch, "/")}
 		case gwv1.FullPathHTTPPathModifier:
-			ff.Path = &api.UrlRewrite_Full{Full: strings.TrimSuffix(*filter.Path.ReplaceFullPath, "/")}
+			ff.Path = &api.UrlRewrite_Full{Full: *filter.Path.ReplaceFullPath}
 		}
 	}
-	return &api.TrafficPolicySpec{
-		Kind: &api.TrafficPolicySpec_UrlRewrite{
-			UrlRewrite: ff,
-		},
-	}
+	return ff
 }
 
 // CreateAgwMirrorFilter creates an agw RequestMirror based on a HTTPRequestMirrorFilter
@@ -218,10 +214,8 @@ func CreateAgwMirrorFilter(
 	}
 	var weightOne int32 = 1
 	dst, err := buildAgwDestination(ctx, gwv1.HTTPBackendRef{
-		BackendRef: gwv1.BackendRef{
-			BackendObjectReference: filter.BackendRef,
-			Weight:                 &weightOne,
-		},
+		BackendObjectReference: filter.BackendRef,
+		Weight:                 &weightOne,
 	}, ns, k)
 	if err != nil {
 		return nil, err
@@ -258,10 +252,8 @@ func CreateAgwExternalAuthFilter(
 		return nil, nil
 	}
 	dst, err := buildAgwDestination(ctx, gwv1.HTTPBackendRef{
-		BackendRef: gwv1.BackendRef{
-			BackendObjectReference: filter.BackendRef,
-			Weight:                 new(int32(1)),
-		},
+		BackendObjectReference: filter.BackendRef,
+		Weight:                 new(int32(1)),
 	}, ns, k)
 	if err != nil {
 		return nil, err
@@ -271,7 +263,7 @@ func CreateAgwExternalAuthFilter(
 	}
 	if b := filter.ForwardBody; b != nil {
 		pol.IncludeRequestBody = &api.TrafficPolicySpec_ExternalAuth_BodyOptions{
-			MaxRequestBytes: uint32(b.MaxSize),
+			MaxRequestBytes: uint32(b.MaxSize), //nolint:gosec // G115: kubebuilder validation ensures 0 <= value
 			// "Bodies over that size must fail processing"
 			AllowPartialMessage: false,
 			// TODO(https://github.com/kubernetes-sigs/gateway-api/issues/4198): do we want this?
@@ -361,7 +353,7 @@ func CreateAgwRedirectFilter(filter *gwv1.HTTPRequestRedirectFilter) *api.Reques
 		case gwv1.PrefixMatchHTTPPathModifier:
 			ff.Path = &api.RequestRedirect_Prefix{Prefix: strings.TrimSuffix(*filter.Path.ReplacePrefixMatch, "/")}
 		case gwv1.FullPathHTTPPathModifier:
-			ff.Path = &api.RequestRedirect_Full{Full: strings.TrimSuffix(*filter.Path.ReplaceFullPath, "/")}
+			ff.Path = &api.RequestRedirect_Full{Full: *filter.Path.ReplaceFullPath}
 		}
 	}
 	return ff

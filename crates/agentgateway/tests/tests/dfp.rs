@@ -11,7 +11,7 @@ pub(in crate::tests) fn setup_dfp_bind() -> TestBind {
 
 pub(in crate::tests) fn setup_dfp_bind_with_config(config: &str) -> TestBind {
 	let backend_name = ResourceName::new("dynamic".into(), "".into());
-	let dynamic_backend = Backend::Dynamic(backend_name, ());
+	let dynamic_backend = Backend::Dynamic(backend_name, None);
 
 	let route = basic_named_route("/dynamic".into());
 
@@ -33,24 +33,27 @@ fn setup_dfp() -> (TestBind, MemoryClient) {
 /// Helper to set up a DFP test behind an HTTPS listener.
 fn setup_dfp_https() -> (TestBind, MemoryClient) {
 	let backend_name = ResourceName::new("dynamic".into(), "".into());
-	let dynamic_backend = Backend::Dynamic(backend_name, ());
+	let dynamic_backend = Backend::Dynamic(backend_name, None);
 
 	let route = basic_named_route("/dynamic".into());
 
-	let bind = Bind {
-		key: BIND_KEY,
-		// not really used
-		address: "127.0.0.1:0".parse().unwrap(),
-		listeners: ListenerSet::from_list([Listener {
+	let bind = BindSnapshot::new(
+		Bind {
+			key: BIND_KEY,
+			// not really used
+			address: "127.0.0.1:0".parse().unwrap(),
+			protocol: BindProtocol::tls,
+			tunnel_protocol: Default::default(),
+			mode: Default::default(),
+		},
+		ListenerSet::from_list([Listener {
 			key: LISTENER_KEY,
 			name: Default::default(),
 			hostname: Default::default(),
 			protocol: ListenerProtocol::HTTPS(test_server_tls_config()),
+			..Default::default()
 		}]),
-		protocol: BindProtocol::tls,
-		tunnel_protocol: Default::default(),
-		mode: Default::default(),
-	};
+	);
 
 	let t = setup_proxy_test("{}").unwrap();
 	let pi = t.inputs();
@@ -69,7 +72,7 @@ fn setup_dfp_https() -> (TestBind, MemoryClient) {
 async fn dfp_rejects_inference_routing() {
 	let backend_name = ResourceName::new("dynamic".into(), "".into());
 	let dynamic_backend = BackendWithPolicies {
-		backend: Backend::Dynamic(backend_name, ()),
+		backend: Backend::Dynamic(backend_name, None),
 		inline_policies: vec![BackendTrafficPolicy::InferenceRouting(
 			ext_proc::InferenceRouting {
 				target: Arc::new(
@@ -97,10 +100,7 @@ async fn dfp_rejects_inference_routing() {
 	let res = send_request(io, Method::GET, "http://example.com/dynamic").await;
 	assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
 	let body = res.into_body().collect().await.unwrap().to_bytes();
-	assert_eq!(
-		String::from_utf8_lossy(&body),
-		"processing failed: inferenceRouting is not supported with dynamic backends"
-	);
+	assert_eq!(String::from_utf8_lossy(&body), "internal error");
 }
 
 /// DFP resolves the destination from the request's Host/URI authority, including the port.

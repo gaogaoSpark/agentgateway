@@ -1,17 +1,24 @@
 use std::fmt::Debug;
 
-use agent_core::metrics::{CustomField, DefaultedUnknown, EncodeArc, EncodeDebug, EncodeDisplay};
+pub use agent_core::metrics::OutboundCallSubtype;
+use agent_core::metrics::{
+	CustomField, DefaultedUnknown, EncodeArc, EncodeDebug, EncodeDisplay, MetricRegistry,
+	OptionallyEncode,
+};
 use agent_core::strng::RichStrng;
 use agent_core::version;
 use frozen_collections::FzHashSet;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter;
-use prometheus_client::metrics::family::Family;
-use prometheus_client::metrics::histogram::Histogram as PromHistogram;
+use prometheus_client::metrics::family::{Family, MetricConstructor};
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::{Histogram as PromHistogram, NativeHistogramConfig};
 use prometheus_client::metrics::info::Info;
-use prometheus_client::registry::{Metric, Registry, Unit};
+use prometheus_client::registry::{Metric, Unit};
 use tracing::{debug, trace};
 
+use crate::HistogramMode;
+use crate::http::substrate::ateattr::{ResumeDisposition, RouteOutcome};
 use crate::mcp::MCPOperation;
 use crate::proxy::ProxyResponseReason;
 use crate::types::agent::TransportProtocol;
@@ -35,14 +42,30 @@ pub enum GuardrailPhase {
 }
 
 #[derive(
-	Copy, Clone, Hash, Debug, PartialEq, Eq, prometheus_client::encoding::EncodeLabelValue, Default,
+	Copy,
+	Clone,
+	Hash,
+	Debug,
+	PartialEq,
+	Eq,
+	PartialOrd,
+	Ord,
+	prometheus_client::encoding::EncodeLabelValue,
+	Default,
+	serde::Serialize,
+	serde::Deserialize,
 )]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+// Ordered by severity so guards can retain the most severe result.
 pub enum GuardrailAction {
 	#[default]
 	Allow,
+	FailOpen,
+	// Guard ran in observe mode: the verdict was recorded but not enforced.
+	Audit,
 	Mask,
 	Reject,
-	FailOpen,
 }
 
 #[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
@@ -110,9 +133,39 @@ pub struct GenAILabelsTokenUsage {
 	pub common: EncodeArc<GenAILabels>,
 }
 
+#[derive(Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct ErrorTypeLabel {
+	pub error_type: GenAIErrorType,
+}
+
+#[derive(Clone, Hash, Debug, PartialEq, Eq)]
+pub enum GenAIErrorType {
+	Other,
+}
+
+impl prometheus_client::encoding::EncodeLabelValue for GenAIErrorType {
+	fn encode(
+		&self,
+		encoder: &mut prometheus_client::encoding::LabelValueEncoder,
+	) -> Result<(), std::fmt::Error> {
+		match self {
+			Self::Other => "_OTHER".encode(encoder),
+		}
+	}
+}
+
+#[derive(Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct GenAIRequestDurationLabels {
+	#[prometheus(flatten)]
+	pub common: EncodeArc<GenAILabels>,
+
+	#[prometheus(flatten)]
+	pub error: OptionallyEncode<ErrorTypeLabel>,
+}
+
 #[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
 pub struct CostCatalogLookupLabels {
-	pub status: crate::llm::cost::CostLookupStatus,
+	pub status: crate::llm::catalog::CostLookupStatus,
 
 	#[prometheus(flatten)]
 	pub common: EncodeArc<GenAILabels>,
@@ -121,6 +174,7 @@ pub struct CostCatalogLookupLabels {
 #[derive(Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
 pub struct MCPCall {
 	pub method: DefaultedUnknown<RichStrng>,
+	pub outcome: MCPOutcome,
 
 	pub resource_type: DefaultedUnknown<MCPOperation>,
 	pub server: DefaultedUnknown<RichStrng>,
@@ -131,6 +185,18 @@ pub struct MCPCall {
 
 	#[prometheus(flatten)]
 	pub custom: CustomField,
+}
+
+#[derive(
+	Clone, Copy, Hash, Debug, PartialEq, Eq, prometheus_client::encoding::EncodeLabelValue,
+)]
+#[allow(non_camel_case_types)]
+pub enum MCPOutcome {
+	success,
+	tool_error,
+	protocol_error,
+	gateway_error,
+	unknown,
 }
 
 #[derive(Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
@@ -146,9 +212,35 @@ pub struct ConnectLabels {
 	pub transport: DefaultedUnknown<RichStrng>,
 }
 
+#[derive(Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct BackendLabels {
+	pub backend: DefaultedUnknown<RichStrng>,
+}
+
+#[derive(Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct AdmissionLabels {
+	pub bind: DefaultedUnknown<RichStrng>,
+}
+
+#[derive(Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct SubstrateRouteLabels {
+	pub ate_router_outcome: EncodeDisplay<RouteOutcome>,
+	pub ate_router_resume: EncodeDisplay<ResumeDisposition>,
+}
+
 #[derive(
-	Copy, Clone, Hash, Debug, PartialEq, Eq, prometheus_client::encoding::EncodeLabelValue, Default,
+	Copy,
+	Clone,
+	Hash,
+	Debug,
+	PartialEq,
+	Eq,
+	prometheus_client::encoding::EncodeLabelValue,
+	Default,
+	serde::Serialize,
+	serde::Deserialize,
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum OutboundCallKind {
 	/// The primary backend call
 	#[default]
@@ -159,33 +251,45 @@ pub enum OutboundCallKind {
 	Mirror,
 }
 
-#[derive(
-	Copy, Clone, Hash, Debug, PartialEq, Eq, prometheus_client::encoding::EncodeLabelValue, Default,
-)]
-pub enum OutboundCallSubtype {
-	// Primary
-	#[default]
-	Http,
-	Llm,
-	Mcp,
-
-	// Policy
-	ExtAuthz,
-	ExtProc,
-	Guardrail,
-	RateLimit,
-	Oidc,
+impl OutboundCallKind {
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::Primary => "Primary",
+			Self::Policy => "Policy",
+			Self::Mirror => "Mirror",
+		}
+	}
 }
 
-#[derive(Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+#[derive(Copy, Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
 pub struct OutboundCallLabels {
 	pub kind: OutboundCallKind,
 	pub subtype: OutboundCallSubtype,
 }
 
 type Counter = Family<HTTPLabels, counter::Counter>;
-type Histogram<T> = Family<T, prometheus_client::metrics::histogram::Histogram>;
+type Histogram<T> = Family<T, PromHistogram, HistogramConstructor>;
 type TCPCounter = Family<TCPLabels, counter::Counter>;
+
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct HistogramConstructor {
+	mode: HistogramMode,
+	buckets: &'static [f64],
+}
+
+impl MetricConstructor<PromHistogram> for HistogramConstructor {
+	fn new_metric(&self) -> PromHistogram {
+		match self.mode {
+			HistogramMode::Classic => PromHistogram::new(self.buckets.iter().copied()),
+			HistogramMode::Native => PromHistogram::new_native(NativeHistogramConfig::default()),
+			HistogramMode::Both => PromHistogram::new_classic_and_native(
+				self.buckets.iter().copied(),
+				NativeHistogramConfig::default(),
+			),
+		}
+	}
+}
 
 #[derive(Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
 pub struct BuildLabel {
@@ -195,8 +299,10 @@ pub struct BuildLabel {
 #[derive(Debug)]
 pub struct Metrics {
 	pub requests: Counter,
+	pub requests_active: Family<BackendLabels, Gauge>,
 	pub request_duration: Histogram<HTTPLabels>,
 	pub request_processing_duration: Histogram<MinimalHTTPLabels>,
+	pub substrate_route_duration: Histogram<SubstrateRouteLabels>,
 	pub response_processing_duration: Histogram<MinimalHTTPLabels>,
 	pub response_bytes: Family<HTTPLabels, counter::Counter>,
 
@@ -204,17 +310,21 @@ pub struct Metrics {
 
 	pub gen_ai_token_usage: Histogram<GenAILabelsTokenUsage>,
 	pub gen_ai_cost: Family<GenAILabels, counter::Counter<f64>>,
-	pub gen_ai_request_duration: Histogram<GenAILabels>,
+	pub gen_ai_request_duration: Histogram<GenAIRequestDurationLabels>,
 	pub gen_ai_time_per_output_token: Histogram<GenAILabels>,
 	pub gen_ai_time_to_first_token: Histogram<GenAILabels>,
+	pub gen_ai_inter_chunk_latency: Histogram<GenAILabels>,
 
 	pub tls_handshake_duration: Histogram<TCPLabels>,
 
 	pub downstream_connection: TCPCounter,
 	pub tcp_downstream_rx_bytes: Family<TCPLabels, counter::Counter>,
 	pub tcp_downstream_tx_bytes: Family<TCPLabels, counter::Counter>,
+	pub downstream_connections_shed: Family<AdmissionLabels, counter::Counter>,
+	pub requests_shed: Family<AdmissionLabels, counter::Counter>,
 
 	pub upstream_connect_duration: Histogram<ConnectLabels>,
+	pub upstream_connections_active: Family<BackendLabels, Gauge>,
 	pub upstream_call_duration: Histogram<OutboundCallLabels>,
 
 	// metrics for guardrail checks (allow/mask/reject) for request/response
@@ -224,6 +334,9 @@ pub struct Metrics {
 
 	// metrics for request retries
 	pub retries: Counter,
+
+	// Number of requests currently waiting for a Substrate actor to become routable.
+	pub substrate_request_parking_active: Gauge,
 }
 
 // FilteredRegistry is a wrapper around Registry that allows to filter out certain metrics.
@@ -232,12 +345,12 @@ pub struct Metrics {
 // A more robust future solution would be to have a sort of `Disabled` metric that does not store;
 // note that even still, we would be computing the labels (and then dropping them), but in many cases
 // the same labels are shared by many metrics, and are cheap to construct, so likely not a major concern.
-struct FilteredRegistry<'a> {
-	registry: &'a mut Registry,
+struct FilteredRegistry<'a, R> {
+	registry: &'a mut R,
 	removes: FzHashSet<String>,
 }
 
-impl<'a> FilteredRegistry<'a> {
+impl<R: MetricRegistry> FilteredRegistry<'_, R> {
 	fn should_skip(&self, name: &str, unit: Option<&Unit>) -> bool {
 		let mut names = vec![
 			name.to_string(),
@@ -294,7 +407,11 @@ impl<'a> FilteredRegistry<'a> {
 }
 
 impl Metrics {
-	pub fn new(registry: &mut Registry, removes: FzHashSet<String>) -> Self {
+	pub fn new<R: MetricRegistry>(
+		registry: &mut R,
+		removes: FzHashSet<String>,
+		histogram_mode: HistogramMode,
+	) -> Self {
 		let mut registry = FilteredRegistry { registry, removes };
 		registry.register(
 			"build",
@@ -304,9 +421,7 @@ impl Metrics {
 			}),
 		);
 
-		let gen_ai_token_usage = Family::<GenAILabelsTokenUsage, _>::new_with_constructor(move || {
-			PromHistogram::new(TOKEN_USAGE_BUCKET)
-		});
+		let gen_ai_token_usage = histogram_family(histogram_mode, &TOKEN_USAGE_BUCKET);
 		registry.register(
 			"gen_ai_client_token_usage",
 			"Number of tokens used per request",
@@ -321,40 +436,58 @@ impl Metrics {
 			gen_ai_cost.clone(),
 		);
 
-		// TODO: add error attribute if it ends with an error
-		let gen_ai_request_duration = Family::<GenAILabels, _>::new_with_constructor(move || {
-			PromHistogram::new(REQUEST_DURATION_BUCKET)
-		});
+		let gen_ai_request_duration = histogram_family(histogram_mode, &REQUEST_DURATION_BUCKET);
 		registry.register(
 			"gen_ai_server_request_duration",
-			"Duration of generative AI request",
+			"Duration of a generative AI request in seconds; failed operations have error_type=\"_OTHER\" and successful operations omit the label",
 			gen_ai_request_duration.clone(),
 		);
 
-		let gen_ai_time_per_output_token = Family::<GenAILabels, _>::new_with_constructor(move || {
-			PromHistogram::new(OUTPUT_TOKEN_BUCKET)
-		});
+		let gen_ai_time_per_output_token = histogram_family(histogram_mode, &OUTPUT_TOKEN_BUCKET);
 		registry.register(
 			"gen_ai_server_time_per_output_token",
 			"Time to generate each output token for a given request",
 			gen_ai_time_per_output_token.clone(),
 		);
 
-		let gen_ai_time_to_first_token = Family::<GenAILabels, _>::new_with_constructor(move || {
-			PromHistogram::new(FIRST_TOKEN_BUCKET)
-		});
+		let gen_ai_time_to_first_token = histogram_family(histogram_mode, &FIRST_TOKEN_BUCKET);
 		registry.register(
 			"gen_ai_server_time_to_first_token",
 			"Time to generate the first token for a given request",
 			gen_ai_time_to_first_token.clone(),
 		);
 
+		let gen_ai_inter_chunk_latency = histogram_family(histogram_mode, &OUTPUT_TOKEN_BUCKET);
+		registry.register(
+			"gen_ai_server_inter_chunk_latency",
+			"Time between consecutive output chunks for a given request",
+			gen_ai_inter_chunk_latency.clone(),
+		);
+
 		Metrics {
+			substrate_request_parking_active: {
+				let m = Gauge::default();
+				registry.register(
+					"substrate_request_parking_active",
+					"Number of requests waiting for a Substrate actor to become routable",
+					m.clone(),
+				);
+				m
+			},
 			requests: build(
 				&mut registry,
 				"requests",
 				"The total number of HTTP requests sent",
 			),
+			requests_active: {
+				let m = Family::<BackendLabels, Gauge>::default();
+				registry.register(
+					"requests_active",
+					"Number of HTTP requests to a backend currently awaiting a complete response",
+					m.clone(),
+				);
+				m
+			},
 			guardrail_checks: {
 				let m = Family::<GuardrailLabels, _>::default();
 				registry.register(
@@ -378,11 +511,21 @@ impl Metrics {
 				"downstream_connections",
 				"The total number of downstream connections established",
 			),
+			downstream_connections_shed: build(
+				&mut registry,
+				"downstream_connections_shed",
+				"Total downstream connections closed by the active connection limit",
+			),
+			requests_shed: build(
+				&mut registry,
+				"requests_shed",
+				"Total downstream requests rejected by the in-flight request limit",
+			),
 
 			mcp_requests: build(
 				&mut registry,
 				"mcp_requests",
-				"Total number of MCP tool calls",
+				"Total number of MCP requests",
 			),
 
 			gen_ai_token_usage,
@@ -390,6 +533,7 @@ impl Metrics {
 			gen_ai_request_duration,
 			gen_ai_time_per_output_token,
 			gen_ai_time_to_first_token,
+			gen_ai_inter_chunk_latency,
 
 			response_bytes: {
 				let m = Family::<HTTPLabels, _>::default();
@@ -402,9 +546,7 @@ impl Metrics {
 				m
 			},
 			request_duration: {
-				let m = Family::<HTTPLabels, _>::new_with_constructor(move || {
-					PromHistogram::new(HTTP_REQUEST_DURATION_BUCKET)
-				});
+				let m = histogram_family(histogram_mode, &HTTP_REQUEST_DURATION_BUCKET);
 				registry.register_with_unit(
 					"request_duration",
 					"Duration of HTTP requests (seconds)",
@@ -414,9 +556,7 @@ impl Metrics {
 				m
 			},
 			request_processing_duration: {
-				let m = Family::<MinimalHTTPLabels, _>::new_with_constructor(move || {
-					PromHistogram::new(PROCESSING_DURATION_BUCKETS)
-				});
+				let m = histogram_family(histogram_mode, &PROCESSING_DURATION_BUCKETS);
 				registry.register_with_unit(
 					"request_processing",
 					"Duration from receiving an HTTP request to sending the primary outbound call (seconds)",
@@ -425,10 +565,18 @@ impl Metrics {
 				);
 				m
 			},
+			substrate_route_duration: {
+				let m = histogram_family(histogram_mode, &HTTP_REQUEST_DURATION_BUCKET);
+				registry.register_with_unit(
+					"atenet_router_route_duration",
+					"Time from receiving a Substrate request to resolving its worker endpoint",
+					Unit::Seconds,
+					m.clone(),
+				);
+				m
+			},
 			response_processing_duration: {
-				let m = Family::<MinimalHTTPLabels, _>::new_with_constructor(move || {
-					PromHistogram::new(PROCESSING_DURATION_BUCKETS)
-				});
+				let m = histogram_family(histogram_mode, &PROCESSING_DURATION_BUCKETS);
 				registry.register_with_unit(
 					"response_processing",
 					"Duration from receiving the primary outbound response to sending the HTTP response (seconds)",
@@ -458,9 +606,7 @@ impl Metrics {
 				m
 			},
 			upstream_connect_duration: {
-				let m = Family::<ConnectLabels, _>::new_with_constructor(move || {
-					PromHistogram::new(CONNECT_DURATION_BUCKET)
-				});
+				let m = histogram_family(histogram_mode, &CONNECT_DURATION_BUCKET);
 				registry.register_with_unit(
 					"upstream_connect_duration",
 					"Duration to establish upstream connection (seconds)",
@@ -469,10 +615,17 @@ impl Metrics {
 				);
 				m
 			},
+			upstream_connections_active: {
+				let m = Family::<BackendLabels, Gauge>::default();
+				registry.register(
+					"upstream_connections_active",
+					"Number of currently open upstream connections",
+					m.clone(),
+				);
+				m
+			},
 			upstream_call_duration: {
-				let m = Family::<OutboundCallLabels, _>::new_with_constructor(move || {
-					PromHistogram::new(HTTP_REQUEST_DURATION_BUCKET)
-				});
+				let m = histogram_family(histogram_mode, &HTTP_REQUEST_DURATION_BUCKET);
 				registry.register_with_unit(
 					"upstream_call_duration",
 					"Duration of outbound calls made by agentgateway (seconds)",
@@ -482,9 +635,7 @@ impl Metrics {
 				m
 			},
 			tls_handshake_duration: {
-				let m = Family::<TCPLabels, _>::new_with_constructor(move || {
-					PromHistogram::new(CONNECT_DURATION_BUCKET)
-				});
+				let m = histogram_family(histogram_mode, &CONNECT_DURATION_BUCKET);
 				registry.register_with_unit(
 					"tls_handshake_duration",
 					"Duration to complete inbound TLS/HTTPS handshake (seconds)",
@@ -502,8 +653,32 @@ impl Metrics {
 	}
 }
 
-fn build<'a, T: Clone + std::hash::Hash + Eq + Send + Sync + Debug + EncodeLabelSet + 'static>(
-	registry: &mut FilteredRegistry<'a>,
+/// Increments a gauge for as long as the guard is alive.
+#[derive(Debug)]
+pub struct GaugeGuard(Gauge);
+
+impl GaugeGuard {
+	pub fn new(gauge: Gauge) -> Self {
+		gauge.inc();
+		Self(gauge)
+	}
+}
+
+impl Drop for GaugeGuard {
+	fn drop(&mut self) {
+		self.0.dec();
+	}
+}
+
+fn histogram_family<T>(mode: HistogramMode, buckets: &'static [f64]) -> Histogram<T>
+where
+	T: Clone + std::hash::Hash + Eq,
+{
+	Family::new_with_constructor(HistogramConstructor { mode, buckets })
+}
+
+fn build<T: Clone + std::hash::Hash + Eq + Send + Sync + Debug + EncodeLabelSet + 'static>(
+	registry: &mut FilteredRegistry<'_, impl MetricRegistry>,
 	name: &str,
 	help: &str,
 ) -> Family<T, counter::Counter> {
@@ -565,3 +740,42 @@ const OUTPUT_TOKEN_BUCKET: [f64; 14] = [
 const FIRST_TOKEN_BUCKET: [f64; 16] = [
 	0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
 ];
+
+#[cfg(test)]
+mod tests {
+	use prometheus_client::encoding::prometheus_protobuf;
+	use prometheus_client::registry::Registry;
+
+	use super::*;
+
+	#[test]
+	fn histogram_mode_controls_collected_representations() {
+		for (mode, want_classic, want_native) in [
+			(HistogramMode::Classic, true, false),
+			(HistogramMode::Native, false, true),
+			(HistogramMode::Both, true, true),
+		] {
+			let mut registry = Registry::default();
+			let metrics = Metrics::new(&mut registry, Default::default(), mode);
+			metrics
+				.request_duration
+				.get_or_create(&HTTPLabels::default())
+				.observe(1.0);
+
+			let families = prometheus_protobuf::encode(&registry).expect("protobuf encoding succeeds");
+			let histogram = families
+				.iter()
+				.find(|family| family.name == "request_duration_seconds")
+				.and_then(|family| family.metric.first())
+				.and_then(|metric| metric.histogram.as_ref())
+				.expect("request duration histogram is encoded");
+
+			assert_eq!(!histogram.bucket.is_empty(), want_classic, "mode: {mode:?}");
+			assert_eq!(
+				!histogram.positive_span.is_empty(),
+				want_native,
+				"mode: {mode:?}"
+			);
+		}
+	}
+}

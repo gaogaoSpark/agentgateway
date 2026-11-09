@@ -11,6 +11,9 @@ metadata:
   {{- end }}
 spec:
   replicas: {{ .Values.controller.replicaCount }}
+  {{- if not (kindIs "invalid" .Values.controller.revisionHistoryLimit) }}
+  revisionHistoryLimit: {{ .Values.controller.revisionHistoryLimit }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "agentgateway.selectorLabels" . | nindent 6 }}
@@ -41,6 +44,10 @@ spec:
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.extraInitContainers }}
+      initContainers:
+      {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: controller
@@ -172,8 +179,8 @@ spec:
             - name: AGW_ENABLE_INFER_EXT
               value: "true"
             {{- end }}
-            {{- if .Values.agentgatewayModels.enabled }}
-            - name: AGW_ENABLE_AGENTGATEWAY_MODELS
+            {{- if .Values.xBackend.enabled }}
+            - name: AGW_ENABLE_X_BACKEND
               value: "true"
             {{- end }}
             - name: AGW_XDS_MODE
@@ -219,6 +226,14 @@ spec:
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- if .Values.gatewayClassParametersRefs }}

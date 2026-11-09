@@ -26,11 +26,16 @@ use crate::rt::{TokioExecutor, TokioIo, TokioTimer};
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TestKey {
 	authority: http::uri::Authority,
+	connect_timeout: Option<Duration>,
 }
 
 impl Key for TestKey {
 	fn expected_capacity(&self) -> ExpectedCapacity {
 		ExpectedCapacity::Http2
+	}
+
+	fn connect_timeout(&self) -> Option<Duration> {
+		self.connect_timeout
 	}
 }
 
@@ -252,6 +257,7 @@ async fn h2_stream_capacity_must_follow_request_body_lifetime() {
 	let uri: Uri = format!("http://{}/hold", server.addr).parse().expect("uri");
 	let key = TestKey {
 		authority: uri.authority().expect("authority").clone(),
+		connect_timeout: None,
 	};
 
 	let client = build_client(server.addr);
@@ -315,6 +321,60 @@ async fn h2_stream_capacity_must_follow_request_body_lifetime() {
 }
 
 #[tokio::test]
+async fn h2_peer_max_concurrent_streams_below_expected_capacity() {
+	// The server allows fewer streams than the pool's default expected capacity.
+	let (server, _response_txs) = TestServer::spawn(5, 5).await;
+	let hold_uri: Uri = format!("http://{}/hold-response", server.addr)
+		.parse()
+		.expect("uri");
+	let empty_uri: Uri = format!("http://{}/empty", server.addr)
+		.parse()
+		.expect("uri");
+	let key = TestKey {
+		authority: hold_uri.authority().expect("authority").clone(),
+		connect_timeout: None,
+	};
+	let mut builder = Client::<(), TestKey>::builder(TokioExecutor::new());
+	builder.pool_timer(TokioTimer::new());
+	let client: Client<_, TestKey> = builder.build(TestConnector { addr: server.addr });
+
+	// Occupy all 5 of the server's streams with long-lived responses.
+	let mut held = Vec::new();
+	for i in 0..5 {
+		let response = tokio::time::timeout(
+			Duration::from_secs(1),
+			client.request(make_h2_request(
+				&hold_uri,
+				&key,
+				axum_core::body::Body::new(Empty::<Bytes>::new()),
+			)),
+		)
+		.await
+		.unwrap_or_else(|_| panic!("request {i} timed out"))
+		.unwrap_or_else(|e| panic!("request {i} failed: {e}"));
+		held.push(response);
+	}
+	assert_eq!(server.accepted(), 1);
+
+	// The next request must not queue behind the held streams.
+	let response = tokio::time::timeout(
+		Duration::from_secs(1),
+		client.request(make_h2_request(
+			&empty_uri,
+			&key,
+			axum_core::body::Body::new(Empty::<Bytes>::new()),
+		)),
+	)
+	.await
+	.expect("request queued behind the server's stream limit")
+	.expect("request failed");
+	assert_eq!(response.status(), 200);
+	assert_eq!(server.accepted(), 2);
+
+	server.shutdown().await;
+}
+
+#[tokio::test]
 async fn empty_request_and_response_reuse_single_h2_connection() {
 	let (server, _response_txs) = TestServer::spawn(2, 0).await;
 	let uri: Uri = format!("http://{}/empty", server.addr)
@@ -322,6 +382,7 @@ async fn empty_request_and_response_reuse_single_h2_connection() {
 		.expect("uri");
 	let key = TestKey {
 		authority: uri.authority().expect("authority").clone(),
+		connect_timeout: None,
 	};
 	let client = build_client(server.addr);
 
@@ -362,6 +423,7 @@ async fn h2_response_body_lifetime_must_hold_capacity() {
 		.expect("uri");
 	let key = TestKey {
 		authority: hold_uri.authority().expect("authority").clone(),
+		connect_timeout: None,
 	};
 	let client = build_client(server.addr);
 
@@ -432,6 +494,7 @@ async fn released_response_bodies_allow_reuse_without_new_connection() {
 		.expect("uri");
 	let key = TestKey {
 		authority: hold_uri.authority().expect("authority").clone(),
+		connect_timeout: None,
 	};
 	let client = build_client(server.addr);
 
@@ -496,11 +559,12 @@ async fn connection_timeout_releases_pool_capacity() {
 	let uri: Uri = format!("http://{}/", server.addr).parse().expect("uri");
 	let key = TestKey {
 		authority: uri.authority().expect("authority").clone(),
+		connect_timeout: Some(Duration::from_millis(100)),
 	};
 	let mut builder = Client::<(), TestKey>::builder(TokioExecutor::new());
 	builder.pool_timer(TokioTimer::new());
 	builder.pool_expected_http2_capacity(1);
-	builder.connect_timeout(Duration::from_millis(100));
+	builder.connect_timeout(Duration::from_secs(10));
 	let attempts = Arc::new(AtomicUsize::new(0));
 	let client: Client<_, TestKey> = builder.build(StallOnceConnector {
 		inner: TestConnector { addr: server.addr },

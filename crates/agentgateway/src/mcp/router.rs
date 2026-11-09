@@ -1,8 +1,8 @@
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_core::prelude::{AssertSize, Strng};
-use axum::response::Response;
 
 use crate::http::authorization::RuleSets;
 use crate::http::sessionpersistence::Encoder;
@@ -12,15 +12,20 @@ use crate::mcp::session::SessionManager;
 use crate::mcp::sse::LegacySSEService;
 use crate::mcp::streamablehttp::{StreamableHttpServerConfig, StreamableHttpService};
 use crate::mcp::{FailureMode, MCPInfo, McpAuthorizationSet, auth};
-use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::{MustSnapshot, PolicyClient};
+use crate::proxy::{ProxyError, ProxyResponseReason};
 use crate::store::{BackendPolicies, Stores};
 use crate::telemetry::log::RequestLog;
 use crate::types::agent::{
-	BackendTargetRef, McpBackend, McpPrefixMode, McpTargetSpec, ResourceName, SimpleBackend,
-	SimpleBackendReference,
+	BackendTargetRef, McpBackend, McpPrefixMode, McpServerOverrides, McpTargetSpec, ResourceName,
+	SimpleBackend, SimpleBackendReference,
 };
 use crate::{ProxyInputs, cel, mcp};
+
+// Each MCP request boxes one of these and holds it until the response is ready.
+// A larger future usually means some value is now held across an await.
+const SSE_HANDLE_FUTURE_SIZE: usize = 20 * 1024;
+const STREAMABLE_HANDLE_FUTURE_SIZE: usize = 4 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct App {
@@ -40,6 +45,11 @@ impl App {
 		backend: &McpBackend,
 		req: &Request,
 	) -> Option<SimpleBackendReference> {
+		// Invalid well-known requests must not bypass the validation in `serve`
+		// through the direct upstream passthrough path.
+		if backend.dns_rebinding_protection && !mcp::dns_rebinding::is_localhost_request(req) {
+			return None;
+		}
 		if backend.targets.len() != 1 {
 			return None;
 		}
@@ -80,19 +90,21 @@ impl App {
 					let be = t
 						.spec
 						.backend()
-						.map(|b| crate::proxy::resolve_simple_backend_with_policies(b, &pi))
+						.map(|b| crate::proxy::resolve_simple_backend_with_binds(b, &pi, Some(&binds)))
 						.transpose()?;
 					let inline_pols = be.as_ref().map(|pol| pol.inline_policies.as_slice());
 					let sub_backend_target = BackendTargetRef::Backend {
 						name: backend_group_name.name.as_ref(),
 						namespace: backend_group_name.namespace.as_ref(),
 						section: Some(t.name.as_ref()),
+						kind: backend_group_name.kind.as_deref(),
 					};
 					let target_policies = binds.sub_backend_policies(sub_backend_target, inline_pols);
 					let backend_policies = backend_policies.clone().merge(target_policies);
 					tracing::trace!("merged policies {:?}", backend_policies);
 					Ok::<_, ProxyError>(Arc::new(McpTarget {
 						name: t.name.clone(),
+						condition: t.condition.clone(),
 						spec: t.spec.clone(),
 						backend: be.map(|b| b.backend),
 						backend_policies,
@@ -106,23 +118,39 @@ impl App {
 				prefix_mode: backend.prefix_mode,
 				failure_mode: backend.failure_mode,
 				session_idle_ttl: backend.session_idle_ttl,
+				sse_keep_alive: backend.sse_keep_alive,
+				server: backend.server.clone(),
 			}
 		};
 		let sessions = self.session.clone();
 		sessions.ensure_idle_running();
 		let client = PolicyClient::new(pi.clone());
+		let request_client = client.with_parent(req.deref());
 		let authorization_policies = backend_policies
 			.mcp_authorization
 			.unwrap_or_else(|| McpAuthorizationSet::new(RuleSets::from(Vec::new())));
 		let authn = backend_policies.mcp_authentication;
 		let mcp_guardrails = backend_policies.mcp_guardrails.clone();
+		for target in &backends.targets {
+			if let Some(condition) = target.condition.as_deref() {
+				log.cel.ctx().register_expression(condition);
+			}
+		}
 
 		// Store an empty value, we will populate each field async
 		let logy = log.mcp_status.clone();
 		logy.store(Some(MCPInfo::default()));
 		req.extensions_mut().insert(logy);
-		let tracer = log.span_writer();
-		req.extensions_mut().insert(tracer);
+		req.extensions_mut().insert(log.mcp_guardrails.clone());
+
+		if backend.dns_rebinding_protection
+			&& let Some(resp) = mcp::dns_rebinding::reject_non_localhost(&req)
+		{
+			return Err(ProxyError::direct_response_from(
+				ProxyResponseReason::Authorization,
+				resp,
+			));
+		}
 
 		authorization_policies.register(log.cel.ctx());
 		log.cel.ctx().maybe_buffer_request_body(&mut req).await;
@@ -132,17 +160,20 @@ impl App {
 		// authentication so it can include verified claims
 
 		// Take a request snapshot before authentication can mutate or partially consume the
-		// request. If authentication lets the request continue, the normal snapshot below
+		// request. If authentication lets the request continue, the snapshot below
 		// replaces this with the post-authentication request state.
-		Self::snapshot_request_without_clearing_extensions(&mut req, log);
+		// MCP requires CEL execution after the snapshot so we do not clear extensions
+		let mut req = req.take_and_snapshot_without_clearing_extensions(Some(&mut log))?;
 		if let Some(auth) = authn.as_ref()
-			&& let Some(resp) = auth::enforce_authentication(&mut req, auth, &client).await?
+			&& let Some(resp) = auth::enforce_authentication(&mut req, auth, &request_client).await?
 		{
 			return Ok(resp);
 		}
-
-		// MCP requires CEL execution after the snapshot so we do not clear extensions
-		let req = req.take_and_snapshot_without_clearing_extensions(Some(&mut log))?;
+		log.request_snapshot = log
+			.cel
+			.cel_context
+			.maybe_snapshot_request(&mut req, false)
+			.map(Arc::new);
 		if log.request_processing_duration.is_none() {
 			// This is a bit inaccurate but the best we can do for the MCP path without very invasive changes.
 			log.request_processing_duration = Some(log.request_processing_start.elapsed());
@@ -164,7 +195,7 @@ impl App {
 							client: client.clone(),
 						},
 					)
-					.assert_size::<{ 20 * 1024 }>(),
+					.assert_size::<{ SSE_HANDLE_FUTURE_SIZE }>(),
 			)
 			.await
 		} else {
@@ -186,7 +217,7 @@ impl App {
 							client: client.clone(),
 						},
 					)
-					.assert_size::<{ 4 * 1024 }>(),
+					.assert_size::<{ STREAMABLE_HANDLE_FUTURE_SIZE }>(),
 			)
 			.await
 		};
@@ -207,17 +238,6 @@ impl App {
 		}
 		response
 	}
-
-	fn snapshot_request_without_clearing_extensions(
-		req: &mut MustSnapshot<'_>,
-		log: &mut RequestLog,
-	) {
-		log.request_snapshot = log
-			.cel
-			.cel_context
-			.maybe_snapshot_request(req, false)
-			.map(Arc::new);
-	}
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +247,8 @@ pub struct McpBackendGroup {
 	pub prefix_mode: McpPrefixMode,
 	pub failure_mode: FailureMode,
 	pub session_idle_ttl: Duration,
+	pub sse_keep_alive: Option<Duration>,
+	pub server: Option<McpServerOverrides>,
 }
 
 impl Default for McpBackendGroup {
@@ -237,6 +259,8 @@ impl Default for McpBackendGroup {
 			prefix_mode: McpPrefixMode::default(),
 			failure_mode: crate::mcp::FailureMode::default(),
 			session_idle_ttl: mcp::DEFAULT_SESSION_IDLE_TTL,
+			sse_keep_alive: None,
+			server: None,
 		}
 	}
 }
@@ -244,6 +268,7 @@ impl Default for McpBackendGroup {
 #[derive(Debug)]
 pub struct McpTarget {
 	pub name: Strng,
+	pub condition: Option<Arc<cel::Expression>>,
 	pub spec: crate::types::agent::McpTargetSpec,
 	pub backend_policies: BackendPolicies,
 	pub backend: Option<SimpleBackend>,

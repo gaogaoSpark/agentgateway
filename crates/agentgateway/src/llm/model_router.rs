@@ -1,23 +1,29 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use agent_core::strng;
+use agent_policy::PolicyError;
 use bytes::Bytes;
 use futures_util::stream;
 use headers::{ContentEncoding, HeaderMapExt};
+use itertools::Itertools;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rand::seq::IndexedRandom;
 use serde_json::Value;
 
-use crate::http::transformation_cel::TransformationMetadata;
-use crate::http::{self, Request, Response};
+use crate::http::{self, Request, RequestBodyExt, Response};
+use crate::llm::router_callout::VirtualModelCalloutFailureMode;
+use crate::proxy::ProxyResponseReason;
+use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{
 	Authorization, BackendTrafficPolicy, HeaderMatch, RouteBackendReference,
 };
-use crate::{apply, cel, llm, schema_enum};
+use crate::{apply, cel, llm, schema_enum, schema_ser_schema};
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[apply(schema_ser_schema!)]
 pub struct ModelRoute {
+	/// Catalog provider and reverse transformation compiled during local config normalization.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub discovery: Option<llm::discovery::ModelDiscovery>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub id: Option<String>,
 	pub name: String,
@@ -25,13 +31,16 @@ pub struct ModelRoute {
 	pub visibility: ModelVisibility,
 	pub header_matches: Vec<Vec<HeaderMatch>>,
 	pub backend: RouteBackendReference,
+	#[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
 	pub policies: ModelRoutePolicies,
+	#[cfg_attr(feature = "schema", schemars(with = "Vec<serde_json::Value>"))]
 	pub backend_policies: Vec<BackendTrafficPolicy>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[apply(schema_ser_schema!)]
 pub struct ModelRoutePolicies {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub passthrough: Option<llm::RouteType>,
 	pub llm: Arc<llm::Policy>,
 	pub authorization: Option<Authorization>,
 }
@@ -52,82 +61,288 @@ impl ModelVisibility {
 	}
 }
 
-pub fn default_route_types() -> Arc<llm::Policy> {
-	Arc::new(llm::Policy {
-		routes: [
-			(
-				strng::new("/v1/chat/completions"),
-				llm::RouteType::Completions,
-			),
-			(strng::new("/v1/messages"), llm::RouteType::Messages),
-			(strng::new(":rawPredict"), llm::RouteType::Messages),
-			(strng::new(":streamRawPredict"), llm::RouteType::Messages),
-			(strng::new("/v1/responses"), llm::RouteType::Responses),
-			(strng::new("/v1/images/generations"), llm::RouteType::Detect),
-			(strng::new("/v1/images/edits"), llm::RouteType::Detect),
-			(strng::new("/v1/images/variations"), llm::RouteType::Detect),
-			(strng::new("/v1/responses/compact"), llm::RouteType::Detect),
-			(strng::new("/v1/embeddings"), llm::RouteType::Embeddings),
-			(strng::new("/v1/rerank"), llm::RouteType::Rerank),
-			(strng::new("/v2/rerank"), llm::RouteType::Rerank),
-			(strng::new("*"), llm::RouteType::Passthrough),
-		]
-		.into_iter()
-		.collect(),
-		..Default::default()
-	})
+enum EndpointMatch {
+	Exact(strng::Strng),
+	Regex(regex::Regex),
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+struct ServingEndpoint {
+	matcher: EndpointMatch,
+	route_type: Option<llm::RouteType>,
+	operation: Option<llm::DetectedOperation>,
+	template: &'static str,
+}
+
+// Model serving has its own endpoint recognition. Backend policy `routes` retain suffix matching.
+static SERVING_ENDPOINTS: LazyLock<Vec<ServingEndpoint>> = LazyLock::new(|| {
+	use llm::DetectedOperation as Op;
+	use llm::RouteType::*;
+	let mut endpoints = [
+		("/v1/models", Some(Models), None),
+		("/models", Some(Models), None),
+		(
+			"/v1/messages/count_tokens",
+			Some(AnthropicTokenCount),
+			Some(Op::CountTokens),
+		),
+		("/v1/chat/completions", Some(Completions), Some(Op::Chat)),
+		("/v1/messages", Some(Messages), Some(Op::Chat)),
+		("/v1/responses", Some(Responses), Some(Op::Chat)),
+		("/v1/responses/compact", Some(Detect), Some(Op::Compaction)),
+		("/v1/images/generations", Some(Detect), Some(Op::Image)),
+		("/v1/images/edits", Some(Detect), Some(Op::Image)),
+		("/v1/images/variations", Some(Detect), Some(Op::Image)),
+		(
+			"/v1/audio/transcriptions",
+			Some(Detect),
+			Some(Op::Transcription),
+		),
+		(
+			"/v1/audio/translations",
+			Some(Detect),
+			Some(Op::Transcription),
+		),
+		("/v1/audio/speech", Some(Detect), Some(Op::Speech)),
+		("/v1/ocr", Some(Detect), Some(Op::Ocr)),
+		("/v1/systemone", Some(SystemOne), Some(Op::Decisions)),
+		("/v1/decisions", Some(Decisions), Some(Op::Decisions)),
+		("/v1/embeddings", Some(Embeddings), Some(Op::Embeddings)),
+		("/v1/rerank", Some(Rerank), Some(Op::Rerank)),
+		("/v2/rerank", Some(Rerank), Some(Op::Rerank)),
+	]
+	.into_iter()
+	.map(|(path, route_type, operation)| ServingEndpoint {
+		matcher: EndpointMatch::Exact(strng::new(path)),
+		route_type,
+		operation,
+		template: path,
+	})
+	.collect::<Vec<_>>();
+	for (suffix, route_type, operation, gemini) in [
+		("rawPredict|streamRawPredict", Messages, Op::Chat, false),
+		(
+			"generateContent|streamGenerateContent",
+			GenerateContent,
+			Op::GenerateContent,
+			true,
+		),
+		("countTokens", GeminiCountTokens, Op::CountTokens, true),
+	] {
+		endpoints.push(ServingEndpoint {
+			matcher: EndpointMatch::Regex(regex::Regex::new(&format!(
+				r"^/(?P<version>v(?:[0-9]+|[0-9]+beta[0-9]+))/projects/[^/]+/locations/[^/]+/publishers/[^/]+/models/[^/]+:(?P<operation>{suffix})$"
+			)).expect("valid Vertex model route regex")),
+			route_type: Some(route_type),
+			operation: Some(operation),
+			template: "/${version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:${operation}",
+		});
+		if gemini {
+			endpoints.push(ServingEndpoint {
+				matcher: EndpointMatch::Regex(
+					regex::Regex::new(&format!(
+						r"^/(?P<version>v[0-9]+(?:(?:alpha|beta)[0-9]*)?)/models/[^/]+:(?P<operation>{suffix})$"
+					))
+					.expect("valid Gemini model route regex"),
+				),
+				route_type: Some(route_type),
+				operation: Some(operation),
+				template: "/${version}/models/{model}:${operation}",
+			});
+		}
+	}
+	// After the Gemini routes, so `/v1/models/{model}:generateContent` is classified as Gemini.
+	for (pattern, template) in [
+		(r"^/v1/models/.+$", "/v1/models/{model}"),
+		(r"^/models/.+$", "/models/{model}"),
+	] {
+		endpoints.push(ServingEndpoint {
+			matcher: EndpointMatch::Regex(regex::Regex::new(pattern).expect("valid model route regex")),
+			route_type: Some(Models),
+			operation: None,
+			template,
+		});
+	}
+	endpoints.push(ServingEndpoint {
+		matcher: EndpointMatch::Regex(
+			regex::Regex::new(
+				r"^/model/[^/]+/(?P<operation>invoke-with-response-stream|invoke|converse-stream|converse)$",
+			)
+			.expect("valid Bedrock model route regex"),
+		),
+		route_type: Some(Detect),
+		operation: None,
+		template: "/model/{model}/${operation}",
+	});
+	endpoints
+});
+
+/// Matches for the implicit route created for listener-attached models.
+pub fn serving_route_matches() -> Vec<crate::types::agent::RouteMatch> {
+	use crate::types::agent::{PathMatch, RouteMatch};
+	SERVING_ENDPOINTS
+		.iter()
+		.map(|endpoint| RouteMatch {
+			path: match &endpoint.matcher {
+				EndpointMatch::Exact(path) => PathMatch::Exact(path.clone()),
+				EndpointMatch::Regex(regex) => PathMatch::Regex(regex.clone()),
+			},
+			method: None,
+			headers: vec![],
+			query: vec![],
+		})
+		.collect()
+}
+
+fn serving_endpoint(path: &str) -> Option<&'static ServingEndpoint> {
+	SERVING_ENDPOINTS
+		.iter()
+		.find(|endpoint| match &endpoint.matcher {
+			EndpointMatch::Exact(expected) => expected.as_str() == path,
+			EndpointMatch::Regex(regex) => regex.is_match(path),
+		})
+}
+
+pub fn classify_route(path: &str) -> Option<llm::RouteType> {
+	serving_endpoint(path).and_then(|endpoint| endpoint.route_type)
+}
+
+/// The operation a request path serves, independent of how it is routed (e.g. `passthrough: detect`
+/// on /v1/chat/completions is still chat).
+pub fn classify_operation(path: &str) -> Option<llm::DetectedOperation> {
+	serving_endpoint(path).and_then(|endpoint| endpoint.operation)
+}
+
+#[apply(schema_ser_schema!)]
 pub struct VirtualModelRoute {
 	pub name: String,
 	pub created: u64,
+	#[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
 	pub llm_policy: Arc<llm::Policy>,
 	pub routing: VirtualModelRouting,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[apply(schema_ser_schema!)]
 pub enum VirtualModelRouting {
 	Weighted(Vec<WeightedTarget>),
-	Failover { backend: RouteBackendReference },
+	Failover {
+		backend: RouteBackendReference,
+		/// Target model names in priority order, used only to describe the virtual model.
+		#[serde(skip_serializing_if = "Vec::is_empty")]
+		targets: Vec<strng::Strng>,
+	},
 	Conditional(Vec<ConditionalTarget>),
+	Callout(Arc<llm::router_callout::VirtualModelCallout>),
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+/// The model name the client asked for, before any virtual model or alias rewrite. Stored as a
+/// request extension so it can be attached to the request log and used for cost lookups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginalModel(pub String);
+
+impl OriginalModel {
+	/// Records the client's model before a rewrite. A model router runs first, so keep its value:
+	/// that is the name the client actually sent.
+	pub(crate) fn record(extensions: &mut ::http::Extensions, model: String) {
+		if extensions.get::<OriginalModel>().is_none() {
+			extensions.insert(OriginalModel(model));
+		}
+	}
+}
+
+#[apply(schema_ser_schema!)]
 pub struct WeightedTarget {
 	pub model: String,
 	pub weight: usize,
+	// XDS-only resolution state. User-facing configuration does not expose this field.
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub invalid: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[apply(schema_ser_schema!)]
 pub struct ConditionalTarget {
 	pub model: String,
 	pub when: Option<Arc<cel::Expression>>,
+	// XDS-only resolution state. User-facing configuration does not expose this field.
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub invalid: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRouter {
+	discovery: llm::discovery::Discovery,
+	#[serde(skip_serializing_if = "String::is_empty")]
+	path_prefix: String,
 	models: Vec<ModelRoute>,
 	virtual_models: Vec<VirtualModelRoute>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedBackend {
+	pub route_type: llm::RouteType,
 	pub backend: RouteBackendReference,
 	pub llm_policy: Arc<llm::Policy>,
 }
 
 pub enum ResolveResult {
+	/// A response the router serves itself, such as the model list.
 	DirectResponse(Response),
+	Rejected(ProxyResponseReason, Response),
+	Error(Error),
 	Backend(ResolvedBackend),
 }
 
+/// Model routing failures that are logged as errors. Clients get the same JSON error body as other
+/// model router rejections.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+	#[error("model {0} is not allowed for this API key")]
+	ApiKeyModelDenied(String),
+	#[error("virtual model {model} callout failed: {cause}")]
+	CalloutFailed { model: String, cause: String },
+}
+
+impl Error {
+	pub fn reason(&self) -> ProxyResponseReason {
+		match self {
+			Error::ApiKeyModelDenied(_) => ProxyResponseReason::Authorization,
+			Error::CalloutFailed { .. } => ProxyResponseReason::ModelRouting,
+		}
+	}
+}
+
+impl PolicyError for Error {
+	fn status(&self) -> ::http::StatusCode {
+		match self {
+			Error::ApiKeyModelDenied(_) => ::http::StatusCode::FORBIDDEN,
+			Error::CalloutFailed { .. } => ::http::StatusCode::SERVICE_UNAVAILABLE,
+		}
+	}
+
+	fn external_message(&self) -> std::borrow::Cow<'static, str> {
+		match self {
+			Error::ApiKeyModelDenied(_) => "Model is not allowed for this API key".into(),
+			Error::CalloutFailed { model, .. } => format!("Virtual model {model} callout failed").into(),
+		}
+	}
+
+	fn into_response(self) -> Result<Response, Self> {
+		let code = match self {
+			Error::ApiKeyModelDenied(_) => "model_not_allowed",
+			Error::CalloutFailed { .. } => "virtual_model_callout_failed",
+		};
+		Ok(llm_error_response(
+			self.status(),
+			&self.external_message(),
+			code,
+		))
+	}
+}
+
 type RouterResult<T> = Result<T, Box<Response>>;
+
+/// Bounds virtual model nesting so a cycle cannot loop forever.
+const MAX_VIRTUAL_MODEL_DEPTH: usize = 4;
 
 struct RequestedModel {
 	model: String,
@@ -135,7 +350,8 @@ struct RequestedModel {
 }
 
 enum RequestedModelLocation {
-	Body(Value),
+	/// The parsed body is cached on the request as `ParsedJson`.
+	Body,
 	Multipart,
 	Path,
 }
@@ -143,34 +359,114 @@ enum RequestedModelLocation {
 impl ModelRouter {
 	pub fn new(models: Vec<ModelRoute>, virtual_models: Vec<VirtualModelRoute>) -> Self {
 		Self {
+			path_prefix: String::new(),
+			discovery: Default::default(),
 			models,
 			virtual_models,
 		}
 	}
 
-	pub async fn resolve(&self, req: &mut Request) -> ResolveResult {
+	pub fn with_discovery(mut self, discovery: llm::discovery::Discovery) -> Self {
+		self.discovery = discovery;
+		self
+	}
+
+	pub fn with_path_prefix(mut self, path_prefix: String) -> Self {
+		self.path_prefix = path_prefix;
+		self
+	}
+
+	/// Describe the public serving path before model selection or provider rewrites.
+	pub fn trace_path(&self, req: &Request) -> Option<agent_core::strng::Strng> {
+		let path = req
+			.uri()
+			.path()
+			.strip_prefix(&self.path_prefix)
+			.filter(|path| path.starts_with('/'))?;
+		let original_path = req
+			.extensions()
+			.get::<crate::http::filters::OriginalUrl>()
+			.map(|original| original.0.path())
+			.unwrap_or(req.uri().path());
+		// HTTPRoute prefix rewrites remove the serving prefix before reaching the router.
+		// If another rewrite changed the endpoint itself, retain the HTTP route's trace match.
+		let prefix = original_path.strip_suffix(path)?;
+		let template = serving_endpoint(path)
+			.map(|endpoint| match &endpoint.matcher {
+				EndpointMatch::Exact(_) => endpoint.template.into(),
+				EndpointMatch::Regex(regex) => regex.replace(path, endpoint.template),
+			})
+			.unwrap_or(std::borrow::Cow::Borrowed("/*"));
+		Some(strng::format!("{prefix}{template}"))
+	}
+
+	pub async fn resolve(
+		&self,
+		req: &mut Request,
+		catalog: &llm::catalog::ModelCatalog,
+		client: &PolicyClient,
+	) -> ResolveResult {
+		if !self.path_prefix.is_empty() {
+			let original = req.uri().clone();
+			let rewritten = http::modify_req_uri(req, |uri| {
+				let path = uri
+					.path_and_query
+					.as_ref()
+					.ok_or_else(|| anyhow::anyhow!("request URI has no path"))?
+					.as_str();
+				let path = path
+					.strip_prefix(&self.path_prefix)
+					.filter(|path| path.starts_with('/'))
+					.ok_or_else(|| anyhow::anyhow!("request does not match llm.pathPrefix"))?;
+				uri.path_and_query = Some(path.parse()?);
+				Ok(())
+			});
+			if rewritten.is_err() {
+				return ResolveResult::Rejected(
+					ProxyResponseReason::NotFound,
+					llm_error_response(
+						::http::StatusCode::NOT_FOUND,
+						"Request does not match llm.pathPrefix",
+						"not_found",
+					),
+				);
+			}
+			req
+				.extensions_mut()
+				.get_or_insert(crate::http::filters::OriginalUrl(original));
+		}
+		if is_responses_websocket(req) {
+			let mut response = llm_error_response(
+				::http::StatusCode::METHOD_NOT_ALLOWED,
+				"Responses WebSocket transport is not supported. Use HTTP POST instead.",
+				"websocket_not_supported",
+			);
+			response.headers_mut().insert(
+				::http::header::ALLOW,
+				::http::HeaderValue::from_static("POST"),
+			);
+			return ResolveResult::Rejected(ProxyResponseReason::InvalidRequest, response);
+		}
 		if is_model_list_request(req) {
-			return ResolveResult::DirectResponse(self.model_list_response(req));
+			return ResolveResult::DirectResponse(self.model_list_response(req, catalog));
 		}
 		let requested_model = match requested_model(req).await {
 			Ok(requested_model) => requested_model,
-			Err(resp) => return ResolveResult::DirectResponse(*resp),
+			Err(resp) => return ResolveResult::Rejected(ProxyResponseReason::InvalidRequest, *resp),
 		};
+		if !api_key_model_authorized(req, &requested_model.model) {
+			return ResolveResult::Error(Error::ApiKeyModelDenied(requested_model.model));
+		}
 		req
 			.extensions_mut()
-			.get_or_insert_with(TransformationMetadata::default)
-			.0
-			.insert(
-				"agentgateway_user_model".to_string(),
-				Value::String(requested_model.model.clone()),
-			);
+			.insert(OriginalModel(requested_model.model.clone()));
 		if let Some(virtual_model) = self
 			.virtual_models
 			.iter()
 			.find(|model| model.name == requested_model.model)
 		{
 			return self
-				.resolve_virtual_model(virtual_model, req, requested_model.location)
+				.resolve_virtual_model(virtual_model, req, requested_model.location, client)
 				.await;
 		}
 		tracing::trace!(
@@ -181,30 +477,92 @@ impl ModelRouter {
 
 		match self.resolve_concrete_model(&requested_model.model, false, req) {
 			Ok(Some(route)) => ResolveResult::Backend(route),
-			Ok(None) => ResolveResult::DirectResponse(model_not_found_response()),
-			Err(()) => ResolveResult::DirectResponse(model_authorization_denied_response()),
+			Ok(None) => {
+				ResolveResult::Rejected(ProxyResponseReason::NotFound, model_not_found_response())
+			},
+			Err(()) => ResolveResult::Rejected(
+				ProxyResponseReason::Authorization,
+				model_authorization_denied_response(),
+			),
 		}
 	}
 
-	fn model_list_response(&self, req: &Request) -> Response {
+	fn model_list_response(&self, req: &Request, catalog: &llm::catalog::ModelCatalog) -> Response {
+		let catalog = catalog.snapshot();
+		let expand = self.discovery == llm::discovery::Discovery::Catalog;
 		let data = self
 			.models
 			.iter()
 			.filter(|model| model.visibility == ModelVisibility::Public)
 			.filter(|model| model_authorized(model, req))
-			.map(|model| model_list_entry(&model.name, model.created))
+			.flat_map(|model| {
+				if expand
+					&& let Some(discovery) = &model.discovery
+					&& discovery.expands(&model.name)
+					&& let Some(model_ids) = catalog.model_ids(&discovery.provider)
+				{
+					model_ids
+						// Get all models from the catalog. Apply our transformation to it
+						// For example, an expression `model.stripPrefix("foo/")` would become Prefix(foo/);
+						// we would take gpt-4o and make it foo/gpt-4o.
+						.filter_map(|id| Some((id, discovery.transformation.apply(id)?)))
+						.filter(|(_, name)| {
+							// Now check it still matches the model match (e.g 'foo/*') and we are authorized for this model
+							model_name_matches(&model.name, name) && api_key_model_authorized(req, name)
+						})
+						.map(|(id, name)| llm::model_list::ModelInfo {
+							preferred_endpoints: discovery.preferred_endpoints(id, &catalog),
+							..llm::model_list::ModelInfo::new(
+								name.into_owned(),
+								model.created,
+								Some(discovery.provider.clone()),
+								catalog.model(&discovery.provider, id),
+							)
+						})
+						.collect::<Vec<_>>()
+				} else {
+					api_key_discoverable_models(req, &model.name)
+						.map(|name| model_info(model, name.to_owned(), &catalog))
+						.collect()
+				}
+			})
 			.chain(
 				self
 					.virtual_models
 					.iter()
-					.map(|model| model_list_entry(&model.name, model.created)),
+					.filter(|model| api_key_model_authorized(req, &model.name))
+					.map(|model| self.virtual_model_info(model, &catalog)),
 			)
+			.unique_by(|model| model.id.clone())
 			.collect::<Vec<_>>();
-		let body = serde_json::json!({
-			"data": data,
-			"object": "list",
-		})
-		.to_string();
+		let path = req.uri().path().trim_end_matches('/');
+		let body = match path
+			.strip_prefix("/v1/models/")
+			.or_else(|| path.strip_prefix("/models/"))
+		{
+			Some(id) => {
+				let id = percent_encoding::percent_decode_str(id).decode_utf8_lossy();
+				let Some(model) = data.iter().find(|model| model.id == id) else {
+					return llm_error_response(
+						::http::StatusCode::NOT_FOUND,
+						&format!("The model `{id}` does not exist"),
+						"model_not_found",
+					);
+				};
+				llm::model_list::render_model(model)
+			},
+			None => {
+				let limit = req
+					.uri()
+					.query()
+					.and_then(|query| {
+						url::form_urlencoded::parse(query.as_bytes()).find(|(key, _)| key == "limit")
+					})
+					.and_then(|(_, limit)| limit.parse::<usize>().ok())
+					.unwrap_or(data.len());
+				llm::model_list::render(&data[..limit.min(data.len())])
+			},
+		};
 		::http::Response::builder()
 			.status(::http::StatusCode::OK)
 			.header(::http::header::CONTENT_TYPE, "application/json")
@@ -212,57 +570,186 @@ impl ModelRouter {
 			.expect("LLM model list response is valid")
 	}
 
+	fn virtual_model_info(
+		&self,
+		model: &VirtualModelRoute,
+		catalog: &llm::catalog::CatalogSnapshot,
+	) -> llm::model_list::ModelInfo {
+		let targets: Vec<(&str, bool)> = match &model.routing {
+			VirtualModelRouting::Weighted(targets) => targets
+				.iter()
+				.map(|t| (t.model.as_str(), t.invalid))
+				.collect(),
+			VirtualModelRouting::Conditional(targets) => targets
+				.iter()
+				.map(|t| (t.model.as_str(), t.invalid))
+				.collect(),
+			// Failover targets are always concrete models.
+			VirtualModelRouting::Failover { targets, .. } => {
+				targets.iter().map(|t| (t.as_str(), false)).collect()
+			},
+			// Callouts pick targets at request time.
+			VirtualModelRouting::Callout(_) => vec![],
+		};
+		let targets = targets
+			.into_iter()
+			.map(|(target, invalid)| {
+				// An unresolved or invalid target leaves its metadata unknown rather than being skipped.
+				match self
+					.models
+					.iter()
+					.find(|route| !invalid && model_name_matches(&route.name, target))
+				{
+					Some(route) => model_info(route, target.to_string(), catalog),
+					None => llm::model_list::ModelInfo::default(),
+				}
+			})
+			.collect::<Vec<_>>();
+		llm::model_list::ModelInfo::combine(model.name.clone(), model.created, &targets)
+	}
+
 	async fn resolve_virtual_model(
 		&self,
 		virtual_model: &VirtualModelRoute,
 		req: &mut Request,
 		location: RequestedModelLocation,
+		client: &PolicyClient,
 	) -> ResolveResult {
-		let target = match &virtual_model.routing {
-			VirtualModelRouting::Weighted(targets) => {
-				match targets.choose_weighted(&mut rand::rng(), |target| target.weight) {
-					Ok(target) => target.model.clone(),
-					Err(err) => {
-						tracing::debug!(%err, "failed to select weighted virtual model target");
-						return ResolveResult::DirectResponse(llm_error_response(
-							::http::StatusCode::NOT_FOUND,
-							&format!("Virtual model {} could not be resolved", virtual_model.name),
-							"virtual_model_not_resolved",
-						));
-					},
-				}
-			},
-			VirtualModelRouting::Failover { backend } => {
-				return ResolveResult::Backend(ResolvedBackend {
-					backend: backend.clone(),
-					llm_policy: virtual_model.llm_policy.clone(),
-				});
-			},
-			VirtualModelRouting::Conditional(targets) => {
-				let exec = cel::Executor::new_request(req);
-				match targets.iter().find(|target| {
-					target
-						.when
-						.as_ref()
-						.map(|expr| exec.eval_bool(expr))
-						.unwrap_or(true)
-				}) {
-					Some(target) => target.model.clone(),
-					None => {
-						return ResolveResult::DirectResponse(llm_error_response(
-							::http::StatusCode::BAD_REQUEST,
-							&format!(
-								"Virtual model {} did not match any conditional target",
-								virtual_model.name
-							),
-							"virtual_model_no_matching_target",
-						));
-					},
-				}
-			},
+		let mut fields = Vec::new();
+		let mut virtual_model = virtual_model;
+		let mut depth = 0;
+		let target = loop {
+			let (target, invalid) = match &virtual_model.routing {
+				VirtualModelRouting::Weighted(targets) => {
+					match targets.choose_weighted(&mut rand::rng(), |target| target.weight) {
+						Ok(target) => (target.model.clone(), target.invalid),
+						Err(err) => {
+							tracing::debug!(%err, "failed to select weighted virtual model target");
+							return ResolveResult::Rejected(
+								ProxyResponseReason::ModelRouting,
+								llm_error_response(
+									::http::StatusCode::NOT_FOUND,
+									&format!("Virtual model {} could not be resolved", virtual_model.name),
+									"virtual_model_not_resolved",
+								),
+							);
+						},
+					}
+				},
+				VirtualModelRouting::Failover { backend, .. } => {
+					// A callout earlier in the chain may have set fields; apply them since we will not reach the
+					// rewrite below. The failover providers override the model themselves.
+					if !fields.is_empty()
+						&& let Err(resp) = Box::pin(rewrite_request_model(
+							req,
+							location,
+							&virtual_model.name,
+							fields,
+						))
+						.await
+					{
+						return ResolveResult::Rejected(ProxyResponseReason::InvalidRequest, *resp);
+					}
+					return ResolveResult::Backend(ResolvedBackend {
+						backend: backend.clone(),
+						route_type: classify_route(req.uri().path()).unwrap_or(llm::RouteType::Passthrough),
+						llm_policy: virtual_model.llm_policy.clone(),
+					});
+				},
+				VirtualModelRouting::Conditional(targets) => {
+					let exec = cel::Executor::new_request(req);
+					match targets.iter().find(|target| {
+						target
+							.when
+							.as_ref()
+							.map(|expr| exec.eval_bool(expr))
+							.unwrap_or(true)
+					}) {
+						Some(target) => (target.model.clone(), target.invalid),
+						None => {
+							return ResolveResult::Rejected(
+								ProxyResponseReason::ModelRouting,
+								llm_error_response(
+									::http::StatusCode::BAD_REQUEST,
+									&format!(
+										"Virtual model {} did not match any conditional target",
+										virtual_model.name
+									),
+									"virtual_model_no_matching_target",
+								),
+							);
+						},
+					}
+				},
+				VirtualModelRouting::Callout(callout) => {
+					let selection = match callout.select(client, req).await {
+						Ok(selection) if self.has_model(&selection.model) => Ok(selection),
+						Ok(selection) => Err(format!("selected unknown model {}", selection.model)),
+						Err(err) => Err(err.to_string()),
+					};
+					match (selection, &callout.failure_mode) {
+						(Ok(selection), _) => {
+							fields.extend(selection.fields);
+							(selection.model, false)
+						},
+						(Err(cause), VirtualModelCalloutFailureMode::Fallback(model)) => {
+							tracing::debug!(virtual_model = %virtual_model.name, %cause, "virtual model callout failed, using fallback");
+							(model.clone(), false)
+						},
+						(Err(cause), VirtualModelCalloutFailureMode::FailClosed) => {
+							return ResolveResult::Error(Error::CalloutFailed {
+								model: virtual_model.name.clone(),
+								cause,
+							});
+						},
+					}
+				},
+			};
+			if invalid {
+				tracing::debug!(
+					virtual_model = %virtual_model.name,
+					target_model = %target,
+					"virtual model selected an invalid target",
+				);
+				return ResolveResult::Rejected(
+					ProxyResponseReason::ModelRouting,
+					llm_error_response(
+						::http::StatusCode::NOT_FOUND,
+						&format!(
+							"Virtual model {} selected invalid target {target}",
+							virtual_model.name
+						),
+						"virtual_model_target_not_found",
+					),
+				);
+			}
+			// A target may itself be a virtual model; keep resolving until we reach a concrete model.
+			// A target with the virtual model's own name refers to the concrete model it shadows.
+			let next = (target != virtual_model.name)
+				.then(|| self.virtual_models.iter().find(|m| m.name == target))
+				.flatten();
+			let Some(next) = next else {
+				break target;
+			};
+			depth += 1;
+			if depth >= MAX_VIRTUAL_MODEL_DEPTH {
+				return ResolveResult::Rejected(
+					ProxyResponseReason::ModelRouting,
+					llm_error_response(
+						::http::StatusCode::NOT_FOUND,
+						&format!(
+							"Virtual model {} exceeded the maximum nesting depth",
+							virtual_model.name
+						),
+						"virtual_model_not_resolved",
+					),
+				);
+			}
+			virtual_model = next;
 		};
-		if let Err(resp) = rewrite_request_model(req, location, &target) {
-			return ResolveResult::DirectResponse(*resp);
+
+		if let Err(resp) = Box::pin(rewrite_request_model(req, location, &target, fields)).await {
+			return ResolveResult::Rejected(ProxyResponseReason::InvalidRequest, *resp);
 		}
 		match self.resolve_concrete_model(&target, true, req) {
 			Ok(Some(route)) => ResolveResult::Backend(route),
@@ -272,17 +759,31 @@ impl ModelRouter {
 					target_model = %target,
 					"virtual model selected target with no declared concrete model",
 				);
-				ResolveResult::DirectResponse(llm_error_response(
-					::http::StatusCode::NOT_FOUND,
-					&format!(
-						"Virtual model {} selected target {target}, but no matching model was found",
-						virtual_model.name
+				ResolveResult::Rejected(
+					ProxyResponseReason::ModelRouting,
+					llm_error_response(
+						::http::StatusCode::NOT_FOUND,
+						&format!(
+							"Virtual model {} selected target {target}, but no matching model was found",
+							virtual_model.name
+						),
+						"virtual_model_target_not_found",
 					),
-					"virtual_model_target_not_found",
-				))
+				)
 			},
-			Err(()) => ResolveResult::DirectResponse(model_authorization_denied_response()),
+			Err(()) => ResolveResult::Rejected(
+				ProxyResponseReason::Authorization,
+				model_authorization_denied_response(),
+			),
 		}
+	}
+
+	fn has_model(&self, model: &str) -> bool {
+		self.virtual_models.iter().any(|route| route.name == model)
+			|| self
+				.models
+				.iter()
+				.any(|route| model_name_matches(&route.name, model))
 	}
 
 	fn resolve_concrete_model(
@@ -310,6 +811,11 @@ impl ModelRouter {
 		};
 		Ok(Some(ResolvedBackend {
 			backend: model.backend.clone(),
+			route_type: model
+				.policies
+				.passthrough
+				.or_else(|| classify_route(req.uri().path()))
+				.unwrap_or(llm::RouteType::Passthrough),
 			llm_policy: model.policies.llm.clone(),
 		}))
 	}
@@ -373,17 +879,74 @@ fn model_authorized(model: &ModelRoute, req: &Request) -> bool {
 	.is_ok()
 }
 
-fn model_list_entry(id: &str, created: u64) -> serde_json::Value {
-	serde_json::json!({
-		"id": id,
-		"object": "model",
-		"created": created,
-		// TODO: this matches some other gateways but seems odd. Should we use the real provide here?
-		"owned_by": "openai",
-	})
+fn api_key_model_authorized(req: &Request, model: &str) -> bool {
+	let Some(policy) = req
+		.extensions()
+		.get::<crate::http::apikey::ModelAccessPolicy>()
+	else {
+		return true;
+	};
+	let allowed = policy.allows(model);
+	if !allowed {
+		tracing::debug!(model, "requested model is not allowed for API key");
+	}
+	allowed
+}
+
+fn api_key_discoverable_models<'a>(
+	req: &'a Request,
+	configured_model: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
+	crate::http::apikey::discoverable_models(
+		req
+			.extensions()
+			.get::<crate::http::apikey::ModelAccessPolicy>(),
+		configured_model,
+	)
+}
+
+fn model_info(
+	route: &ModelRoute,
+	name: String,
+	catalog: &llm::catalog::CatalogSnapshot,
+) -> llm::model_list::ModelInfo {
+	let Some(discovery) = &route.discovery else {
+		return llm::model_list::ModelInfo::new(name, route.created, None, None);
+	};
+	let id = catalog
+		.model_ids(&discovery.provider)
+		.map(|ids| discovery.catalog_model(&name, ids))
+		.unwrap_or_else(|| discovery.model.as_deref().unwrap_or(&name).to_string());
+	let entry = catalog.model(&discovery.provider, &id);
+	llm::model_list::ModelInfo {
+		preferred_endpoints: discovery.preferred_endpoints(&id, catalog),
+		..llm::model_list::ModelInfo::new(name, route.created, Some(discovery.provider.clone()), entry)
+	}
+}
+
+fn is_responses_websocket(req: &Request) -> bool {
+	req.method() == ::http::Method::GET
+		&& req
+			.headers()
+			.typed_get::<headers::Connection>()
+			.is_some_and(|connection| connection.contains(::http::header::UPGRADE))
+		&& req
+			.headers()
+			.get_all(::http::header::UPGRADE)
+			.iter()
+			.filter_map(|value| value.to_str().ok())
+			.any(|value| {
+				value
+					.split(',')
+					.any(|protocol| protocol.trim().eq_ignore_ascii_case("websocket"))
+			})
+		&& classify_route(req.uri().path()) == Some(llm::RouteType::Responses)
 }
 
 fn is_model_list_request(req: &Request) -> bool {
+	if req.method() != ::http::Method::GET {
+		return false;
+	}
 	let path = req.uri().path().trim_end_matches('/');
 	path == "/v1/models"
 		|| path
@@ -411,6 +974,11 @@ fn headers_match(headers: &[HeaderMatch], req: &Request) -> bool {
 	true
 }
 
+/// Ranks model patterns so more specific ones are tried first: higher is more specific.
+pub(crate) fn model_match_specificity(pattern: &str) -> usize {
+	pattern.chars().filter(|c| *c != '*').count()
+}
+
 fn model_name_matches(pattern: &str, model: &str) -> bool {
 	if pattern == "*" {
 		return true;
@@ -424,6 +992,65 @@ fn model_name_matches(pattern: &str, model: &str) -> bool {
 	pattern == model
 }
 
+/// Exposes the request model as `llm.requestModel` and, if requested, the parsed JSON body as
+/// `llmRequest` to policy CEL.
+pub(crate) async fn set_llm_cel_context(req: &mut Request, include_body: bool) -> RouterResult<()> {
+	// Clear first so a failed parse below leaves no model rather than a stale one. This runs again
+	// after route policies and virtual model rewrites, so keep the model seen first.
+	let previous = req
+		.extensions_mut()
+		.remove::<cel::RequestModel>()
+		.map(|m| m.original_model);
+	let path_model = llm::types::detect::extract_model_from_path(req.uri().path()).is_some();
+	if include_body || !path_model {
+		// Reject unreadable bodies (too large, or failing to decode) rather than evaluating policies
+		// without the model. A failed decode also leaves the body unusable.
+		body_bytes(req).await?;
+	}
+	if include_body {
+		let _ = json_body(req).await;
+	}
+	if let Ok(requested) = requested_model(req).await {
+		let request_model = strng::new(requested.model);
+		let original_model = req
+			.extensions()
+			.get::<OriginalModel>()
+			.map(|m| strng::new(&m.0))
+			.or(previous)
+			.unwrap_or_else(|| request_model.clone());
+		req.extensions_mut().insert(cel::RequestModel {
+			request_model,
+			original_model,
+		});
+	}
+	Ok(())
+}
+
+/// The request body parsed as JSON. It is parsed once and cached on the body for later readers.
+async fn json_body(req: &mut Request) -> RouterResult<&Value> {
+	if req.body().extension::<crate::json::ParsedJson>().is_none() {
+		let body = body_bytes(req).await?;
+		let body = serde_json::from_slice(&body).map_err(|err| {
+			tracing::debug!(%err, "failed to parse LLM request body");
+			Box::new(llm_error_response(
+				::http::StatusCode::BAD_REQUEST,
+				"LLM request body must be valid JSON",
+				"invalid_request_body",
+			))
+		})?;
+		req
+			.body_mut()
+			.insert_extension(crate::json::ParsedJson(body));
+	}
+	Ok(
+		&req
+			.body()
+			.extension::<crate::json::ParsedJson>()
+			.expect("parsed body was cached above")
+			.0,
+	)
+}
+
 async fn requested_model(req: &mut Request) -> RouterResult<RequestedModel> {
 	let path = req.uri().path();
 	if let Some(model) = crate::llm::types::detect::extract_model_from_path(path) {
@@ -433,23 +1060,16 @@ async fn requested_model(req: &mut Request) -> RouterResult<RequestedModel> {
 		});
 	}
 
-	let body = body_bytes(req).await?;
 	if let Some(boundary) = multipart_boundary(req) {
+		let body = body_bytes(req).await?;
 		let model = multipart_model(&body, &boundary).await?;
 		return Ok(RequestedModel {
 			model,
 			location: RequestedModelLocation::Multipart,
 		});
 	}
-	let body: Value = serde_json::from_slice(&body).map_err(|err| {
-		tracing::debug!(%err, "failed to parse LLM request body");
-		Box::new(llm_error_response(
-			::http::StatusCode::BAD_REQUEST,
-			"LLM request body must be valid JSON",
-			"invalid_request_body",
-		))
-	})?;
-	let model = body
+	let model = json_body(req)
+		.await?
 		.get("model")
 		.and_then(Value::as_str)
 		.map(ToString::to_string)
@@ -462,49 +1082,64 @@ async fn requested_model(req: &mut Request) -> RouterResult<RequestedModel> {
 		})?;
 	Ok(RequestedModel {
 		model,
-		location: RequestedModelLocation::Body(body),
+		location: RequestedModelLocation::Body,
 	})
 }
 
-fn rewrite_request_model(
+async fn rewrite_request_model(
 	req: &mut Request,
 	location: RequestedModelLocation,
 	target: &str,
+	fields: Vec<(String, Option<Value>)>,
 ) -> RouterResult<()> {
 	match location {
-		RequestedModelLocation::Body(body) => rewrite_body_model(req, body, target),
+		RequestedModelLocation::Body => rewrite_body_model(req, target, fields),
 		RequestedModelLocation::Path => rewrite_uri_model(req, target),
-		// TODO: Rewrite multipart model fields for virtual model routing.
-		RequestedModelLocation::Multipart => Ok(()),
+		RequestedModelLocation::Multipart => rewrite_multipart_request_model(req, target).await,
 	}
 }
 
-fn rewrite_body_model(req: &mut Request, mut body: Value, target: &str) -> RouterResult<()> {
-	let Some(obj) = body.as_object_mut() else {
+/// Sets `model` and any callout-selected `fields` on the cached JSON body, and re-serializes it.
+fn rewrite_body_model(
+	req: &mut Request,
+	target: &str,
+	fields: Vec<(String, Option<Value>)>,
+) -> RouterResult<()> {
+	let Some(crate::json::ParsedJson(mut body)) = req.body_mut().remove_extension() else {
 		return Ok(());
 	};
-	obj.insert("model".to_string(), Value::String(target.to_string()));
-	let body = serde_json::to_vec(&body).map_err(|err| {
-		tracing::debug!(%err, "failed to serialize rewritten LLM request body");
-		Box::new(llm_error_response(
-			::http::StatusCode::BAD_REQUEST,
-			"Failed to rewrite LLM request body model",
-			"request_body_rewrite_failed",
-		))
-	})?;
-	*req.body_mut() = http::Body::from(body);
-	req.headers_mut().remove(::http::header::CONTENT_LENGTH);
-	req.extensions_mut().remove::<cel::BufferedBody>();
+	if let Some(obj) = body.as_object_mut() {
+		for (k, v) in fields {
+			match v {
+				Some(v) => obj.insert(k, v),
+				None => obj.remove(&k),
+			};
+		}
+		obj.insert("model".to_string(), Value::String(target.to_string()));
+		let bytes = serde_json::to_vec(&body).map_err(|err| {
+			tracing::debug!(%err, "failed to serialize rewritten LLM request body");
+			Box::new(llm_error_response(
+				::http::StatusCode::BAD_REQUEST,
+				"Failed to rewrite LLM request body model",
+				"request_body_rewrite_failed",
+			))
+		})?;
+		req.replace_body_bytes(bytes.into());
+	}
+	req
+		.body_mut()
+		.insert_extension(crate::json::ParsedJson(body));
 	Ok(())
 }
 
-fn rewrite_uri_model(req: &mut Request, target: &str) -> RouterResult<()> {
+pub(crate) fn rewrite_uri_model(req: &mut Request, target: &str) -> RouterResult<()> {
 	let Some(path_and_query) = req.uri().path_and_query() else {
 		return Ok(());
 	};
 	let Some(path) = rewrite_path_model(path_and_query.path(), target) else {
 		return Ok(());
 	};
+	let original = crate::llm::types::detect::extract_model_from_path(path_and_query.path());
 	let path_and_query = if let Some(query) = path_and_query.query() {
 		format!("{path}?{query}")
 	} else {
@@ -528,22 +1163,28 @@ fn rewrite_uri_model(req: &mut Request, target: &str) -> RouterResult<()> {
 			"request_uri_rewrite_failed",
 		))
 	})?;
+	if let Some(original) = original {
+		OriginalModel::record(req.extensions_mut(), original.to_string());
+	}
 	Ok(())
 }
 
-fn rewrite_path_model(path: &str, target: &str) -> Option<String> {
+pub(crate) fn rewrite_path_model(path: &str, target: &str) -> Option<String> {
 	if path.ends_with(":streamRawPredict") || path.ends_with(":rawPredict") {
-		// Vertex: .../publishers/{publisher}/models/{model}:{rawPredict|streamRawPredict}
-		// Preserve the publisher from the path; only rewrite the model id. Matching only
-		// `publishers/anthropic` incorrectly dropped virtual-model rewrites for other publishers.
-		let (prefix, rest) = path.split_once("/publishers/")?;
-		let (publisher, after_publisher) = rest.split_once("/models/")?;
-		if publisher.is_empty() {
-			return None;
+		return rewrite_publishers_path_model(path, target);
+	}
+	if path.ends_with(":generateContent")
+		|| path.ends_with(":streamGenerateContent")
+		|| path.ends_with(":countTokens")
+	{
+		if path.contains("/publishers/") {
+			return rewrite_publishers_path_model(path, target);
 		}
-		let (_, suffix) = after_publisher.split_once(':')?;
+		// Gemini API: /v1beta/models/{model}:{suffix}
+		let (prefix, rest) = path.split_once("/models/")?;
+		let (_, suffix) = rest.split_once(':')?;
 		return Some(format!(
-			"{prefix}/publishers/{publisher}/models/{}:{suffix}",
+			"{prefix}/models/{}:{suffix}",
 			encode_model_path_segment(target)
 		));
 	}
@@ -565,12 +1206,28 @@ fn rewrite_path_model(path: &str, target: &str) -> Option<String> {
 	None
 }
 
+fn rewrite_publishers_path_model(path: &str, target: &str) -> Option<String> {
+	// Vertex: .../publishers/{publisher}/models/{model}:{suffix}
+	// Preserve the publisher from the path; only rewrite the model id. Matching only
+	// `publishers/anthropic` incorrectly dropped virtual-model rewrites for other publishers.
+	let (prefix, rest) = path.split_once("/publishers/")?;
+	let (publisher, after_publisher) = rest.split_once("/models/")?;
+	if publisher.is_empty() {
+		return None;
+	}
+	let (_, suffix) = after_publisher.split_once(':')?;
+	Some(format!(
+		"{prefix}/publishers/{publisher}/models/{}:{suffix}",
+		encode_model_path_segment(target)
+	))
+}
+
 fn encode_model_path_segment(model: &str) -> String {
 	const MODEL_SEGMENT: &AsciiSet = &CONTROLS.add(b'/').add(b'%');
 	utf8_percent_encode(model, MODEL_SEGMENT).to_string()
 }
 
-fn multipart_boundary(req: &Request) -> Option<String> {
+pub fn multipart_boundary(req: &Request) -> Option<String> {
 	req
 		.headers()
 		.get(::http::header::CONTENT_TYPE)
@@ -578,7 +1235,24 @@ fn multipart_boundary(req: &Request) -> Option<String> {
 		.and_then(|content_type| multer::parse_boundary(content_type).ok())
 }
 
-async fn multipart_model(body: &Bytes, boundary: &str) -> RouterResult<String> {
+pub(crate) async fn rewrite_multipart_request_model(
+	req: &mut Request,
+	target: &str,
+) -> Result<(), Box<Response>> {
+	let Some(boundary) = multipart_boundary(req) else {
+		return Ok(());
+	};
+	let body = body_bytes(req).await?;
+	let Some((body, original)) = rewrite_multipart_body_model(&body, &boundary, target).await? else {
+		return Ok(());
+	};
+	OriginalModel::record(req.extensions_mut(), original);
+	req.replace_body_bytes(body);
+	req.headers_mut().remove(::http::header::TRANSFER_ENCODING);
+	Ok(())
+}
+
+pub(crate) async fn multipart_model(body: &Bytes, boundary: &str) -> RouterResult<String> {
 	let stream = stream::once(std::future::ready(Ok::<Bytes, multer::Error>(body.clone())));
 	let mut multipart = multer::Multipart::new(stream, boundary);
 	while let Some(field) = multipart.next_field().await.map_err(|err| {
@@ -607,70 +1281,155 @@ async fn multipart_model(body: &Bytes, boundary: &str) -> RouterResult<String> {
 	)))
 }
 
+pub(crate) async fn rewrite_multipart_body_model(
+	body: &Bytes,
+	boundary: &str,
+	target: &str,
+) -> RouterResult<Option<(Bytes, String)>> {
+	// Parse once to avoid rebuilding an already-correct body. Comparing decoded text also
+	// respects a model field's declared charset. Returns the rewritten body and the replaced model.
+	let stream = stream::once(std::future::ready(Ok::<Bytes, multer::Error>(body.clone())));
+	let mut multipart = multer::Multipart::new(stream, boundary);
+	let mut original = None;
+	while let Some(field) = multipart.next_field().await.map_err(|err| {
+		tracing::debug!(%err, "failed to parse LLM multipart request body for model rewrite");
+		Box::new(llm_error_response(
+			::http::StatusCode::BAD_REQUEST,
+			"LLM multipart request body must be valid multipart/form-data",
+			"invalid_request_body",
+		))
+	})? {
+		if field.name() != Some("model") {
+			continue;
+		}
+		let model = field.text().await.map_err(|err| {
+			tracing::debug!(%err, "failed to parse LLM multipart model field for rewrite");
+			Box::new(llm_error_response(
+				::http::StatusCode::BAD_REQUEST,
+				"LLM multipart request body has invalid string field 'model'",
+				"invalid_model",
+			))
+		})?;
+		if model != target && original.is_none() {
+			original = Some(model);
+		}
+	}
+	let Some(original) = original else {
+		return Ok(None);
+	};
+
+	// Multer does not expose raw offsets, so rebuild the multipart envelope from the fields it
+	// parsed. File and non-model field bytes are preserved; header formatting is normalized.
+	let stream = stream::once(std::future::ready(Ok::<Bytes, multer::Error>(body.clone())));
+	let mut multipart = multer::Multipart::new(stream, boundary);
+	let mut rewritten = Vec::with_capacity(body.len());
+	while let Some(field) = multipart.next_field().await.map_err(|err| {
+		tracing::debug!(%err, "failed to parse LLM multipart request body for model rewrite");
+		Box::new(llm_error_response(
+			::http::StatusCode::BAD_REQUEST,
+			"LLM multipart request body must be valid multipart/form-data",
+			"invalid_request_body",
+		))
+	})? {
+		let is_model = field.name() == Some("model");
+		rewritten.extend_from_slice(b"--");
+		rewritten.extend_from_slice(boundary.as_bytes());
+		rewritten.extend_from_slice(b"\r\n");
+		for (name, value) in field.headers() {
+			rewritten.extend_from_slice(name.as_str().as_bytes());
+			rewritten.extend_from_slice(b": ");
+			if is_model && name == ::http::header::CONTENT_TYPE {
+				// The replacement is UTF-8 regardless of the source field's charset.
+				rewritten.extend_from_slice(b"text/plain; charset=utf-8");
+			} else if is_model && name == ::http::header::CONTENT_LENGTH {
+				rewritten.extend_from_slice(target.len().to_string().as_bytes());
+			} else {
+				rewritten.extend_from_slice(value.as_bytes());
+			}
+			rewritten.extend_from_slice(b"\r\n");
+		}
+		rewritten.extend_from_slice(b"\r\n");
+		if is_model {
+			// Consume the original field so multer validates the complete body.
+			field.bytes().await.map_err(|err| {
+				tracing::debug!(%err, "failed to read LLM multipart model field for rewrite");
+				Box::new(llm_error_response(
+					::http::StatusCode::BAD_REQUEST,
+					"LLM multipart request body must be valid multipart/form-data",
+					"invalid_request_body",
+				))
+			})?;
+			rewritten.extend_from_slice(target.as_bytes());
+		} else {
+			let data = field.bytes().await.map_err(|err| {
+				tracing::debug!(%err, "failed to read LLM multipart field for model rewrite");
+				Box::new(llm_error_response(
+					::http::StatusCode::BAD_REQUEST,
+					"LLM multipart request body must be valid multipart/form-data",
+					"invalid_request_body",
+				))
+			})?;
+			rewritten.extend_from_slice(&data);
+		}
+		rewritten.extend_from_slice(b"\r\n");
+	}
+	rewritten.extend_from_slice(b"--");
+	rewritten.extend_from_slice(boundary.as_bytes());
+	rewritten.extend_from_slice(b"--\r\n");
+	Ok(Some((Bytes::from(rewritten), original)))
+}
+
 async fn body_bytes(req: &mut Request) -> RouterResult<Bytes> {
 	let limit = http::buffer_limit(req);
 	let content_encoding = req.headers().typed_get::<ContentEncoding>();
 	if content_encoding.is_some() {
-		let body = if let Some(body) = req.extensions().get::<cel::BufferedBody>() {
-			http::Body::from(
-				body
-					.bytes()
-					.cloned()
-					.ok_or_else(|| Box::new(request_body_too_large_response()))?,
-			)
-		} else {
-			std::mem::take(req.body_mut())
-		};
-		let (encoding, body) =
-			http::compression::to_bytes_with_decompression(body, content_encoding.as_ref(), limit)
-				.await
-				.map_err(|err| match err {
-					http::compression::Error::LimitExceeded => Box::new(request_body_too_large_response()),
-					err => {
-						tracing::debug!(%err, "failed to decode LLM request body");
-						Box::new(llm_error_response(
-							::http::StatusCode::BAD_REQUEST,
-							"Failed to decode LLM request body",
-							"request_body_decode_failed",
-						))
-					},
-				})?;
-		*req.body_mut() = http::Body::from(body.clone());
+		let mut encoding = None;
+		let mut decoded_bytes = Bytes::new();
+		req
+			.body_mut()
+			.try_modify(|body| async {
+				let (decoded_encoding, bytes) =
+					http::compression::to_bytes_with_decompression(body, content_encoding.as_ref(), limit)
+						.await?;
+				encoding = decoded_encoding;
+				decoded_bytes = bytes.clone();
+				Ok::<_, http::compression::Error>(bytes.into())
+			})
+			.await
+			.map_err(|err| match err {
+				http::compression::Error::LimitExceeded => Box::new(request_body_too_large_response()),
+				err => {
+					tracing::debug!(%err, "failed to decode LLM request body");
+					Box::new(llm_error_response(
+						::http::StatusCode::BAD_REQUEST,
+						"Failed to decode LLM request body",
+						"request_body_decode_failed",
+					))
+				},
+			})?;
 		if encoding.is_some() {
 			req.headers_mut().remove(::http::header::CONTENT_ENCODING);
 			req.headers_mut().remove(::http::header::CONTENT_LENGTH);
 			req.headers_mut().remove(::http::header::TRANSFER_ENCODING);
 		}
-		req
-			.extensions_mut()
-			.insert(cel::BufferedBody::complete(body.clone()));
-		return Ok(body);
+		return Ok(decoded_bytes);
 	}
-	if let Some(body) = req.extensions().get::<cel::BufferedBody>() {
-		return body
-			.bytes()
-			.cloned()
-			.ok_or_else(|| Box::new(request_body_too_large_response()));
-	}
-	let inspection = http::inspect_body_with_limit(req.body_mut(), limit)
-		.await
-		.map_err(|err| {
-			tracing::debug!(%err, "failed to read LLM request body");
-			Box::new(llm_error_response(
-				::http::StatusCode::BAD_REQUEST,
-				"Failed to read LLM request body",
-				"request_body_read_failed",
-			))
-		})?;
+	// A prior partial inspection may have used a smaller limit. Inspection
+	// reuses known bytes and reads further only when this limit requires it.
+	let inspection = req.body_mut().inspect(limit).await.map_err(|err| {
+		tracing::debug!(%err, "failed to read LLM request body");
+		Box::new(llm_error_response(
+			::http::StatusCode::BAD_REQUEST,
+			"Failed to read LLM request body",
+			"request_body_read_failed",
+		))
+	})?;
 	let body = match inspection {
 		http::BodyInspection::Complete(body) => body,
 		http::BodyInspection::Partial(_) => {
 			return Err(Box::new(request_body_too_large_response()));
 		},
 	};
-	req
-		.extensions_mut()
-		.insert(cel::BufferedBody::complete(body.clone()));
 	Ok(body)
 }
 
@@ -679,6 +1438,507 @@ mod tests {
 	use super::*;
 	use crate::transport::BufferLimit;
 	use crate::types::agent::RouteBackendTarget;
+
+	fn original_model(req: &Request) -> Option<&str> {
+		req
+			.extensions()
+			.get::<OriginalModel>()
+			.map(|model| model.0.as_str())
+	}
+
+	#[tokio::test]
+	async fn conditional_virtual_model_can_use_llm_request() {
+		let model = |name: &str| ModelRoute {
+			discovery: None,
+			id: None,
+			name: name.to_string(),
+			created: 0,
+			visibility: ModelVisibility::Internal,
+			header_matches: vec![],
+			backend: RouteBackendReference {
+				weight: 1,
+				target: RouteBackendTarget::Invalid,
+				inline_policies: vec![],
+			},
+			policies: ModelRoutePolicies {
+				passthrough: None,
+				llm: Arc::default(),
+				authorization: None,
+			},
+			backend_policies: vec![],
+		};
+		let router = ModelRouter::new(
+			vec![model("economy-model"), model("premium-model")],
+			vec![VirtualModelRoute {
+				name: "smart-model".to_string(),
+				created: 0,
+				llm_policy: Arc::default(),
+				routing: VirtualModelRouting::Conditional(vec![
+					ConditionalTarget {
+						model: "economy-model".to_string(),
+						invalid: false,
+						when: Some(Arc::new(
+							cel::Expression::new_strict("llmRequest.max_tokens <= 1024")
+								.expect("valid CEL expression"),
+						)),
+					},
+					ConditionalTarget {
+						model: "premium-model".to_string(),
+						invalid: false,
+						when: None,
+					},
+				]),
+			}],
+		);
+		let mut req = ::http::Request::builder()
+			.uri("http://example.com/v1/chat/completions")
+			.body(http::Body::from(
+				r#"{"model":"smart-model","max_tokens":256}"#,
+			))
+			.expect("valid request");
+
+		assert!(matches!(
+			router
+				.resolve(
+					&mut req,
+					&llm::catalog::ModelCatalog::default(),
+					&crate::test_helpers::policy_client(),
+				)
+				.await,
+			ResolveResult::Backend(_)
+		));
+		assert_eq!(original_model(&req), Some("smart-model"));
+		let cached = req
+			.body()
+			.extension::<crate::json::ParsedJson>()
+			.unwrap()
+			.0
+			.clone();
+		let body = http::read_body_with_limit(req.into_body(), 1024)
+			.await
+			.expect("rewritten request body");
+		let body: Value = serde_json::from_slice(&body).expect("valid JSON request body");
+		assert_eq!(body["model"], "economy-model");
+		assert_eq!(cached, body);
+	}
+
+	#[test]
+	fn passthrough_overrides_serving_endpoint() {
+		let model = |name: &str, passthrough| ModelRoute {
+			discovery: None,
+			id: None,
+			name: name.to_string(),
+			created: 0,
+			visibility: ModelVisibility::Public,
+			header_matches: vec![],
+			backend: RouteBackendReference {
+				weight: 1,
+				target: RouteBackendTarget::Invalid,
+				inline_policies: vec![],
+			},
+			policies: ModelRoutePolicies {
+				passthrough,
+				llm: Arc::default(),
+				authorization: None,
+			},
+			backend_policies: vec![],
+		};
+		let router = ModelRouter::new(
+			vec![
+				model("default", None),
+				model("detect", Some(llm::RouteType::Detect)),
+				model("opaque", Some(llm::RouteType::Passthrough)),
+			],
+			vec![],
+		);
+		let route_type = |name: &str, path: &str| {
+			let req = ::http::Request::builder()
+				.uri(path)
+				.body(http::Body::empty())
+				.expect("valid request");
+			router
+				.resolve_concrete_model(name, false, &req)
+				.expect("authorized")
+				.expect("model exists")
+				.route_type
+		};
+		assert_eq!(
+			route_type("default", "/v1/chat/completions"),
+			llm::RouteType::Completions
+		);
+		assert_eq!(
+			route_type("detect", "/v1/chat/completions"),
+			llm::RouteType::Detect
+		);
+		assert_eq!(
+			route_type("opaque", "/v1/audio/speech"),
+			llm::RouteType::Passthrough
+		);
+	}
+
+	#[tokio::test]
+	async fn callout_virtual_model() {
+		use wiremock::matchers::{body_json, header, method, path};
+		use wiremock::{Mock, MockServer, ResponseTemplate};
+
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(path("/route"))
+			.and(header("x-tenant", "acme"))
+			.and(body_json(serde_json::json!({"max_tokens": 256})))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.insert_header("x-route", "r1")
+					.set_body_json(serde_json::json!({"model": "premium-model", "effort": "high"})),
+			)
+			.expect(1)
+			.mount(&server)
+			.await;
+		Mock::given(path("/fail"))
+			.respond_with(ResponseTemplate::new(500))
+			.mount(&server)
+			.await;
+		Mock::given(path("/nested"))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(serde_json::json!({"model": "ha", "effort": "low"})),
+			)
+			.mount(&server)
+			.await;
+
+		let model = |name: &str| ModelRoute {
+			discovery: None,
+			id: None,
+			name: name.to_string(),
+			created: 0,
+			visibility: ModelVisibility::Internal,
+			header_matches: vec![],
+			backend: RouteBackendReference {
+				weight: 1,
+				target: RouteBackendTarget::Invalid,
+				inline_policies: vec![],
+			},
+			policies: ModelRoutePolicies {
+				passthrough: None,
+				llm: Arc::default(),
+				authorization: None,
+			},
+			backend_policies: vec![],
+		};
+		let callout = |name: &str, config: Value| VirtualModelRoute {
+			name: name.to_string(),
+			created: 0,
+			llm_policy: Arc::default(),
+			routing: VirtualModelRouting::Callout(Arc::new(
+				serde_json::from_value::<llm::router_callout::VirtualModelCallout>(config)
+					.expect("valid callout")
+					.with_configured_cache_store(),
+			)),
+		};
+		let router = ModelRouter::new(
+			vec![model("economy-model"), model("premium-model")],
+			vec![
+				callout(
+					"auto",
+					serde_json::json!({
+						"host": format!("http://{}/route", server.address()),
+						"headers": {"x-tenant": "'acme'"},
+						"body": "{'max_tokens': llmRequest.max_tokens}",
+						"transformation": {
+							"model": "callout.body.model",
+							"reasoning_effort": "callout.body.effort",
+							"route": "callout.headers['x-route']",
+						},
+						"cache": {"key": ["request.headers['x-session']"], "ttl": "1m"},
+					}),
+				),
+				callout(
+					"fallback",
+					serde_json::json!({
+						"host": format!("http://{}/fail", server.address()),
+						"transformation": {"model": "callout.body.model"},
+						"failureMode": {"fallback": "economy-model"},
+					}),
+				),
+				callout(
+					"closed",
+					serde_json::json!({
+						"host": format!("http://{}/fail", server.address()),
+						"transformation": {"model": "callout.body.model"},
+					}),
+				),
+				callout(
+					"nested",
+					serde_json::json!({
+						"host": format!("http://{}/nested", server.address()),
+						"transformation": {
+							"model": "callout.body.model",
+							"reasoning_effort": "callout.body.effort",
+						},
+					}),
+				),
+				VirtualModelRoute {
+					name: "ha".to_string(),
+					created: 0,
+					llm_policy: Arc::default(),
+					routing: VirtualModelRouting::Failover {
+						backend: RouteBackendReference {
+							weight: 1,
+							target: RouteBackendTarget::Invalid,
+							inline_policies: vec![],
+						},
+						targets: vec![],
+					},
+				},
+			],
+		);
+		let client = crate::test_helpers::policy_client();
+		let resolve = async |model: &str| {
+			let mut req = ::http::Request::builder()
+				.uri("http://example.com/v1/chat/completions")
+				.header("x-session", "s1")
+				.body(http::Body::from(format!(
+					r#"{{"model":"{model}","max_tokens":256}}"#
+				)))
+				.expect("valid request");
+			let result = router
+				.resolve(&mut req, &llm::catalog::ModelCatalog::default(), &client)
+				.await;
+			(result, req)
+		};
+		let body = async |req: Request| -> Value {
+			let body = http::read_body_with_limit(req.into_body(), 1024)
+				.await
+				.expect("request body");
+			serde_json::from_slice(&body).expect("valid JSON request body")
+		};
+
+		// The second request is served from the cache.
+		for _ in 0..2 {
+			let (result, req) = resolve("auto").await;
+			assert!(matches!(result, ResolveResult::Backend(_)));
+			assert_eq!(
+				body(req).await,
+				serde_json::json!({
+					"model": "premium-model",
+					"max_tokens": 256,
+					"reasoning_effort": "high",
+					"route": "r1",
+				})
+			);
+		}
+
+		let (result, req) = resolve("fallback").await;
+		assert!(matches!(result, ResolveResult::Backend(_)));
+		assert_eq!(body(req).await["model"], "economy-model");
+
+		let (result, _) = resolve("closed").await;
+		let ResolveResult::Error(error) = result else {
+			panic!("expected an error");
+		};
+		assert_eq!(error.status(), ::http::StatusCode::SERVICE_UNAVAILABLE);
+
+		// A callout can select a failover virtual model; its fields still apply.
+		let (result, req) = resolve("nested").await;
+		assert!(matches!(result, ResolveResult::Backend(_)));
+		assert_eq!(
+			body(req).await,
+			serde_json::json!({"model": "ha", "max_tokens": 256, "reasoning_effort": "low"})
+		);
+	}
+
+	#[rstest::rstest]
+	#[case("", "")]
+	#[case("/foo", "/foo")]
+	#[case("/foo", "")]
+	fn trace_templates_preserve_prefix_and_operation(
+		#[case] public_prefix: &str,
+		#[case] serving_prefix: &str,
+	) {
+		let router = ModelRouter::new(vec![], vec![]).with_path_prefix(serving_prefix.to_string());
+		for (path, template) in [
+			("/v1/models", "/v1/models"),
+			("/v1/messages", "/v1/messages"),
+			("/other/v1/messages", "/*"),
+			("/custom", "/*"),
+			(
+				"/v1beta/models/missing:generateContent",
+				"/v1beta/models/{model}:generateContent",
+			),
+			("/model/missing/converse", "/model/{model}/converse"),
+			(
+				"/v1alpha/models/gemini:streamGenerateContent",
+				"/v1alpha/models/{model}:streamGenerateContent",
+			),
+			(
+				"/v1/projects/p/locations/global/publishers/google/models/gemini:countTokens",
+				"/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:countTokens",
+			),
+			(
+				"/model/arn:aws:bedrock:us-east-1:123:application-inference-profile%2Ftest/invoke-with-response-stream",
+				"/model/{model}/invoke-with-response-stream",
+			),
+		] {
+			let mut req = ::http::Request::builder()
+				.uri(format!("{serving_prefix}{path}?trace=1"))
+				.body(http::Body::empty())
+				.unwrap();
+			if public_prefix != serving_prefix {
+				req
+					.extensions_mut()
+					.insert(crate::http::filters::OriginalUrl(
+						format!("{public_prefix}{path}?trace=1").parse().unwrap(),
+					));
+			}
+			assert_eq!(
+				router.trace_path(&req).as_deref(),
+				Some(format!("{public_prefix}{template}").as_str())
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn prefix_rewrite_preserves_original_uri_and_rejects_partial_segment() {
+		let router = ModelRouter::new(vec![], vec![]).with_path_prefix("/foo".to_string());
+		let original: ::http::Uri = "/public/foo/v1/models?trace=1".parse().unwrap();
+		let mut req = ::http::Request::builder()
+			.uri("/foo/v1/models?trace=1")
+			.body(http::Body::empty())
+			.unwrap();
+		req
+			.extensions_mut()
+			.insert(crate::http::filters::OriginalUrl(original.clone()));
+		assert_eq!(
+			router.trace_path(&req).as_deref(),
+			Some("/public/foo/v1/models")
+		);
+		let ResolveResult::DirectResponse(response) = router
+			.resolve(
+				&mut req,
+				&llm::catalog::ModelCatalog::default(),
+				&crate::test_helpers::policy_client(),
+			)
+			.await
+		else {
+			panic!("expected discovery")
+		};
+		assert_eq!(response.status(), ::http::StatusCode::OK);
+		assert_eq!(req.uri(), "/v1/models?trace=1");
+		assert_eq!(
+			req
+				.extensions()
+				.get::<crate::http::filters::OriginalUrl>()
+				.unwrap()
+				.0,
+			original
+		);
+		for uri in ["/foobar/v1/models", "/foo", "example.com:443"] {
+			let mut req = ::http::Request::builder()
+				.uri(uri)
+				.body(http::Body::empty())
+				.unwrap();
+			assert!(router.trace_path(&req).is_none());
+			let ResolveResult::Rejected(_, response) = router
+				.resolve(
+					&mut req,
+					&llm::catalog::ModelCatalog::default(),
+					&crate::test_helpers::policy_client(),
+				)
+				.await
+			else {
+				panic!("expected rejection")
+			};
+			assert_eq!(response.status(), ::http::StatusCode::NOT_FOUND);
+		}
+	}
+
+	#[tokio::test]
+	async fn weighted_virtual_model_invalid_target_fails_when_selected() {
+		let router = ModelRouter::new(
+			vec![],
+			vec![VirtualModelRoute {
+				name: "weighted-model".to_string(),
+				created: 0,
+				llm_policy: Arc::default(),
+				routing: VirtualModelRouting::Weighted(vec![WeightedTarget {
+					model: "missing-model".to_string(),
+					weight: 1,
+					invalid: true,
+				}]),
+			}],
+		);
+		let mut req = ::http::Request::builder()
+			.uri("http://example.com/v1/chat/completions")
+			.body(http::Body::from(r#"{"model":"weighted-model"}"#))
+			.expect("valid request");
+
+		let ResolveResult::Rejected(_, resp) = router
+			.resolve(
+				&mut req,
+				&llm::catalog::ModelCatalog::default(),
+				&crate::test_helpers::policy_client(),
+			)
+			.await
+		else {
+			panic!("invalid weighted target should fail");
+		};
+		assert_eq!(resp.status(), ::http::StatusCode::NOT_FOUND);
+		let body = http::read_body_with_limit(resp.into_body(), 1024)
+			.await
+			.expect("error body");
+		let body: Value = serde_json::from_slice(&body).expect("error JSON");
+		assert_eq!(body["error"]["code"], "virtual_model_target_not_found");
+	}
+
+	#[tokio::test]
+	async fn conditional_virtual_model_invalid_match_does_not_fall_through() {
+		let router = ModelRouter::new(
+			vec![],
+			vec![VirtualModelRoute {
+				name: "conditional-model".to_string(),
+				created: 0,
+				llm_policy: Arc::default(),
+				routing: VirtualModelRouting::Conditional(vec![
+					ConditionalTarget {
+						model: "missing-model".to_string(),
+						when: Some(Arc::new(
+							cel::Expression::new_strict("request.headers['x-use-missing'] == 'true'")
+								.expect("valid CEL expression"),
+						)),
+						invalid: true,
+					},
+					ConditionalTarget {
+						model: "fallback-model".to_string(),
+						when: None,
+						invalid: false,
+					},
+				]),
+			}],
+		);
+		let mut req = ::http::Request::builder()
+			.uri("http://example.com/v1/chat/completions")
+			.header("x-use-missing", "true")
+			.body(http::Body::from(r#"{"model":"conditional-model"}"#))
+			.expect("valid request");
+
+		let ResolveResult::Rejected(_, resp) = router
+			.resolve(
+				&mut req,
+				&llm::catalog::ModelCatalog::default(),
+				&crate::test_helpers::policy_client(),
+			)
+			.await
+		else {
+			panic!("invalid conditional target should fail");
+		};
+		assert_eq!(resp.status(), ::http::StatusCode::NOT_FOUND);
+		assert_eq!(original_model(&req), Some("conditional-model"));
+		let body = http::read_body_with_limit(resp.into_body(), 1024)
+			.await
+			.expect("error body");
+		let body: Value = serde_json::from_slice(&body).expect("error JSON");
+		assert_eq!(body["error"]["code"], "virtual_model_target_not_found");
+	}
 
 	#[test]
 	fn concrete_model_authorization_filters_requests() {
@@ -693,6 +1953,7 @@ mod tests {
 			),
 		)));
 		let model = ModelRoute {
+			discovery: None,
 			id: None,
 			name: "gpt-5-mini".to_string(),
 			created: 0,
@@ -704,7 +1965,8 @@ mod tests {
 				inline_policies: vec![],
 			},
 			policies: ModelRoutePolicies {
-				llm: default_route_types(),
+				passthrough: None,
+				llm: Arc::default(),
 				authorization: Some(authorization),
 			},
 			backend_policies: vec![],
@@ -783,6 +2045,117 @@ mod tests {
 	}
 
 	#[test]
+	fn rewrite_path_model_rewrites_vertex_gemini_paths() {
+		assert_eq!(
+			rewrite_path_model(
+				"/v1/projects/p/locations/global/publishers/google/models/virtual:generateContent",
+				"gemini-2.5-flash",
+			)
+			.as_deref(),
+			Some(
+				"/v1/projects/p/locations/global/publishers/google/models/gemini-2.5-flash:generateContent"
+			)
+		);
+		assert_eq!(
+			rewrite_path_model(
+				"/v1/projects/p/locations/global/publishers/google/models/virtual:streamGenerateContent",
+				"gemini-2.5-flash",
+			)
+			.as_deref(),
+			Some(
+				"/v1/projects/p/locations/global/publishers/google/models/gemini-2.5-flash:streamGenerateContent"
+			)
+		);
+		assert_eq!(
+			rewrite_path_model(
+				"/v1/projects/p/locations/global/publishers/google/models/virtual:countTokens",
+				"gemini-2.5-flash",
+			)
+			.as_deref(),
+			Some("/v1/projects/p/locations/global/publishers/google/models/gemini-2.5-flash:countTokens")
+		);
+	}
+
+	#[test]
+	fn rewrite_path_model_rewrites_bare_gemini_api_paths() {
+		assert_eq!(
+			rewrite_path_model("/v1beta/models/virtual:generateContent", "gemini-2.5-pro").as_deref(),
+			Some("/v1beta/models/gemini-2.5-pro:generateContent")
+		);
+		assert_eq!(
+			rewrite_path_model(
+				"/v1beta/models/virtual:streamGenerateContent",
+				"gemini-2.5-pro"
+			)
+			.as_deref(),
+			Some("/v1beta/models/gemini-2.5-pro:streamGenerateContent")
+		);
+		assert_eq!(
+			rewrite_path_model("/v1beta/models/virtual:countTokens", "gemini-2.5-pro").as_deref(),
+			Some("/v1beta/models/gemini-2.5-pro:countTokens")
+		);
+	}
+
+	#[test]
+	fn rewrite_path_model_encodes_slashes_in_gemini_targets() {
+		// Vertex tuned/global endpoints are addressed by resource name, which must stay in a single
+		// path segment.
+		assert_eq!(
+			rewrite_path_model("/v1beta/models/virtual:generateContent", "tunedModels/abc").as_deref(),
+			Some("/v1beta/models/tunedModels%2Fabc:generateContent")
+		);
+		assert_eq!(
+			rewrite_path_model(
+				"/v1/projects/p/locations/global/publishers/google/models/virtual:generateContent",
+				"tunedModels/abc",
+			)
+			.as_deref(),
+			Some(
+				"/v1/projects/p/locations/global/publishers/google/models/tunedModels%2Fabc:generateContent"
+			)
+		);
+	}
+
+	#[test]
+	fn rewrite_path_model_ignores_gemini_shaped_paths_it_cannot_parse() {
+		// No `/models/` segment, and a publisher path missing its publisher: rewriting would
+		// fabricate a path, so both must no-op and leave the client's URI alone.
+		assert_eq!(
+			rewrite_path_model(
+				"/v1beta/tunedModels/virtual:generateContent",
+				"gemini-2.5-flash"
+			),
+			None
+		);
+		assert_eq!(
+			rewrite_path_model(
+				"/v1/projects/p/locations/global/publishers//models/virtual:countTokens",
+				"gemini-2.5-flash",
+			),
+			None
+		);
+		assert_eq!(
+			rewrite_path_model("/v1beta/models/virtual:embedContent", "gemini-2.5-flash"),
+			None
+		);
+	}
+
+	#[test]
+	fn rewrite_uri_model_preserves_alt_sse_on_gemini_streams() {
+		// The streaming route is only SSE because of `?alt=sse`; a virtual-model rewrite that
+		// dropped it would flip the upstream to the JSON-array variant.
+		let mut req = ::http::Request::builder()
+			.uri("http://example.com/v1beta/models/virtual:streamGenerateContent?alt=sse&key=abc")
+			.body(http::Body::empty())
+			.unwrap();
+		rewrite_uri_model(&mut req, "gemini-2.5-flash").expect("URI rewrites");
+		assert_eq!(
+			req.uri().to_string(),
+			"http://example.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=abc"
+		);
+	}
+
+	#[test]
 	fn rewrite_uri_model_preserves_query() {
 		let mut req = ::http::Request::builder()
 			.uri("http://example.com/model/virtual/converse?trace=true")
@@ -796,11 +2169,198 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn rewrite_multipart_body_model_preserves_non_model_bytes() {
+		let body = Bytes::from_static(
+			concat!(
+				"--audio-boundary\r\n",
+				"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
+				"Content-Type: audio/wav\r\n",
+				"\r\n",
+				"audio--audio-boundary-public-model-bytes\r\n",
+				"--audio-boundary\r\n",
+				"Content-Disposition: form-data; name=\"model\"\r\n",
+				"Content-Length: 12\r\n",
+				"\r\n",
+				"public-model\r\n",
+				"--audio-boundary\r\n",
+				"Content-Disposition: form-data; name=\"model\"\r\n",
+				"X-Field-Metadata: preserved\r\n",
+				"\r\n",
+				"stale-duplicate\r\n",
+				"--audio-boundary--\r\n",
+			)
+			.as_bytes(),
+		);
+
+		let rewritten = rewrite_multipart_body_model(&body, "audio-boundary", "upstream-model")
+			.await
+			.expect("multipart body should parse")
+			.expect("model fields should change")
+			.0;
+		let stream = stream::once(std::future::ready(Ok::<Bytes, multer::Error>(rewritten)));
+		let mut multipart = multer::Multipart::new(stream, "audio-boundary");
+		let mut model_fields = 0;
+		while let Some(field) = multipart
+			.next_field()
+			.await
+			.expect("rewritten multipart body should parse")
+		{
+			match field.name() {
+				Some("file") => assert_eq!(
+					field
+						.bytes()
+						.await
+						.expect("file field should read")
+						.as_ref(),
+					b"audio--audio-boundary-public-model-bytes"
+				),
+				Some("model") => {
+					if model_fields == 0 {
+						assert_eq!(
+							field
+								.headers()
+								.get(::http::header::CONTENT_LENGTH)
+								.and_then(|value| value.to_str().ok()),
+							Some("14")
+						);
+					}
+					if model_fields == 1 {
+						assert_eq!(
+							field
+								.headers()
+								.get("x-field-metadata")
+								.and_then(|value| value.to_str().ok()),
+							Some("preserved")
+						);
+					}
+					assert_eq!(
+						field.text().await.expect("model field should read"),
+						"upstream-model"
+					);
+					model_fields += 1;
+				},
+				name => panic!("unexpected multipart field {name:?}"),
+			}
+		}
+		assert_eq!(model_fields, 2);
+	}
+
+	#[tokio::test]
+	async fn rewrite_multipart_body_model_normalizes_model_charset() {
+		let mut body = concat!(
+			"--charset-boundary\r\n",
+			"Content-Disposition: form-data; name=\"model\"\r\n",
+			"Content-Type: text/plain; charset=utf-16le\r\n",
+			"\r\n",
+		)
+		.as_bytes()
+		.to_vec();
+		for code_unit in "public-model".encode_utf16() {
+			body.extend_from_slice(&code_unit.to_le_bytes());
+		}
+		body.extend_from_slice(b"\r\n--charset-boundary--\r\n");
+
+		let rewritten =
+			rewrite_multipart_body_model(&Bytes::from(body), "charset-boundary", "upstream-model")
+				.await
+				.expect("multipart body should parse")
+				.expect("model field should change")
+				.0;
+		let stream = stream::once(std::future::ready(Ok::<Bytes, multer::Error>(rewritten)));
+		let mut multipart = multer::Multipart::new(stream, "charset-boundary");
+		let field = multipart
+			.next_field()
+			.await
+			.expect("rewritten multipart body should parse")
+			.expect("rewritten multipart body should contain a model field");
+		assert_eq!(
+			field.content_type().map(|value| value.as_ref()),
+			Some("text/plain; charset=utf-8")
+		);
+		assert_eq!(
+			field.text().await.expect("model field should read"),
+			"upstream-model"
+		);
+	}
+
+	#[tokio::test]
+	async fn rewrite_multipart_request_model_refreshes_buffered_body() {
+		let body = Bytes::from_static(
+			concat!(
+				"--quoted-boundary\r\n",
+				"Content-Disposition: form-data; name=\"model\"\r\n",
+				"\r\n",
+				"short\r\n",
+				"--quoted-boundary--\r\n",
+			)
+			.as_bytes(),
+		);
+		let mut req = ::http::Request::builder()
+			.uri("http://example.com/v1/audio/transcriptions")
+			.header(
+				::http::header::CONTENT_TYPE,
+				"multipart/form-data; boundary=\"quoted-boundary\"",
+			)
+			.header(::http::header::CONTENT_LENGTH, body.len())
+			.header(::http::header::TRANSFER_ENCODING, "chunked")
+			.body(http::Body::from(body.clone()))
+			.expect("valid request");
+		req.body_mut().record(1024);
+		let recorded = req.body().recorded().unwrap().clone();
+
+		rewrite_multipart_request_model(&mut req, "a-much-longer-model")
+			.await
+			.expect("multipart model rewrite");
+
+		assert!(!req.headers().contains_key(::http::header::CONTENT_LENGTH));
+		assert!(
+			!req
+				.headers()
+				.contains_key(::http::header::TRANSFER_ENCODING)
+		);
+		assert_ne!(req.body().known_bytes(), Some(&body));
+		assert!(recorded.bytes().is_empty());
+		let buffered = req
+			.body()
+			.known_bytes()
+			.expect("rewritten body is buffered")
+			.clone();
+		let rewritten = http::read_body_with_limit(req.into_body(), 1024)
+			.await
+			.expect("rewritten request body");
+		assert_eq!(rewritten, buffered);
+		assert!(
+			rewritten
+				.windows(b"a-much-longer-model".len())
+				.any(|window| window == b"a-much-longer-model")
+		);
+	}
+
+	#[tokio::test]
+	async fn rewrite_multipart_body_model_without_model_is_unchanged() {
+		let body = Bytes::from_static(
+			concat!(
+				"--audio-boundary\r\n",
+				"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
+				"\r\n",
+				"audio-bytes\r\n",
+				"--audio-boundary--\r\n",
+			)
+			.as_bytes(),
+		);
+
+		let rewritten = rewrite_multipart_body_model(&body, "audio-boundary", "upstream-model")
+			.await
+			.expect("multipart body should parse");
+		assert!(rewritten.is_none());
+	}
+
+	#[tokio::test]
 	async fn body_bytes_rejects_json_body_over_buffer_limit() {
 		let request_body = br#"{"model":"real-model","messages":[{"role":"user","content":"this part is over the limit"}]}"#;
 		let mut req = ::http::Request::builder()
 			.uri("http://example.com/v1/chat/completions")
-			.body(http::Body::from(request_body.as_slice()))
+			.body(http::Body::from(request_body.to_vec()))
 			.unwrap();
 		req.extensions_mut().insert(BufferLimit(24));
 
@@ -845,5 +2405,131 @@ mod tests {
 				.expect("decompressed request body"),
 			Bytes::from_static(body)
 		);
+	}
+
+	#[tokio::test]
+	async fn requested_model_reads_gemini_paths_without_touching_the_body() {
+		// The Gemini body carries no `model`, so the router has to take it from the path — and must
+		// leave the body untouched, since it is what reaches the upstream verbatim.
+		let body = br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+		for uri in [
+			"http://example.com/v1beta/models/gemini-2.5-flash:generateContent",
+			"http://example.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+			"http://example.com/v1beta/models/gemini-2.5-flash:countTokens",
+			"http://example.com/v1/projects/p/locations/global/publishers/google/models/gemini-2.5-flash:generateContent",
+		] {
+			let mut req = ::http::Request::builder()
+				.uri(uri)
+				.body(http::Body::from(body.to_vec()))
+				.unwrap();
+
+			let requested = requested_model(&mut req)
+				.await
+				.expect("the model rides the Gemini path");
+			assert_eq!(requested.model, "gemini-2.5-flash", "{uri}");
+			assert!(matches!(requested.location, RequestedModelLocation::Path));
+			assert_eq!(
+				http::read_body_with_limit(req.into_body(), 1024)
+					.await
+					.expect("request body"),
+				Bytes::from_static(body),
+				"{uri}"
+			);
+		}
+	}
+
+	#[test]
+	fn native_routes_recognize_gemini_endpoints() {
+		let classify = |path: &str| classify_route(path).unwrap_or(llm::RouteType::Passthrough);
+		assert_eq!(
+			classify("/v1beta/models/gemini-2.5-flash:generateContent"),
+			llm::RouteType::GenerateContent
+		);
+		assert_eq!(
+			classify("/v1beta/models/gemini-2.5-flash:streamGenerateContent"),
+			llm::RouteType::GenerateContent
+		);
+		assert_eq!(
+			classify("/v1beta/models/gemini-2.5-flash:countTokens"),
+			llm::RouteType::GeminiCountTokens
+		);
+		assert_eq!(
+			classify(
+				"/v1/projects/p/locations/global/publishers/google/models/gemini-2.5-pro:generateContent"
+			),
+			llm::RouteType::GenerateContent
+		);
+	}
+
+	#[test]
+	fn native_routes_send_custom_endpoints_through_detect() {
+		assert_eq!(classify_route("/v1/ocr"), Some(llm::RouteType::Detect));
+	}
+
+	#[test]
+	fn native_routes_recognize_gemini_stream_ignoring_query() {
+		// The dispatcher matches on `uri.path()`, so the `?alt=sse` the Gemini SDKs append to the
+		// streaming endpoint never reaches the endpoint classifier.
+		let uri: ::http::Uri = "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+			.parse()
+			.expect("valid uri");
+		assert_eq!(
+			classify_route(uri.path()).unwrap(),
+			llm::RouteType::GenerateContent
+		);
+	}
+
+	#[test]
+	fn stream_generate_content_does_not_match_generate_content() {
+		// `:generateContent` is not a suffix of `:streamGenerateContent`, so the two entries are
+		// independent even before longest-suffix-first ordering applies. Point them at different
+		// route types so a mis-resolution would be visible.
+		let policy = llm::Policy {
+			routes: [
+				(strng::new(":generateContent"), llm::RouteType::Passthrough),
+				(
+					strng::new(":streamGenerateContent"),
+					llm::RouteType::GenerateContent,
+				),
+			]
+			.into_iter()
+			.collect(),
+			..Default::default()
+		};
+		assert_eq!(
+			policy.resolve_route("/v1beta/models/gemini-2.5-flash:streamGenerateContent"),
+			llm::RouteType::GenerateContent
+		);
+		assert_eq!(
+			policy.resolve_route("/v1beta/models/gemini-2.5-flash:generateContent"),
+			llm::RouteType::Passthrough
+		);
+	}
+
+	#[test]
+	fn native_routes_require_standard_paths() {
+		let classify = |path: &str| classify_route(path).unwrap_or(llm::RouteType::Passthrough);
+		assert_eq!(
+			classify("/v1/projects/p/locations/us/publishers/anthropic/models/m:rawPredict"),
+			llm::RouteType::Messages
+		);
+		assert_eq!(
+			classify("/v1/projects/p/locations/us/publishers/anthropic/models/m:streamRawPredict"),
+			llm::RouteType::Messages
+		);
+		assert_eq!(classify("/v1/messages"), llm::RouteType::Messages);
+		assert_eq!(
+			classify("/v1/chat/completions"),
+			llm::RouteType::Completions
+		);
+		assert_eq!(classify("/v1/anything/else"), llm::RouteType::Passthrough);
+		for path in [
+			"/other/v1/messages",
+			"/other/v1/chat/completions",
+			"/other/v1beta/models/gemini:generateContent",
+			"/custom:generateContent",
+		] {
+			assert_eq!(classify_route(path), None, "{path}");
+		}
 	}
 }

@@ -21,17 +21,17 @@ import (
 
 // Status message constants
 const (
-	GatewayAcceptedMessage           = "Successfully accepted Gateway"
-	GatewayProgrammedMessage         = "Successfully programmed Gateway"
-	ListenerSetAcceptedMessage       = "Successfully accepted ListenerSet"
-	ListenerSetProgrammedMessage     = "Successfully programmed ListenerSet"
-	ListenerAcceptedMessage          = "Successfully accepted Listener"
-	ListenerNoConflictsMessage       = "Successfully verified that Listener has no conflicts"
-	ValidRefsMessage                 = "Successfully resolved all references"
-	ListenerProgrammedMessage        = "Successfully programmed Listener"
-	RouteAcceptedMessage             = "Successfully accepted Route"
-	AgentgatewayModelAcceptedMessage = "Successfully accepted AgentgatewayModel"
-	GatewayClassAcceptedMessage      = "GatewayClass accepted by agentgateway controller"
+	GatewayAcceptedMessage        = "Successfully accepted Gateway"
+	GatewayProgrammedMessage      = "Successfully programmed Gateway"
+	GatewayReasonDeploymentFailed = gwv1.GatewayConditionReason("DeploymentFailed")
+	ListenerSetAcceptedMessage    = "Successfully accepted ListenerSet"
+	ListenerSetProgrammedMessage  = "Successfully programmed ListenerSet"
+	ListenerAcceptedMessage       = "Successfully accepted Listener"
+	ListenerNoConflictsMessage    = "Successfully verified that Listener has no conflicts"
+	ValidRefsMessage              = "Successfully resolved all references"
+	ListenerProgrammedMessage     = "Successfully programmed Listener"
+	RouteAcceptedMessage          = "Successfully accepted Route"
+	GatewayClassAcceptedMessage   = "GatewayClass accepted by agentgateway controller"
 )
 
 // TODO: refactor this struct + methods to better reflect the usage now in proxy_syncer
@@ -103,6 +103,15 @@ func (r *ReportMap) BuildGWStatus(ctx context.Context, gw gwv1.Gateway, attached
 				resolvedRefsMessage = lisCondition.Message
 			}
 		}
+		// Preserve foreign listener conditions verbatim when rebuilding status, including
+		// their observedGeneration and lastTransitionTime (GatewayPreserveForeignConditions).
+		if oldLisStatusIndex != -1 {
+			for _, condition := range gw.Status.Listeners[oldLisStatusIndex].Conditions {
+				if meta.FindStatusCondition(finalConditions, condition.Type) == nil {
+					finalConditions = append(finalConditions, condition)
+				}
+			}
+		}
 		lisReport.Status.Conditions = finalConditions
 
 		finalListeners = append(finalListeners, lisReport.Status)
@@ -111,7 +120,7 @@ func (r *ReportMap) BuildGWStatus(ctx context.Context, gw gwv1.Gateway, attached
 	// If any listeners are invalid, Gateway Accepted depends on whether at least one
 	// listener remains accepted.
 	if len(invalidListeners) > 0 {
-		message := fmt.Sprintf("Some listeners are not accepted: %s", strings.Join(invalidMessages, "; "))
+		message := fmt.Sprintf("Some listeners are not accepted: %s", strings.Join(slices.FilterDuplicates(invalidMessages), "; "))
 		if len(invalidMessages) == 0 {
 			message = fmt.Sprintf("Some listeners are not accepted: %s", strings.Join(invalidListeners, ", "))
 		}
@@ -176,9 +185,14 @@ func (r *ReportMap) BuildGWStatus(ctx context.Context, gw gwv1.Gateway, attached
 		}
 		meta.SetStatusCondition(&finalConditions, gwCondition)
 	}
-	// If there are conditions on the Gateway that are not owned by our reporter, include
-	// them in the final list of conditions to preseve conditions we do not own
+	// Preserve existing conditions that were set externally.
 	for _, condition := range gw.Status.Conditions {
+		if condition.Type == string(gwv1.GatewayConditionInsecureFrontendValidationMode) {
+			// We own this condition and recompute it above. Gateway API requires its
+			// removal when insecure fallback is disabled, so only the current report
+			// may contribute it to finalConditions.
+			continue
+		}
 		if meta.FindStatusCondition(finalConditions, condition.Type) == nil {
 			finalConditions = append(finalConditions, condition)
 		}
@@ -201,6 +215,29 @@ func isGatewayBackendTLSResolvedRefsCondition(reason, message string) bool {
 }
 
 func handleInvalidAddresses(report *GatewayReport, g *gwv1.Gateway) {
+	clusterRoutable := 0
+	for _, addr := range g.Spec.Addresses {
+		switch addr.Routability {
+		case gwv1.GatewayAddressRoutabilityDefault:
+		case gwv1.GatewayAddressRoutabilityCluster:
+			clusterRoutable++
+		default:
+			report.SetCondition(reporter.GatewayCondition{
+				Type:    gwv1.GatewayConditionAccepted,
+				Status:  metav1.ConditionFalse,
+				Reason:  gwv1.GatewayReasonUnsupportedAddress,
+				Message: fmt.Sprintf("Unsupported address routability %q", addr.Routability),
+			})
+		}
+	}
+	if clusterRoutable > 0 && clusterRoutable != len(g.Spec.Addresses) {
+		report.SetCondition(reporter.GatewayCondition{
+			Type:    gwv1.GatewayConditionAccepted,
+			Status:  metav1.ConditionFalse,
+			Reason:  gwv1.GatewayReasonUnsupportedAddress,
+			Message: "Addresses with Cluster routability cannot be mixed with other routabilities",
+		})
+	}
 	for _, addr := range g.Spec.Addresses {
 		if addr.Type == nil {
 			continue
@@ -345,21 +382,14 @@ func (r *ReportMap) BuildRouteStatusWithParentRefDefaulting(
 		newStatus.Parents = append(newStatus.Parents, routeParentStatus)
 	}
 
-	// now we have a status object reflecting the state of translation according to our reportMap
-	// let's add status from other controllers on the current object status
-	var kgwStatus = &newStatus
-	for _, rps := range existingStatus.Parents {
-		if rps.ControllerName != gwv1.GatewayController(controller) {
-			kgwStatus.Parents = append(kgwStatus.Parents, rps)
-		}
-	}
-
-	// sort all parents for consistency with Equals and for Update
-	// match sorting semantics of istio/istio, see:
-	// https://github.com/istio/istio/blob/6dcaa0206bcaf20e3e3b4e45e9376f0f96365571/pilot/pkg/config/kube/gateway/conditions.go#L188-L193
-	slices.SortStableFunc(kgwStatus.Parents, func(a, b gwv1.RouteParentStatus) int {
-		return strings.Compare(ParentString(a.ParentRef), ParentString(b.ParentRef))
-	})
+	// Keep existing entries, ours and other controllers', in their current positions so the desired order
+	// matches what the status syncer writes. Only entries new to the object are sorted and appended.
+	ours := gwv1.GatewayController(controller)
+	newStatus.Parents = MergeOwnedStatuses(existingStatus.Parents, newStatus.Parents,
+		func(p gwv1.RouteParentStatus) bool { return p.ControllerName == ours },
+		func(a, b gwv1.RouteParentStatus) bool { return CompareParentReference(a.ParentRef, b.ParentRef) == 0 },
+		func(a, b gwv1.RouteParentStatus) int { return CompareParentReference(a.ParentRef, b.ParentRef) },
+	)
 	if newStatus.Parents == nil {
 		// Kubernetes will not let us send "nil", so we need an empty
 		newStatus.Parents = []gwv1.RouteParentStatus{}

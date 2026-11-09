@@ -46,6 +46,7 @@ impl DynamicCa {
 		params.is_ca = rcgen::IsCa::NoCa;
 		params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
 		params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+		params.use_authority_key_identifier_extension = true;
 
 		let leaf_key = KeyPair::generate()?;
 		let leaf_cert = params.signed_by(&leaf_key, &self.issuer)?;
@@ -94,9 +95,7 @@ impl DynamicCaCertResolver {
 		];
 
 		let private_key = PrivatePkcs8KeyDer::from(key_der);
-		let signing_key = self
-			.provider
-			.key_provider
+		let signing_key = crate::crypto::tls::key_provider(&self.provider)
 			.load_private_key(private_key.into())
 			.ok()?;
 
@@ -157,7 +156,7 @@ pub(super) fn build_dynamic_ca_server_config(
 	key_exchange_groups: &[tls::KeyExchangeGroup],
 	cache_config: &crate::DynamicCaCertCacheConfig,
 ) -> anyhow::Result<rustls::ServerConfig> {
-	let provider = tls::provider_with_options(cipher_suites, key_exchange_groups);
+	let provider = tls::provider_with_options_validated(cipher_suites, key_exchange_groups)?;
 
 	let versions = super::agent::tls_versions_for_range(min_version, max_version)?;
 	let mut config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
@@ -203,7 +202,50 @@ pub(crate) fn build_dynamic_ca_tls_config_with_profile(
 
 #[cfg(test)]
 mod tests {
+	use rcgen::{BasicConstraints, IsCa, KeyUsagePurpose};
+	use x509_parser::extensions::ParsedExtension;
+	use x509_parser::prelude::{FromDer, X509Certificate};
+
 	use super::*;
+
+	fn ca_params(common_name: &str) -> CertificateParams {
+		let mut params = CertificateParams::default();
+		params
+			.distinguished_name
+			.push(DnType::CommonName, common_name);
+		params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+		params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+		params
+	}
+
+	fn subject_key_identifier(cert_der: &[u8]) -> Vec<u8> {
+		let (_, cert) = X509Certificate::from_der(cert_der).expect("parse certificate");
+		cert
+			.extensions()
+			.iter()
+			.find_map(|extension| match extension.parsed_extension() {
+				ParsedExtension::SubjectKeyIdentifier(key_identifier) => Some(key_identifier.0.to_vec()),
+				_ => None,
+			})
+			.expect("certificate has a subject key identifier")
+	}
+
+	fn authority_key_identifier(cert_der: &[u8]) -> Vec<u8> {
+		let (_, cert) = X509Certificate::from_der(cert_der).expect("parse certificate");
+		cert
+			.extensions()
+			.iter()
+			.find_map(|extension| match extension.parsed_extension() {
+				ParsedExtension::AuthorityKeyIdentifier(authority_key_identifier) => {
+					authority_key_identifier
+						.key_identifier
+						.as_ref()
+						.map(|key_identifier| key_identifier.0.to_vec())
+				},
+				_ => None,
+			})
+			.expect("certificate has an authority key identifier")
+	}
 
 	fn test_resolver() -> DynamicCaCertResolver {
 		let ca_key = rcgen::KeyPair::generate().expect("generate CA key");
@@ -216,7 +258,7 @@ mod tests {
 				DynamicCa::from_pem(ca_cert.pem().as_bytes(), ca_key.serialize_pem().as_bytes())
 					.expect("parse CA"),
 			),
-			provider: tls::provider_with_options(&[], &[]),
+			provider: tls::provider(),
 			cache: Cache::new(crate::DynamicCaCertCacheConfig::default().capacity),
 			cache_ttl: crate::DynamicCaCertCacheConfig::default().ttl,
 		}
@@ -251,5 +293,64 @@ mod tests {
 			.expect("generate replacement cert");
 
 		assert!(!Arc::ptr_eq(&first, &second));
+	}
+
+	#[test]
+	fn leaf_authority_key_identifier_matches_self_signed_ca() {
+		let ca_key = KeyPair::generate().expect("generate CA key");
+		let ca_cert = ca_params("dynamic CA")
+			.self_signed(&ca_key)
+			.expect("generate CA cert");
+		let dynamic_ca =
+			DynamicCa::from_pem(ca_cert.pem().as_bytes(), ca_key.serialize_pem().as_bytes())
+				.expect("parse CA");
+
+		let (leaf_der, _) = dynamic_ca
+			.generate_leaf_cert("example.com")
+			.expect("generate leaf");
+
+		assert_eq!(
+			authority_key_identifier(&leaf_der),
+			subject_key_identifier(ca_cert.der())
+		);
+	}
+
+	#[test]
+	fn intermediate_ca_signs_leaf_and_is_served_in_chain() {
+		let root_key = KeyPair::generate().expect("generate root key");
+		let root_params = ca_params("root CA");
+		let root_cert = root_params
+			.self_signed(&root_key)
+			.expect("generate root cert");
+		let root_issuer = Issuer::new(root_params, root_key);
+
+		let intermediate_key = KeyPair::generate().expect("generate intermediate key");
+		let mut intermediate_params = ca_params("dynamic intermediate CA");
+		intermediate_params.use_authority_key_identifier_extension = true;
+		let intermediate_cert = intermediate_params
+			.signed_by(&intermediate_key, &root_issuer)
+			.expect("generate intermediate cert");
+		let intermediate_der = intermediate_cert.der().to_vec();
+		let dynamic_ca = DynamicCa::from_pem(
+			intermediate_cert.pem().as_bytes(),
+			intermediate_key.serialize_pem().as_bytes(),
+		)
+		.expect("parse intermediate CA");
+		let resolver = DynamicCaCertResolver {
+			ca: Arc::new(dynamic_ca),
+			provider: tls::provider(),
+			cache: Cache::new(crate::DynamicCaCertCacheConfig::default().capacity),
+			cache_ttl: crate::DynamicCaCertCacheConfig::default().ttl,
+		};
+
+		let certified_key = resolver
+			.generate_certified_key("example.com")
+			.expect("generate certified key");
+		assert_eq!(certified_key.cert.len(), 2);
+		assert_eq!(certified_key.cert[1].as_ref(), intermediate_der);
+
+		let leaf_aki = authority_key_identifier(certified_key.cert[0].as_ref());
+		assert_eq!(leaf_aki, subject_key_identifier(&intermediate_der));
+		assert_ne!(leaf_aki, subject_key_identifier(root_cert.der()));
 	}
 }

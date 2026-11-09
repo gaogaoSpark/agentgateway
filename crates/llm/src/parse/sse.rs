@@ -1,19 +1,70 @@
-use axum_core::body::Body;
-use bytes::Bytes;
+use agent_http::{Body, RawBody};
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
+use futures_util::stream::{self, BoxStream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio_sse_codec::{Event, Frame, SseDecoder};
-use tokio_util::codec::BytesCodec;
+use tokio_sse_codec::{Event, Frame, SseDecodeError, SseDecoder};
+use tokio_util::codec::{BytesCodec, Decoder};
 
 use super::passthrough::parser as passthrough_parser;
-use super::transform::parser as transform_parser;
+use super::transform::{TransformEvent, parser as transform_parser};
+
+/// Append an OpenAI `[DONE]` event after a body closes successfully.
+pub fn append_done_on_success(body: Body) -> Body {
+	body.transform_stream(|body| {
+		let done = crate::parse::encode_sse_event("", Bytes::from_static(b"[DONE]"));
+		let stream = stream::unfold(
+			(Some(body.into_data_stream().boxed()), Some(done)),
+			|(stream, done): (
+				Option<BoxStream<'static, Result<Bytes, axum_core::Error>>>,
+				Option<Bytes>,
+			)| async move {
+				let mut stream = stream?;
+				match stream.next().await {
+					Some(Ok(chunk)) => Some((Ok(chunk), (Some(stream), done))),
+					Some(Err(err)) => Some((Err(err), (None, None))),
+					None => done.map(|done| (Ok(done), (None, None))),
+				}
+			},
+		)
+		.fuse();
+		RawBody::from_stream(stream)
+	})
+}
+
+/// Some upstreams end the stream with a `data: [DONE]` lacking the blank line that terminates
+/// it. Dispatch it rather than failing with `UnexpectedEof`; any other unterminated event still fails.
+struct DoneTolerantSseDecoder(SseDecoder<Bytes>);
+
+impl Decoder for DoneTolerantSseDecoder {
+	type Item = Frame<Bytes>;
+	type Error = SseDecodeError;
+
+	fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+		self.0.decode(src)
+	}
+
+	fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+		match self.0.decode_eof(src) {
+			Err(SseDecodeError::UnexpectedEof) => {
+				src.extend_from_slice(b"\n\n");
+				match self.0.decode_eof(src)? {
+					Some(Frame::Event(e)) if e.data.as_ref() == b"[DONE]" => Ok(Some(Frame::Event(e))),
+					_ => Err(SseDecodeError::UnexpectedEof),
+				}
+			},
+			res => res,
+		}
+	}
+}
 
 pub fn json_passthrough<F: DeserializeOwned>(
 	b: Body,
 	buffer_limit: usize,
 	mut f: impl FnMut(Option<anyhow::Result<F>>) + Send + 'static,
 ) -> Body {
-	let decoder = SseDecoder::<Bytes>::with_max_size(buffer_limit);
+	let decoder = DoneTolerantSseDecoder(SseDecoder::with_max_size(buffer_limit));
 
 	passthrough_parser(b, decoder, move |o| {
 		let Some(data) = unwrap_sse_data(o) else {
@@ -33,7 +84,7 @@ pub fn permissive_json_passthrough<F: DeserializeOwned>(
 	buffer_limit: usize,
 	mut f: impl FnMut(Option<anyhow::Result<F>>) + Send + 'static,
 ) -> Body {
-	let decoder = SseDecoder::<Bytes>::with_max_size(buffer_limit);
+	let decoder = DoneTolerantSseDecoder(SseDecoder::with_max_size(buffer_limit));
 
 	crate::parse::passthrough::full_passthrough_parser(b, decoder, move |o| {
 		let Some(data) = unwrap_sse_data(o) else {
@@ -56,8 +107,16 @@ pub fn json_transform<I: DeserializeOwned, O: Serialize>(
 	let decoder = SseDecoder::<Bytes>::with_max_size(buffer_limit);
 	let encoder = BytesCodec::new();
 
-	transform_parser(b, decoder, encoder, move |o| {
-		let data = unwrap_sse_data(o)?;
+	transform_parser(b, decoder, encoder, move |event| {
+		let data = match event {
+			TransformEvent::Item(frame) => unwrap_sse_data(frame)?,
+			TransformEvent::Eof => return None,
+			TransformEvent::Error => {
+				let transformed = f(Err(anyhow::anyhow!("upstream SSE stream failed")))?;
+				let json_bytes = serde_json::to_vec(&transformed).ok()?;
+				return Some(crate::parse::encode_sse_event("", Bytes::from(json_bytes)));
+			},
+		};
 		// Pass through [DONE] events unchanged
 		if data.as_ref() == b"[DONE]" {
 			return Some(crate::parse::encode_sse_event(
@@ -75,6 +134,8 @@ pub fn json_transform<I: DeserializeOwned, O: Serialize>(
 pub enum SseJsonEvent<I> {
 	Data(anyhow::Result<I>),
 	Done,
+	Eof,
+	Error,
 }
 
 pub fn json_transform_multi<I: DeserializeOwned, O: Serialize, It>(
@@ -89,28 +150,23 @@ where
 	let decoder = SseDecoder::<Bytes>::with_max_size(buffer_limit);
 	let encoder = BytesCodec::new();
 
-	transform_parser(b, decoder, encoder, move |o| {
-		let data = unwrap_sse_data(o);
-		if let Some(data) = &data
-			&& data.as_ref() == b"[DONE]"
-		{
-			return f(SseJsonEvent::Done)
-				.into_iter()
-				.filter_map(|(event_name, item)| {
-					let json_bytes = serde_json::to_vec(&item).ok()?;
-					Some(crate::parse::encode_sse_event(
-						event_name,
-						Bytes::from(json_bytes),
-					))
-				})
-				.collect();
-		}
-		let Some(data) = data else {
-			return vec![];
+	transform_parser(b, decoder, encoder, move |event| {
+		let event = match event {
+			TransformEvent::Eof => SseJsonEvent::Eof,
+			TransformEvent::Error => SseJsonEvent::Error,
+			TransformEvent::Item(frame) => {
+				let Some(data) = unwrap_sse_data(frame) else {
+					return Vec::new();
+				};
+				if data.as_ref() == b"[DONE]" {
+					SseJsonEvent::Done
+				} else {
+					let obj = serde_json::from_slice::<I>(&data);
+					SseJsonEvent::Data(obj.map_err(anyhow::Error::from))
+				}
+			},
 		};
-
-		let obj = serde_json::from_slice::<I>(&data);
-		f(SseJsonEvent::Data(obj.map_err(anyhow::Error::from)))
+		f(event)
 			.into_iter()
 			.filter_map(|(event_name, item)| {
 				let json_bytes = serde_json::to_vec(&item).ok()?;

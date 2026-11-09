@@ -2,10 +2,11 @@
 source: crates/llm/src/golden_tests.rs
 description: src/tests/requests/messages/reasoning.json
 info:
-  model: claude-opus-4-6
+  model: gpt-5.6-terra
   max_tokens: 1024
   thinking:
     type: adaptive
+    display: summarized
   output_config:
     effort: high
   output_format: markdown
@@ -19,31 +20,50 @@ info:
             scope: turn
 ---
 {
-  "modelId": "claude-opus-4-6",
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {
-          "text": "Give one concise insight about distributed consensus."
-        },
-        {
-          "cachePoint": {
-            "type": "default"
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "text": "Give one concise insight about distributed consensus."
+          },
+          {
+            "cachePoint": {
+              "type": "default"
+            }
           }
-        }
-      ]
-    }
-  ],
-  "inferenceConfig": {
-    "maxTokens": 1024
-  },
-  "additionalModelRequestFields": {
-    "thinking": {
-      "type": "adaptive"
+        ]
+      }
+    ],
+    "inferenceConfig": {
+      "maxTokens": 1024
     },
-    "output_config": {
-      "effort": "high"
+    "additionalModelRequestFields": {
+      "thinking": {
+        "type": "adaptive",
+        "display": "summarized"
+      },
+      "output_config": {
+        "effort": "high"
+      }
     }
+  },
+  "parsed": {
+    "input_format": "Messages",
+    "cache_convention": "InputIncludesCache",
+    "request_model": "gpt-5.6-terra",
+    "provider": "bedrock",
+    "streaming": false,
+    "params": {
+      "max_tokens": 1024,
+      "reasoning_effort": "high"
+    },
+    "prompt": [
+      {
+        "role": "user",
+        "content": "Give one concise insight about distributed consensus."
+      }
+    ]
   }
 }

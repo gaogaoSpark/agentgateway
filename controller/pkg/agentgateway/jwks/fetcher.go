@@ -4,7 +4,6 @@ import (
 	"container/heap"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
+	"github.com/agentgateway/agentgateway/controller/pkg/utils/ssrf"
 )
 
 const (
@@ -140,9 +140,10 @@ func nextRetryDelay(retryAttempt int) time.Duration {
 
 func makeFetchClient(tlsConfig *tls.Config, proxyURL string, proxyTLSConfig *tls.Config) (*http.Client, error) {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	dialContext := ssrf.SafeDialContext(dialer)
 	transport := &http.Transport{
 		TLSClientConfig:   tlsConfig,
-		DialContext:       dialer.DialContext,
+		DialContext:       dialContext,
 		DisableKeepAlives: true,
 	}
 	if proxyURL != "" {
@@ -157,7 +158,7 @@ func makeFetchClient(tlsConfig *tls.Config, proxyURL string, proxyTLSConfig *tls
 			httpProxy := *parsed
 			httpProxy.Scheme = "http"
 			transport.Proxy = http.ProxyURL(&httpProxy)
-			transport.DialContext = proxyTLSDialContext(dialer, proxyTLSConfig)
+			transport.DialContext = proxyTLSDialContext(dialContext, proxyTLSConfig)
 		} else {
 			transport.Proxy = http.ProxyURL(parsed)
 		}
@@ -171,9 +172,12 @@ func makeFetchClient(tlsConfig *tls.Config, proxyURL string, proxyTLSConfig *tls
 // proxyTLSDialContext returns a DialContext function that wraps TCP connections
 // in TLS using the given proxy TLS configuration. This is used when the tunnel
 // proxy backend has a TLS policy, so the CONNECT request is sent over TLS.
-func proxyTLSDialContext(dialer *net.Dialer, proxyTLSConfig *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
+func proxyTLSDialContext(
+	dialContext func(context.Context, string, string) (net.Conn, error),
+	proxyTLSConfig *tls.Config,
+) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		conn, err := dialer.DialContext(ctx, network, addr)
+		conn, err := dialContext(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
@@ -550,8 +554,13 @@ func (c *jwksHttpClientImpl) FetchJwks(ctx context.Context, target remotehttp.Fe
 		return jose.JSONWebKeySet{}, fmt.Errorf("unexpected status code from jwks endpoint at %s: %d", target.URL, response.StatusCode)
 	}
 
-	var jwks jose.JSONWebKeySet
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&jwks); err != nil {
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return jose.JSONWebKeySet{}, fmt.Errorf("could not read jwks: %w", err)
+	}
+
+	jwks, err := ParseKeySet(body)
+	if err != nil {
 		return jose.JSONWebKeySet{}, fmt.Errorf("could not decode jwks: %w", err)
 	}
 

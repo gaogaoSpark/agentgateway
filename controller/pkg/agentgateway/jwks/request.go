@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/ptr"
 
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
@@ -16,7 +17,8 @@ var (
 func ResolveEndpoint(
 	krtctx krt.HandlerContext,
 	resolver remotehttp.Resolver,
-	policyName, defaultNS string,
+	parentKind OwnerKind,
+	parentName, defaultNS string,
 	remoteProvider agentgateway.RemoteJWKS,
 ) (*remotehttp.ResolvedTarget, error) {
 	if resolver == nil {
@@ -24,9 +26,11 @@ func ResolveEndpoint(
 	}
 
 	return resolver.Resolve(krtctx, remotehttp.ResolveInput{
-		ParentName:       policyName,
+		ParentKind:       string(parentKind),
+		ParentName:       parentName,
 		DefaultNamespace: defaultNS,
 		BackendRef:       remoteProvider.BackendRef,
-		Path:             remoteProvider.JwksPath,
+		URL:              remoteProvider.URL,
+		Path:             ptr.OrDefault(remoteProvider.JwksPath, ""),
 	})
 }

@@ -83,17 +83,56 @@ const (
 )
 
 // Action to take if a regex pattern is matched in a request or response.
-// This setting applies only to request matches. `PromptguardResponse`
-// matches are always masked by default.
+// The action applies to request and response matches alike. Note that
+// `Mask` is not applied to streamed responses: matched content in a
+// streamed response is passed through unmodified.
 // +k8s:enum
 type Action string
 
 const (
-	// Mask the matched data in the request.
+	// Mask the matched data in the request or response.
 	MASK Action = "Mask"
 
-	// Reject the request if the regex matches content in the request.
+	// Reject the request or response that contains the matched content.
 	REJECT Action = "Reject"
+
+	// Audit runs the guard but never blocks or masks: the would-be action is
+	// recorded (metrics + structured log) and the content passes through.
+	AUDIT Action = "Audit"
+)
+
+// Action for guards that cannot mask (only reject or observe). `Reject` (the
+// default) enforces the guard's native verdict; `Audit` invokes the guard and
+// records what it would have done without enforcing.
+// +k8s:enum
+type RejectAuditAction string
+
+const (
+	// RejectAuditReject enforces the guard's verdict (the default).
+	RejectAuditReject RejectAuditAction = "Reject"
+
+	// RejectAuditAudit records the would-be action without blocking or masking.
+	RejectAuditAudit RejectAuditAction = "Audit"
+)
+
+// Which category of request or response content a prompt guard inspects.
+// Encrypted payloads are excluded. Signed response payloads are scanned but
+// a mask that would change them rejects the response instead.
+// +k8s:enum
+type ContentScope string
+
+const (
+	// The system/developer prompt.
+	ContentScopeSystemPrompt ContentScope = "SystemPrompt"
+
+	// Regular user/assistant message text, including plaintext reasoning.
+	ContentScopeMessages ContentScope = "Messages"
+
+	// Tool call results, including results from serverside tools.
+	ContentScopeToolOutput ContentScope = "ToolOutput"
+
+	// Tool call arguments, usually produced by the model.
+	ContentScopeToolInput ContentScope = "ToolInput"
 )
 
 // Streaming prompt guard mode.
@@ -102,6 +141,8 @@ type PromptGuardStreamingMode string
 
 const (
 	// Enable prompt guards for streaming responses and realtime websocket messages.
+	// A guard can reject a streamed response, but `Mask` actions are not applied to
+	// streamed content.
 	PromptGuardStreamingModeEnabled PromptGuardStreamingMode = "Enabled"
 )
 
@@ -118,10 +159,10 @@ type Regex struct {
 	Builtins []BuiltIn `json:"builtins,omitempty"`
 
 	// The action to take if a regex pattern is matched in a request or response.
-	// This setting applies only to request matches. `PromptguardResponse`
-	// matches are always masked by default.
+	// The action applies to request and response matches alike. Note that
+	// `Mask` is not applied to streamed responses: matched content in a
+	// streamed response is passed through unmodified.
 	// Defaults to `Mask`.
-	// +kubebuilder:default=Mask
 	// +optional
 	Action *Action `json:"action,omitempty"`
 }
@@ -151,37 +192,59 @@ type Webhook struct {
 	// `FailClosed` (default) rejects the request.
 	// +optional
 	FailureMode FailureMode `json:"failureMode,omitempty"`
+
+	// Action controls whether the webhook's verdict is enforced or only observed.
+	// `Reject` (the default) enforces it; `Audit` records the would-be action
+	// without blocking or masking.
+	// +optional
+	Action *RejectAuditAction `json:"action,omitempty"`
 }
 
 // Response to return to the client if request content
 // is matched against a regex pattern and the action is `REJECT`.
-// +kubebuilder:validation:AtLeastOneFieldSet
 type CustomResponse struct {
 	// Custom response message to return to the client. If not specified, defaults to
 	// `The request was rejected due to inappropriate content`.
-	// +kubebuilder:default="The request was rejected due to inappropriate content"
 	// +optional
-	Message string `json:"message,omitempty"`
+	Message *string `json:"message,omitempty"`
 
 	// Status code to return to the client. Defaults to 403.
-	// +kubebuilder:default=403
 	// +kubebuilder:validation:Minimum=200
 	// +kubebuilder:validation:Maximum=599
 	// +optional
 	StatusCode int32 `json:"statusCode,omitempty"`
+
+	// Headers to include in the rejection response.
+	// +optional
+	Headers []gwv1.HTTPHeader `json:"headers,omitempty"`
 }
 
 type OpenAIModeration struct {
+	// Behavior when the provider is unavailable or returns an error.
+	// `FailOpen` allows the request to continue; `FailClosed` (default) rejects it.
+	// +optional
+	FailureMode FailureMode `json:"failureMode,omitempty"`
+
 	// Moderation model to use. For example,
 	// `omni-moderation`.
 	// +optional
 	Model *string `json:"model,omitempty"`
+	// Action controls whether flagged content is rejected or only observed.
+	// `Reject` (the default) rejects flagged content; `Audit` records the
+	// would-be rejection without blocking.
+	// +optional
+	Action *RejectAuditAction `json:"action,omitempty"`
 	// Policies for communicating with OpenAI.
 	// +optional
 	Policies *OpenAIModerationPolicy `json:"policies,omitempty"`
 }
 
 type BedrockGuardrails struct {
+	// Behavior when the provider is unavailable or returns an error.
+	// `FailOpen` allows the request to continue; `FailClosed` (default) rejects it.
+	// +optional
+	FailureMode FailureMode `json:"failureMode,omitempty"`
+
 	// Identifier of the Guardrail policy to use for the backend.
 	// +required
 	GuardrailIdentifier ShortString `json:"identifier"`
@@ -195,12 +258,26 @@ type BedrockGuardrails struct {
 	// +required
 	Region ShortString `json:"region"`
 
+	// Action controls whether the guardrail's verdict is enforced or only
+	// observed. `Reject` (the default) enforces the guardrail: a blocked
+	// assessment rejects the request/response and an anonymized assessment masks
+	// the matched content. `Audit` runs the guardrail in observe mode: it is
+	// invoked and its assessment recorded (metrics + structured log), but the
+	// request/response is never blocked or masked.
+	// +optional
+	Action *RejectAuditAction `json:"action,omitempty"`
+
 	// Policies for communicating with AWS Bedrock Guardrails.
 	// +optional
 	Policies *BedrockGuardrailsPolicy `json:"policies,omitempty"`
 }
 
 type GoogleModelArmor struct {
+	// Behavior when the provider is unavailable or returns an error.
+	// `FailOpen` allows the request to continue; `FailClosed` (default) rejects it.
+	// +optional
+	FailureMode FailureMode `json:"failureMode,omitempty"`
+
 	// Template ID for Google Model Armor.
 	// +required
 	TemplateID ShortString `json:"templateId"`
@@ -211,9 +288,14 @@ type GoogleModelArmor struct {
 
 	// Google Cloud location, for example `us-central1`.
 	// Defaults to `us-central1` if not specified.
-	// +kubebuilder:default="us-central1"
 	// +optional
 	Location *ShortString `json:"location,omitempty"`
+
+	// Action controls whether flagged content is rejected or only observed.
+	// `Reject` (the default) rejects flagged content; `Audit` records the
+	// would-be rejection without blocking.
+	// +optional
+	Action *RejectAuditAction `json:"action,omitempty"`
 
 	// Policies for communicating with Google Model Armor.
 	// +optional
@@ -222,11 +304,25 @@ type GoogleModelArmor struct {
 
 // Prompt guards to apply to requests sent by the client.
 // +kubebuilder:validation:ExactlyOneOf=regex;webhook;openAIModeration;bedrockGuardrails;googleModelArmor
+// +kubebuilder:validation:XValidation:rule="!has(self.scope) || !has(self.webhook) || (self.scope.size() == 2 && 'SystemPrompt' in self.scope && 'Messages' in self.scope)",message="scope: webhook guards do not support scope; they always inspect SystemPrompt + Messages"
 type PromptguardRequest struct {
 	// Custom response message to return to the client. If not specified, defaults to
 	// `The request was rejected due to inappropriate content`.
 	// +optional
 	CustomResponse *CustomResponse `json:"response,omitempty"`
+
+	// Which parts of the request this guard inspects. When unset, defaults to
+	// `SystemPrompt`, `Messages`, and `ToolOutput`. Tool call inputs are not
+	// inspected unless `ToolInput` is listed explicitly. Webhook guards do not
+	// support scope and always inspect `SystemPrompt` and `Messages`.
+	// In APIs that send tool arguments as opaque JSON, such as Completions, the
+	// arguments are masked as a single string, meaning a prompt guard has the
+	// potential to rewrite the arguments into invalid JSON.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=4
+	// +listType=set
+	// +optional
+	Scope []ContentScope `json:"scope,omitempty"`
 
 	// Regular expression (regex) matching for prompt guards and data masking.
 	// +optional
@@ -254,11 +350,25 @@ type PromptguardRequest struct {
 
 // Prompt guards to apply to responses returned by the LLM provider.
 // +kubebuilder:validation:ExactlyOneOf=regex;webhook;bedrockGuardrails;googleModelArmor
+// +kubebuilder:validation:XValidation:rule="!has(self.scope) || !has(self.webhook) || (self.scope.size() == 1 && 'Messages' in self.scope)",message="scope: webhook guards do not support a non-default scope; they always inspect the default (Messages)"
 type PromptguardResponse struct {
 	// Custom response message to return to the client. If not specified, defaults to
 	// `The response was rejected due to inappropriate content`.
 	// +optional
 	CustomResponse *CustomResponse `json:"response,omitempty"`
+
+	// Which parts of the response this guard inspects. When unset, defaults to
+	// `Messages`. Tool calls generated by the model are not inspected unless
+	// `ToolInput` is listed explicitly; `ToolOutput` covers results of
+	// serverside tools.
+	// In APIs that send tool arguments as opaque JSON, such as Completions, the
+	// arguments are masked as a single string, meaning a prompt guard has the
+	// potential to rewrite the arguments into invalid JSON.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=4
+	// +listType=set
+	// +optional
+	Scope []ContentScope `json:"scope,omitempty"`
 
 	// Regular expression (regex) matching for prompt guards and data masking.
 	// +optional
@@ -301,6 +411,7 @@ type PromptguardResponse struct {
 //		    action: MASK
 //
 // +kubebuilder:validation:AtLeastOneFieldSet:fields=request;response
+// +kubebuilder:validation:XValidation:rule="!has(self.streaming) || self.streaming != 'Enabled' || !has(self.response) || self.response.all(g, !has(g.scope) || g.scope.all(s, s == 'Messages'))",message="streaming response guards only support the Messages scope"
 type AIPromptGuard struct {
 	// Apply prompt guards to streaming responses and realtime websocket messages.
 	// Defaults to disabled to preserve streaming throughput unless explicitly enabled.
@@ -393,31 +504,29 @@ type FieldTransformation struct {
 // - Without caching: 10,000 tokens × $3/MTok = $0.03
 // - With caching (90% cached): 1,000 × $3/MTok + 9,000 × $0.30/MTok = $0.0057 (81% savings)
 type PromptCachingConfig struct {
-	// Enables caching for system prompts.
+	// Enables caching for system prompts. Defaults to true.
 	// Inserts a cache point after all system messages.
 	// +optional
-	// +kubebuilder:default=true
-	CacheSystem bool `json:"cacheSystem,omitempty"`
+	CacheSystem *bool `json:"cacheSystem,omitempty"`
 
-	// Enables caching for conversation messages.
+	// Enables caching for conversation messages. Defaults to true.
 	// Caches all messages in the conversation for cost savings.
 	// +optional
-	// +kubebuilder:default=true
-	CacheMessages bool `json:"cacheMessages,omitempty"`
+	CacheMessages *bool `json:"cacheMessages,omitempty"`
 
-	// Enables caching for tool definitions.
+	// Enables caching for tool definitions. Defaults to false.
 	// Inserts a cache point after all tool specifications.
+	// Ignored for Bedrock Nova models, which do not support caching tools.
 	// +optional
-	// +kubebuilder:default=false
 	CacheTools bool `json:"cacheTools,omitempty"`
 
 	// Minimum estimated token count
 	// before caching is enabled. Uses rough heuristic (word count × 1.3) to estimate tokens.
-	// Bedrock requires at least 1,024 tokens for caching to be effective.
+	// Applies to system prompt caching. Defaults to 1024; most models require at least
+	// 1,024 tokens for caching to be effective.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default=1024
-	MinTokens int `json:"minTokens,omitempty"`
+	MinTokens *int `json:"minTokens,omitempty"`
 
 	// Shifts the message cache point further back in the
 	// conversation. 0 (default) places it at the second-to-last message.
@@ -425,6 +534,5 @@ type PromptCachingConfig struct {
 	// to bounds.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default=0
 	CacheMessageOffset int `json:"cacheMessageOffset,omitempty"`
 }

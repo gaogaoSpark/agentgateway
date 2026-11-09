@@ -3,7 +3,7 @@ use async_compression::tokio::bufread::{
 	ZstdEncoder,
 };
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use headers::{ContentEncoding, Header};
 use http_body::Body;
 use http_body_util::BodyExt;
@@ -14,6 +14,12 @@ const GZIP: &str = "gzip";
 const DEFLATE: &str = "deflate";
 const BR: &str = "br";
 const ZSTD: &str = "zstd";
+
+mod policy;
+pub use policy::{
+	Compression, CompressionAlgorithm, CompressionRequest, CompressionResponse, RequestDecompression,
+	ResponseCompression, ResponseCompressor,
+};
 
 /// Errors that can occur during compression/decompression operations.
 #[derive(Debug, thiserror::Error)]
@@ -113,21 +119,19 @@ fn detect_encoding(ce: &ContentEncoding) -> EncodingDecision {
 /// Use this for streaming responses (SSE, large files) where you can't buffer the entire body.
 /// If encoding is None or identity, returns the body unchanged.
 /// If encoding is unsupported or multi-encoded, returns an error.
-pub fn decompress_body<B>(
-	body: B,
+pub fn decompress_body(
+	mut body: crate::http::Body,
 	encoding: Option<&ContentEncoding>,
-) -> Result<(axum_core::body::Body, Option<&'static str>), Error>
-where
-	B: Body<Data = Bytes> + Send + Unpin + 'static,
-	B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
+) -> Result<(crate::http::Body, Option<&'static str>), Error> {
 	match encoding {
-		None => Ok((axum_core::body::Body::new(body), None)),
+		None => Ok((body, None)),
 		Some(ce) => match detect_encoding(ce) {
 			EncodingDecision::Single(enc) => {
-				decompress_body_with_encoding(body, enc).map(|b| (b, Some(enc)))
+				let decoded = decompress_body_with_encoding(body.take_content(), enc)?;
+				body.replace_content(decoded.into());
+				Ok((body, Some(enc)))
 			},
-			EncodingDecision::None => Ok((axum_core::body::Body::new(body), None)),
+			EncodingDecision::None => Ok((body, None)),
 			EncodingDecision::Multiple | EncodingDecision::Unsupported => Err(Error::UnsupportedEncoding),
 		},
 	}
@@ -155,39 +159,104 @@ where
 	)))
 }
 
+/// Buffer and decompress within the attached body deadline, limiting decoded bytes.
+/// Adds no timeout when no deadline is attached.
 pub async fn to_bytes_with_decompression(
-	body: axum_core::body::Body,
+	body: crate::http::Body,
 	encoding: Option<&ContentEncoding>,
 	limit: usize,
 ) -> Result<(Option<&'static str>, Bytes), Error> {
 	match encoding {
 		None => {
 			// No encoding - use optimized direct body read
-			Ok((None, read_body_with_limit(body, limit).await?))
+			Ok((None, body.into_bytes(limit).await.map_err(map_body_error)?))
 		},
 		Some(ce) => match detect_encoding(ce) {
-			EncodingDecision::Single(enc) => Ok((Some(enc), decode_body(body, enc, limit).await?)),
-			EncodingDecision::None => Ok((None, read_body_with_limit(body, limit).await?)),
+			EncodingDecision::Single(enc) => {
+				let deadline = body.deadline();
+				let read = decode_body(body.into_boxed(), enc, limit);
+				let bytes = match deadline {
+					Some(deadline) => tokio::time::timeout_at(deadline, read)
+						.await
+						.map_err(axum_core::Error::new)??,
+					None => read.await?,
+				};
+				Ok((Some(enc), bytes))
+			},
+			EncodingDecision::None => Ok((None, body.into_bytes(limit).await.map_err(map_body_error)?)),
 			EncodingDecision::Multiple | EncodingDecision::Unsupported => Err(Error::UnsupportedEncoding),
 		},
 	}
 }
 
-pub async fn encode_body(body: &[u8], encoding: &str) -> Result<Bytes, axum_core::Error> {
-	let reader = BufReader::new(body);
-
-	let encoder: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match encoding {
+fn encoder<'a, R: tokio::io::AsyncBufRead + Unpin + Send + 'a>(
+	reader: R,
+	encoding: &str,
+) -> Result<Box<dyn AsyncRead + Unpin + Send + 'a>, Error> {
+	Ok(match encoding {
 		GZIP => Box::new(GzipEncoder::new(reader)),
 		DEFLATE => Box::new(ZlibEncoder::new(reader)),
-		BR => Box::new(BrotliEncoder::new(reader)),
+		// The brotli default (11) is far too slow for on-the-fly compression; 4 matches nginx.
+		BR => Box::new(BrotliEncoder::with_quality(
+			reader,
+			async_compression::Level::Precise(4),
+		)),
 		ZSTD => Box::new(ZstdEncoder::new(reader)),
-		_ => return Err(Error::UnsupportedEncoding.into()),
-	};
+		_ => return Err(Error::UnsupportedEncoding),
+	})
+}
+
+pub async fn encode_body(body: &[u8], encoding: &str) -> Result<Bytes, axum_core::Error> {
+	let encoder = encoder(BufReader::new(body), encoding)?;
 
 	// Preallocate assuming ~50% compression (it can grow if we are wrong)
 	read_to_bytes(encoder, body.len() / 2)
 		.await
 		.map_err(Into::into)
+}
+
+/// Compress a body as it is sent instead of buffering it again. Trailers are passed through
+/// after the encoded data.
+///
+/// Buffered LLM responses use this at the final response boundary: policies need plaintext while
+/// evaluating and replacing `response.body`, but the selected upstream encoding must be restored
+/// after those policies have finished.
+pub fn encode_body_stream(
+	body: axum_core::body::Body,
+	encoding: &str,
+) -> Result<axum_core::body::Body, Error> {
+	let trailers = std::sync::Arc::new(std::sync::Mutex::new(None));
+	let captured = trailers.clone();
+	let byte_stream =
+		TryStreamExt::map_err(http_body_util::BodyStream::new(body), std::io::Error::other)
+			.try_filter_map(move |frame| {
+				let data = match frame.into_data() {
+					Ok(data) => Some(data),
+					Err(frame) => {
+						if let Ok(t) = frame.into_trailers() {
+							*captured.lock().expect("trailers lock") = Some(t);
+						}
+						None
+					},
+				};
+				std::future::ready(Ok(data))
+			});
+	let encoder = encoder(BufReader::new(StreamReader::new(byte_stream)), encoding)?;
+	let frames = ReaderStream::new(encoder)
+		.map_ok(http_body::Frame::data)
+		.chain(
+			futures_util::stream::once(async move {
+				trailers
+					.lock()
+					.expect("trailers lock")
+					.take()
+					.map(|t| Ok(http_body::Frame::trailers(t)))
+			})
+			.filter_map(std::future::ready),
+		);
+	Ok(axum_core::body::Body::new(http_body_util::StreamBody::new(
+		frames,
+	)))
 }
 
 async fn decode_body<B>(body: B, encoding: &str, limit: usize) -> Result<Bytes, Error>
@@ -215,7 +284,7 @@ where
 }
 
 async fn read_body_with_limit(body: axum_core::body::Body, limit: usize) -> Result<Bytes, Error> {
-	crate::http::read_body_with_limit(body, limit)
+	axum::body::to_bytes(body, limit)
 		.await
 		.map_err(map_body_error)
 }
@@ -229,11 +298,7 @@ fn map_body_error(err: axum_core::Error) -> Error {
 }
 
 fn is_length_limit_error(err: &axum_core::Error) -> bool {
-	use std::error::Error as _;
-
-	err
-		.source()
-		.is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+	agent_http::is_length_limit_error(err)
 }
 
 #[cfg(test)]
@@ -381,5 +446,29 @@ mod tests {
 		let ce = make_content_encoding(GZIP);
 		let result = to_bytes_with_decompression(body, Some(&ce), 10).await;
 		assert!(matches!(result, Err(Error::LimitExceeded)));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn test_buffered_decompression_deadline() {
+		use std::convert::Infallible;
+		use std::time::Duration;
+
+		use futures_util::StreamExt;
+		use tokio::time::{Instant, advance};
+
+		let compressed = encode_body(b"hello", GZIP).await.unwrap();
+		let stream = futures_util::stream::once(async move {
+			Ok::<_, Infallible>(compressed.slice(..compressed.len() - 1))
+		})
+		.chain(futures_util::stream::pending());
+		let mut body = Body::from_stream(stream);
+		let start = Instant::now();
+		body.set_deadline(start + Duration::from_secs(5));
+		advance(Duration::from_secs(3)).await;
+
+		let ce = make_content_encoding(GZIP);
+		let result = to_bytes_with_decompression(body, Some(&ce), 1024).await;
+		assert!(matches!(result, Err(Error::Body(_))));
+		assert_eq!(Instant::now() - start, Duration::from_secs(5));
 	}
 }

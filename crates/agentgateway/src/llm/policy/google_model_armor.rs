@@ -5,14 +5,12 @@
 //! via the backend policies.
 
 use agent_core::strng;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::http::auth::{BackendAuthKind, GcpAuth};
 use crate::http::jwt::Claims;
 use crate::json;
-use crate::llm::RequestType;
 use crate::llm::policy::{GoogleModelArmor, with_default_timeout};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::metrics::{OutboundCallKind, OutboundCallSubtype};
@@ -170,76 +168,88 @@ pub struct SanitizeResponse {
 impl SanitizeResponse {
 	/// Returns true if any filter found a match indicating content should be blocked
 	pub fn is_blocked(&self) -> bool {
+		!self.matched_filters().is_empty()
+	}
+
+	/// Names (API field names) of the filters that found a match.
+	pub fn matched_filters(&self) -> Vec<&'static str> {
 		let Some(result) = &self.sanitization_result else {
-			return false;
+			return Vec::new();
 		};
-
+		let mut matched = Vec::new();
 		for entry in result.filter_results.entries() {
-			if let Some(rai) = &entry.rai_filter_result
-				&& rai.match_state == Some(MatchState::MatchFound)
-			{
-				return true;
-			}
-
-			if let Some(pi) = &entry.pi_and_jailbreak_filter_result
-				&& pi.match_state == Some(MatchState::MatchFound)
-			{
-				return true;
-			}
-
-			if let Some(uri) = &entry.malicious_uri_filter_result
-				&& uri.match_state == Some(MatchState::MatchFound)
-			{
-				return true;
-			}
-
-			if let Some(csam) = &entry.csam_filter_result
-				&& csam.match_state == Some(MatchState::MatchFound)
-			{
-				return true;
-			}
-
-			if let Some(virus) = &entry.virus_scan_filter_result
-				&& virus.match_state == Some(MatchState::MatchFound)
-			{
-				return true;
-			}
-
-			// Check SDP filter (both inspect and deidentify results)
+			let mut found = |state: Option<&MatchState>, name: &'static str| {
+				if state == Some(&MatchState::MatchFound) && !matched.contains(&name) {
+					matched.push(name);
+				}
+			};
+			found(
+				entry
+					.rai_filter_result
+					.as_ref()
+					.and_then(|f| f.match_state.as_ref()),
+				"raiFilterResult",
+			);
+			found(
+				entry
+					.pi_and_jailbreak_filter_result
+					.as_ref()
+					.and_then(|f| f.match_state.as_ref()),
+				"piAndJailbreakFilterResult",
+			);
+			found(
+				entry
+					.malicious_uri_filter_result
+					.as_ref()
+					.and_then(|f| f.match_state.as_ref()),
+				"maliciousUriFilterResult",
+			);
+			found(
+				entry
+					.csam_filter_result
+					.as_ref()
+					.and_then(|f| f.match_state.as_ref()),
+				"csamFilterResult",
+			);
+			found(
+				entry
+					.virus_scan_filter_result
+					.as_ref()
+					.and_then(|f| f.match_state.as_ref()),
+				"virusScanFilterResult",
+			);
 			if let Some(sdp) = &entry.sdp_filter_result {
-				if let Some(inspect) = &sdp.inspect_result
-					&& inspect.match_state == Some(MatchState::MatchFound)
-				{
-					return true;
-				}
-				if let Some(deidentify) = &sdp.deidentify_result
-					&& deidentify.match_state == Some(MatchState::MatchFound)
-				{
-					return true;
-				}
+				found(
+					sdp
+						.inspect_result
+						.as_ref()
+						.and_then(|f| f.match_state.as_ref()),
+					"sdpFilterResult",
+				);
+				found(
+					sdp
+						.deidentify_result
+						.as_ref()
+						.and_then(|f| f.match_state.as_ref()),
+					"sdpFilterResult",
+				);
 			}
 		}
-
-		false
+		matched
 	}
 }
 
 /// Use Model Armor sanitizeUserPrompt API for request content
 pub async fn send_request(
-	req: &mut dyn RequestType,
+	content: Vec<String>,
 	claims: Option<Claims>,
 	client: &PolicyClient,
 	model_armor: &GoogleModelArmor,
 ) -> anyhow::Result<SanitizeResponse> {
-	let content = req
-		.get_messages()
-		.into_iter()
-		.map(|m| m.content.to_string())
-		.collect_vec()
-		.join("\n");
-
 	let request_body = SanitizeUserPromptRequest {
-		user_prompt_data: UserPromptData { text: content },
+		user_prompt_data: UserPromptData {
+			text: content.join("\n"),
+		},
 	};
 
 	let response = send_model_armor_request(
@@ -371,7 +381,7 @@ async fn send_model_armor_request<T: Serialize>(
 
 	let mock_be = Backend::Dynamic(
 		ResourceName::new(strng::literal!("_google-model-armor"), strng::literal!("")),
-		(),
+		None,
 	);
 
 	let resp = client
@@ -379,6 +389,9 @@ async fn send_model_armor_request<T: Serialize>(
 		.call_with_explicit_policies_list(with_default_timeout(req), mock_be, pols)
 		.await?;
 
+	if !resp.status().is_success() {
+		anyhow::bail!("Model Armor API error: status={}", resp.status());
+	}
 	let resp: SanitizeResponse = json::from_response_body(resp).await?;
 	Ok(resp)
 }

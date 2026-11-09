@@ -100,9 +100,8 @@ func (r *gatewayClassReconciler) Start(ctx context.Context) error {
 }
 
 func (r *gatewayClassReconciler) reconcile(req types.NamespacedName) (rErr error) {
-	finishMetrics := collectReconciliationMetrics("gatewayclass", req)
 	defer func() {
-		finishMetrics(rErr)
+		recordReconciliation("gatewayclass", rErr)
 	}()
 
 	if req == emptyGatewayClass {
@@ -135,7 +134,7 @@ func (r *gatewayClassReconciler) reconcile(req types.NamespacedName) (rErr error
 		status.SupportedFeatures = i.SupportedFeatures
 	}
 
-	_, err := r.gwClassClient.UpdateStatus(&gwv1.GatewayClass{
+	err := r.gwClassClient.UpdateStatusNoResponse(&gwv1.GatewayClass{
 		ObjectMeta: CloneObjectMetaForStatus(gwClass.ObjectMeta),
 		Status:     status,
 	})
@@ -175,15 +174,11 @@ func (r *gatewayClassReconciler) reconcileGatewayClass(name string, info *deploy
 
 func (r *gatewayClassReconciler) buildDesiredGatewayClass(name string, info *deployer.GatewayClassInfo) *gwv1.GatewayClass {
 	gwc := &gwv1.GatewayClass{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: wellknown.GatewayClassGVK.GroupVersion().String(),
-			Kind:       wellknown.GatewayClassKind,
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Annotations: info.Annotations,
-			Labels:      info.Labels,
-		},
+		APIVersion:  wellknown.GatewayClassGVK.GroupVersion().String(),
+		Kind:        wellknown.GatewayClassKind,
+		Name:        name,
+		Annotations: info.Annotations,
+		Labels:      info.Labels,
 		Spec: gwv1.GatewayClassSpec{
 			ControllerName: gwv1.GatewayController(r.getControllerName(name)),
 			ParametersRef:  info.ParametersRef,

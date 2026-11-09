@@ -6,6 +6,29 @@
 apiVersion: agentgateway.dev/v1alpha1
 kind: AgentgatewayModel
 metadata:
+  name: copilot-default
+spec:
+  parentRefs:
+  - name: ai-gateway
+    sectionName: llm
+  provider: Copilot
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
+  name: copilot-endpoint
+spec:
+  parentRefs:
+  - name: ai-gateway
+    sectionName: llm
+  provider: Copilot
+  match:
+    model: gpt-test
+  baseURL: https://api.githubcopilot.com
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
   name: bedrock
 spec:
   parentRefs:
@@ -25,7 +48,7 @@ spec:
   match:
     model: gpt-5-mini
   provider: OpenAI
-  baseURL: https://api.openai.com
+  baseURL: https://api.openai.com/v1
   policies:
     authorization:
       policy:
@@ -193,3 +216,16 @@ spec:
       - modelRef:
           name: anthropic-models
         model: anthropic/claude-haiku-4-5
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
+  name: bedrock-model-default-guardrail
+spec:
+  parentRefs:
+  - name: ai-gateway
+  provider: Bedrock
+  bedrock:
+    guardrail:
+      identifier: test-guardrail
+      version: "1"

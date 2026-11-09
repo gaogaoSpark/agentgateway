@@ -13,15 +13,17 @@ use rustls::pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use secrecy::{ExposeSecret, SecretString};
 use tonic::body::Body;
-use tower::Service;
 
 use crate::client::{ApplicationTransport, Transport};
 use crate::http::HeaderValue;
-use crate::http::backendtls::{BackendTLS, BackendTLSInfo, PerAlpnConfig, SYSTEM_TRUST};
+use crate::http::backendtls::{
+	BackendTLS, BackendTLSInfo, BackendTLSSource, PerAlpnConfig, SYSTEM_TRUST,
+};
 use crate::types::agent::Target;
 use crate::*;
 
 pub mod caclient;
+pub mod spiffe;
 
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
 pub enum RootCert {
@@ -62,7 +64,7 @@ impl RootCert {
 		ccb.alpn_protocols = vec![b"h2".to_vec()];
 		Ok(BackendTLS {
 			hostname_override: None,
-			config: PerAlpnConfig::new(Arc::new(ccb), false),
+			source: BackendTLSSource::Static(PerAlpnConfig::new(Arc::new(ccb), false)),
 			metadata,
 		})
 	}
@@ -270,7 +272,8 @@ impl tower::Service<::http::Request<tonic::body::Body>> for GrpcChannel {
 					.call(client::Call {
 						req,
 						target,
-						transport,
+						connection: transport.into(),
+						dynamic_backend: false,
 					})
 					.await?,
 			)
@@ -284,7 +287,13 @@ impl agent_xds::ClientTrait for GrpcChannel {
 		req: ::http::Request<Body>,
 	) -> Pin<Box<dyn Future<Output = Result<::http::Response<axum_core::body::Body>, Error>> + Send>>
 	{
-		self.call(req)
+		let mut this = self.clone();
+		Box::pin(async move {
+			tower::Service::call(&mut this, req)
+				.await
+				// We are leaving agentgateway code so no longer need our specialized body; Boxing is fine here.
+				.map(|resp| resp.map(http::Body::into_boxed))
+		})
 	}
 
 	fn box_clone(&self) -> Box<dyn ClientTrait> {

@@ -1,3 +1,49 @@
+_err: exactly one of the fields
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: copilot-multiple-providers
+spec:
+  ai:
+    provider:
+      copilot: {}
+      openai: {}
+---
+_err: exactly one of the fields
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: copilot-group-multiple-providers
+spec:
+  ai:
+    groups:
+    - providers:
+      - name: invalid
+        copilot: {}
+        openai: {}
+---
+_err: at least 1 chars long
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: copilot-empty-model
+spec:
+  ai:
+    provider:
+      copilot:
+        model: ""
+---
+_err: may not be more than 256 bytes
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: copilot-overlong-model
+spec:
+  ai:
+    provider:
+      copilot:
+        model: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+---
 _err: deploymentName is required for this apiVersion
 apiVersion: agentgateway.dev/v1alpha1
 kind: AgentgatewayBackend
@@ -293,3 +339,62 @@ spec:
           name: other-backend
         formats:
         - type: Completions
+
+---
+_err: Must have port for Service reference
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: custom-provider-default-service-missing-port
+spec:
+  ai:
+    provider:
+      custom:
+        backendRef:
+          name: llm-service
+        formats:
+        - type: Completions
+---
+_err: Bedrock guardrails cannot be used with MantlePreferred or MantleOnly
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-backend-mantlepreferred-guardrail
+spec:
+  ai:
+    provider:
+      bedrock:
+        endpointPreference: MantlePreferred
+        guardrail:
+          identifier: test-guardrail
+          version: "1"
+---
+_err: Bedrock guardrails cannot be used with MantlePreferred or MantleOnly
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-group-mantleonly-guardrail
+spec:
+  ai:
+    groups:
+    - providers:
+      - name: bedrock
+        bedrock:
+          endpointPreference: MantleOnly
+          guardrail:
+            identifier: test-guardrail
+            version: "1"
+---
+_err: mcp target condition requires at least two targets unless the target uses selector
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: mcp-single-static-target-condition
+spec:
+  mcp:
+    targets:
+    - name: admin
+      static:
+        host: mcp.example.com
+        port: 80
+      condition: 'jwt.sub == "admin"'

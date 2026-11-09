@@ -1,0 +1,15 @@
+name: tier-aware-semantic-routing
+services:
+  semantic-router:
+    image: ghcr.io/vllm-project/semantic-router/vllm-sr:${VSR_IMAGE_TAG:?Load the shared versions.env}
+    command: ["/app/config/config.yaml"]
+    ports:
+      - "127.0.0.1:50051:50051"
+    volumes:
+      - ../../tier-aware-single-runtime/semantic-router-config.yaml:/app/config/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/50051"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s

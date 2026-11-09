@@ -1,29 +1,32 @@
 // Originally derived from https://github.com/istio/ztunnel (Apache 2.0 licensed)
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use agent_core::drain::DrainWatcher;
-use hyper::Request;
+use agent_http::Response;
+use anyhow::{Context, Result};
 use hyper::body::Incoming;
-use prometheus_client::encoding::text::encode;
+use hyper::{Request, StatusCode, header};
+use mediatype::{MediaType, ReadParams, WriteParams};
+use prometheus_client::encoding::prometheus_protobuf;
+use prometheus_client::encoding::text::encode as encode_openmetrics;
 use prometheus_client::registry::Registry;
 
+use super::accept::Accept;
 use super::hyper_helpers;
 use crate::Address;
-use crate::http::Response;
 
 pub struct Server {
-	s: hyper_helpers::Server<Mutex<Registry>>,
+	s: hyper_helpers::Server<MetricsService>,
 }
 
 impl Server {
-	pub async fn new(
-		addr: Address,
-		drain_rx: DrainWatcher,
-		registry: Registry,
-	) -> anyhow::Result<Self> {
-		hyper_helpers::Server::<Mutex<Registry>>::bind("stats", addr, drain_rx, Mutex::new(registry))
+	pub async fn new(addr: Address, drain_rx: DrainWatcher, registry: Registry) -> Result<Self> {
+		let service = MetricsService {
+			registry: Arc::new(registry),
+		};
+		hyper_helpers::Server::<MetricsService>::bind("stats", addr, drain_rx, service)
 			.await
 			.map(|s| Server { s })
 	}
@@ -32,111 +35,309 @@ impl Server {
 		self.s.address()
 	}
 
+	pub fn service(&self) -> MetricsService {
+		self.s.state().clone()
+	}
+
 	pub fn spawn(self) {
-		self.s.spawn(|registry, req| async move {
-			match req.uri().path() {
-				"/metrics" | "/stats/prometheus" => Ok(handle_metrics(registry, req).await),
-				_ => Ok(hyper_helpers::empty_response(hyper::StatusCode::NOT_FOUND)),
-			}
-		})
+		self
+			.s
+			.spawn(|service, req| async move { service.handle(req).await })
 	}
 }
 
-async fn handle_metrics(reg: Arc<Mutex<Registry>>, req: Request<Incoming>) -> Response {
-	let mut buf = String::new();
-	let reg = reg.lock().expect("mutex");
-	if let Err(err) = encode(&mut buf, &reg) {
-		return ::http::Response::builder()
-			.status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-			.body(err.to_string().into())
-			.expect("builder with known status code should not fail");
-	}
-
-	let response_content_type = content_type(&req);
-
-	::http::Response::builder()
-		.status(hyper::StatusCode::OK)
-		.header(hyper::header::CONTENT_TYPE, response_content_type)
-		.body(buf.into())
-		.expect("builder with known status code should not fail")
+#[derive(Clone, Debug)]
+pub struct MetricsService {
+	registry: Arc<Registry>,
 }
 
-#[derive(Default)]
-enum ContentType {
-	#[default]
+impl MetricsService {
+	pub async fn handle(&self, req: Request<Incoming>) -> Result<Response> {
+		match req.uri().path() {
+			"/metrics" | "/stats/prometheus" => handle_metrics(self.registry.clone(), req).await,
+			_ => Ok(hyper_helpers::empty_response(hyper::StatusCode::NOT_FOUND)),
+		}
+	}
+
+	/// Serves HTTP/1 on an already established connection, such as an HBONE tunnel.
+	pub async fn serve_connection<IO>(self, io: IO) -> Result<()>
+	where
+		IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+	{
+		hyper_helpers::http1_server()
+			.half_close(true)
+			.header_read_timeout(std::time::Duration::from_secs(2))
+			.max_buf_size(8 * 1024)
+			.serve_connection(
+				hyper_util::rt::TokioIo::new(io),
+				hyper::service::service_fn(move |req| {
+					let service = self.clone();
+					async move {
+						Ok::<_, std::convert::Infallible>(service.handle(req).await.unwrap_or_else(|err| {
+							hyper_helpers::plaintext_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+						}))
+					}
+				}),
+			)
+			.await?;
+		Ok(())
+	}
+}
+
+async fn handle_metrics(reg: Arc<Registry>, req: Request<Incoming>) -> Result<Response> {
+	let format = negotiate_format(&req).unwrap_or_default();
+
+	let body = tokio::task::spawn_blocking(move || format.encode(&reg))
+		.await
+		.context("metrics encoding failed")??;
+
+	Ok(
+		::http::Response::builder()
+			.status(StatusCode::OK)
+			.header(header::CONTENT_TYPE, format.content_type())
+			.header(header::VARY, header::ACCEPT.as_str())
+			.body(body.into())?,
+	)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MetricsFormat {
 	PlainText,
-	OpenMetrics,
+	#[default]
+	OpenMetricsText,
+	PrometheusProtobuf,
 }
 
-impl From<ContentType> for &str {
-	fn from(c: ContentType) -> Self {
-		match c {
-			ContentType::PlainText => "text/plain; charset=utf-8",
-			ContentType::OpenMetrics => "application/openmetrics-text;charset=utf-8;version=1.0.0",
+impl MetricsFormat {
+	fn content_type(self) -> &'static str {
+		match self {
+			Self::PlainText => "text/plain;charset=utf-8",
+			Self::OpenMetricsText => {
+				"application/openmetrics-text;version=1.0.0;charset=utf-8;escaping=allow-utf-8"
+			},
+			Self::PrometheusProtobuf => {
+				"application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited"
+			},
+		}
+	}
+
+	fn encode(self, registry: &Registry) -> Result<Vec<u8>> {
+		match self {
+			Self::OpenMetricsText | Self::PlainText => {
+				let mut buffer = String::new();
+				encode_openmetrics(&mut buffer, registry)?;
+				Ok(buffer.into_bytes())
+			},
+			Self::PrometheusProtobuf => Ok(prometheus_protobuf::encode_to_vec(registry)?),
 		}
 	}
 }
 
-#[inline(always)]
-fn content_type<T>(req: &Request<T>) -> &str {
-	req
-		.headers()
-		.get_all(http::header::ACCEPT)
-		.iter()
-		.flat_map(|entry| entry.to_str().ok())
-		// get_all can return multiple in one line still
-		.flat_map(|entry| {
-			entry
-				.split(",")
-				.map(str::trim)
-				.map(|entry| entry.to_lowercase())
+fn negotiate_format<T>(req: &Request<T>) -> Option<MetricsFormat> {
+	use mediatype::Name;
+	use mediatype::names::{APPLICATION, HTML, Q, TEXT};
+
+	let mut values = req.headers().get_all(http::header::ACCEPT).iter();
+	let accept = Accept::decode(&mut values).ok()?;
+	// Browsers download application/openmetrics-text rather than displaying it, so label the
+	// (OpenMetrics) body as text/plain for them.
+	if accept
+		.media_types()
+		.any(|media_type| media_type.ty() == TEXT && media_type.subty() == HTML)
+	{
+		return Some(MetricsFormat::PlainText);
+	}
+	accept
+		.media_types()
+		.map(|media_type| {
+			let mut normalized = media_type.essence();
+			if let Some(quality) = media_type.get_param(Q) {
+				normalized.set_param(Q, quality);
+			}
+			normalized
 		})
-		.find_map(|v| match v.split(";").collect::<Vec<_>>().first() {
-			Some(&"application/openmetrics-text") => Some(ContentType::OpenMetrics),
-			_ => None,
+		.collect::<Accept>()
+		.negotiate(&[
+			MediaType::new(APPLICATION, Name::new_unchecked("openmetrics-text")),
+			MediaType::new(APPLICATION, Name::new_unchecked("vnd.google.protobuf")),
+			MediaType::new(APPLICATION, Name::new_unchecked("protobuf")),
+			MediaType::new(APPLICATION, Name::new_unchecked("x-protobuf")),
+		])
+		.map(|media_type| match media_type.subty.as_str() {
+			"openmetrics-text" => MetricsFormat::OpenMetricsText,
+			_ => MetricsFormat::PrometheusProtobuf,
 		})
-		.unwrap_or_default()
-		.into()
 }
 
-mod test {
-	#[test]
-	fn test_content_type() {
-		let plain_text_req = http::Request::new("I want some plain text");
-		assert_eq!(
-			super::content_type(&plain_text_req),
-			"text/plain; charset=utf-8"
-		);
+#[cfg(test)]
+mod tests {
+	use std::net::{Ipv4Addr, SocketAddr};
 
-		let openmetrics_req = http::Request::builder()
-			.header("X-Custom-Beep", "boop")
-			.header("Accept", "application/json")
-			.header("Accept", "application/openmetrics-text; other stuff")
-			.body("I would like openmetrics")
+	use prometheus_client::encoding::prometheus_protobuf::prometheus_data_model::MetricFamily;
+	use prometheus_client::metrics::counter::Counter;
+	use prometheus_client::registry::Registry;
+	use prost::Message;
+	use rstest::rstest;
+
+	use super::{MetricsFormat, Server};
+	use crate::Address;
+
+	#[rstest]
+	#[case::no_accept(None, MetricsFormat::OpenMetricsText)]
+	#[case::wildcard(Some("*/*"), MetricsFormat::OpenMetricsText)]
+	#[case::openmetrics(
+		Some("application/openmetrics-text;version=1.0.0"),
+		MetricsFormat::OpenMetricsText
+	)]
+	#[case::plain_text(Some("text/plain;version=0.0.4"), MetricsFormat::OpenMetricsText)]
+	#[case::browser(
+		Some("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+		MetricsFormat::PlainText
+	)]
+	#[case::canonical_protobuf(
+		Some(
+			"APPLICATION/VND.GOOGLE.PROTOBUF;PROTO=io.prometheus.client.MetricFamily;ENCODING=delimited"
+		),
+		MetricsFormat::PrometheusProtobuf
+	)]
+	#[case::protobuf_alias(Some("application/protobuf"), MetricsFormat::PrometheusProtobuf)]
+	#[case::x_protobuf_alias(Some("application/x-protobuf"), MetricsFormat::PrometheusProtobuf)]
+	fn negotiates_supported_formats(#[case] accept: Option<&str>, #[case] expected: MetricsFormat) {
+		let mut request = http::Request::new(());
+		if let Some(accept) = accept {
+			request
+				.headers_mut()
+				.insert(http::header::ACCEPT, accept.parse().unwrap());
+		}
+		assert_eq!(
+			super::negotiate_format(&request).unwrap_or_default(),
+			expected
+		);
+	}
+
+	#[rstest]
+	#[case::openmetrics_preferred(
+		"application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.5,application/openmetrics-text;version=0.0.1;q=0.4,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.3,text/plain;version=0.0.4;q=0.2,*/*;q=0.1",
+		MetricsFormat::OpenMetricsText
+	)]
+	#[case::protobuf_preferred(
+		"application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.6,application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.5,application/openmetrics-text;version=0.0.1;q=0.4,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.3,text/plain;version=0.0.4;q=0.2,*/*;q=0.1",
+		MetricsFormat::PrometheusProtobuf
+	)]
+	fn negotiates_prometheus_scrape_headers(#[case] accept: &str, #[case] expected: MetricsFormat) {
+		let request = http::Request::builder()
+			.header(http::header::ACCEPT, accept)
+			.body(())
 			.unwrap();
 		assert_eq!(
-			super::content_type(&openmetrics_req),
-			"application/openmetrics-text;charset=utf-8;version=1.0.0"
+			super::negotiate_format(&request).unwrap_or_default(),
+			expected,
+			"{accept}"
 		);
+	}
 
-		let mixed_req = http::Request::builder()
-          .header("X-Custom-Beep", "boop")
-          .header("Accept", "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.6,application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.5,application/openmetrics-text;version=0.0.1;q=0.4,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.3,text/plain;version=0.0.4;q=0.2,*/*;q=0.1")
-          .body("I would like openmetrics")
-          .unwrap();
-		assert_eq!(
-			super::content_type(&mixed_req),
-			"application/openmetrics-text;charset=utf-8;version=1.0.0"
-		);
-
-		let unsupported_req_accept = http::Request::builder()
-			.header("Accept", "application/json")
-			.body("I would like some json")
+	#[rstest]
+	#[case::quality(
+		"application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.6,application/openmetrics-text;version=1.0.0;q=0.5,text/plain;version=0.0.4;q=0.4",
+		MetricsFormat::PrometheusProtobuf
+	)]
+	#[case::bare_openmetrics(
+		"application/openmetrics-text;q=0.9,text/plain;q=0.8",
+		MetricsFormat::OpenMetricsText
+	)]
+	#[case::bare_protobuf(
+		"application/vnd.google.protobuf;q=0.9,text/plain;q=0.8",
+		MetricsFormat::PrometheusProtobuf
+	)]
+	#[case::wildcard_parameter("*/*;unknown=parameter", MetricsFormat::OpenMetricsText)]
+	#[case::quoted_openmetrics_parameters(
+		"application/openmetrics-text;version=\"1.0.0\";escaping=\"allow-utf-8\"",
+		MetricsFormat::OpenMetricsText
+	)]
+	#[case::quoted_protobuf_parameters(
+		"application/vnd.google.protobuf;proto=\"io.prometheus.client.MetricFamily\";encoding=\"delimited\"",
+		MetricsFormat::PrometheusProtobuf
+	)]
+	fn honors_quality_and_representation_parameters(
+		#[case] accept: &str,
+		#[case] expected: MetricsFormat,
+	) {
+		let request = http::Request::builder()
+			.header(http::header::ACCEPT, accept)
+			.body(())
 			.unwrap();
-		// asking for something we don't support, fall back to plaintext
 		assert_eq!(
-			super::content_type(&unsupported_req_accept),
-			"text/plain; charset=utf-8"
+			super::negotiate_format(&request).unwrap_or_default(),
+			expected,
+			"{accept}"
+		);
+	}
+
+	#[tokio::test]
+	async fn serves_each_metrics_format() {
+		let counter: Counter = Counter::default();
+		let mut registry = Registry::default();
+		registry.register("requests", "Requests", counter.clone());
+		counter.inc();
+
+		let (_drain_tx, drain_rx) = agent_core::drain::new();
+		let server = Server::new(
+			Address::SocketAddr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+			drain_rx,
+			registry,
 		)
+		.await
+		.unwrap();
+		let address = server.address().unwrap();
+		server.spawn();
+
+		let client = reqwest::Client::new();
+		let url = format!("http://{address}/metrics");
+		let openmetrics = client
+			.get(&url)
+			.header(
+				"accept",
+				"application/openmetrics-text;version=1.0.0;escaping=allow-utf-8",
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(openmetrics.status(), reqwest::StatusCode::OK);
+		assert_eq!(
+			openmetrics.headers()[reqwest::header::CONTENT_TYPE],
+			"application/openmetrics-text;version=1.0.0;charset=utf-8;escaping=allow-utf-8"
+		);
+		assert!(openmetrics.bytes().await.unwrap().ends_with(b"# EOF\n"));
+
+		let plain_text = client
+			.get(&url)
+			.header("accept", "text/html,*/*;q=0.8")
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(plain_text.status(), reqwest::StatusCode::OK);
+		assert_eq!(
+			plain_text.headers()[reqwest::header::CONTENT_TYPE],
+			"text/plain;charset=utf-8"
+		);
+		assert!(plain_text.text().await.unwrap().contains("requests_total"));
+
+		let protobuf = client
+			.get(url)
+			.header(
+				"accept",
+				"application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited",
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(protobuf.status(), reqwest::StatusCode::OK);
+		assert_eq!(
+			protobuf.headers()[reqwest::header::CONTENT_TYPE],
+			"application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited"
+		);
+		let protobuf = protobuf.bytes().await.unwrap();
+		let family = MetricFamily::decode_length_delimited(protobuf.as_ref()).unwrap();
+		assert_eq!(family.name, "requests_total");
 	}
 }

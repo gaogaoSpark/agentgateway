@@ -18,6 +18,7 @@ import (
 
 	"github.com/agentgateway/agentgateway/api"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/utils"
+	"github.com/agentgateway/agentgateway/controller/pkg/reports"
 	"github.com/agentgateway/agentgateway/controller/pkg/utils/kubeutils"
 	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
@@ -37,6 +38,28 @@ func NewInferencePlugin(agw *AgwCollections) AgwPlugin {
 						return translatePoliciesForInferencePool(krtctx, agw.ControllerName, input.References, agw.Services, infPool)
 					}, agw.KrtOpts.ToOptions("policies/InferencePool")...)
 					return ConvertStatusCollection(status, agw.KrtOpts.ToOptions, "policies/InferencePool"), policyCol
+				},
+				// The endpoint picker Service is only reachable through the InferencePool, so record it as a
+				// reference to let policies targeting the Service attach to the pool's Gateways.
+				BuildReferences: func(input PolicyPluginInput) krt.Collection[*PolicyAttachment] {
+					return krt.NewCollection(agw.InferencePools, func(krtctx krt.HandlerContext, pool *inf.InferencePool) **PolicyAttachment {
+						epr := pool.Spec.EndpointPickerRef
+						if epr == nil {
+							return nil
+						}
+						self := utils.TypedNamespacedName{
+							Namespace: pool.Namespace, Name: pool.Name,
+							Kind: wellknown.InferencePoolGVK.Kind,
+						}
+						return new(&PolicyAttachment{
+							Target: self,
+							Backend: utils.TypedNamespacedName{
+								NamespacedName: types.NamespacedName{Namespace: pool.Namespace, Name: string(epr.Name)},
+								Kind:           wellknown.ServiceKind,
+							},
+							Source: self,
+						})
+					}, agw.KrtOpts.ToOptions("references/InferencePoolAttachments")...)
 				},
 			},
 		},
@@ -78,15 +101,16 @@ func translatePoliciesForInferencePool(
 	}
 
 	failureMode := api.BackendPolicySpec_InferenceRouting_FAIL_CLOSED
-	if epr.FailureMode == inf.EndpointPickerFailOpen {
+	if epr != nil && epr.FailureMode == inf.EndpointPickerFailOpen {
 		failureMode = api.BackendPolicySpec_InferenceRouting_FAIL_OPEN
 	}
 
 	// Create the inference routing policy
 	inferencePolicy := &api.Policy{
-		Key:    pool.Namespace + "/" + pool.Name + ":inference",
-		Name:   TypedResourceName(wellknown.InferencePoolGVK.Kind, pool),
-		Target: &api.PolicyTarget{Kind: utils.ServiceTargetWithHostname(pool.Namespace, hostname, nil)},
+		Key:               pool.Namespace + "/" + pool.Name + ":inference",
+		Name:              TypedResourceName(wellknown.InferencePoolGVK.Kind, pool),
+		Target:            &api.PolicyTarget{Kind: utils.ServiceTargetWithHostname(pool.Namespace, hostname, nil)},
+		CreationTimestamp: max(pool.CreationTimestamp.Unix(), 0),
 		Kind: &api.Policy_Backend{
 			Backend: &api.BackendPolicySpec{
 				Kind: &api.BackendPolicySpec_InferenceRouting_{
@@ -115,9 +139,10 @@ func translatePoliciesForInferencePool(
 	// Create the TLS policy for the endpoint picker
 	// TODO: we would want some way if they explicitly set a BackendTLSPolicy for the EPP to respect that
 	inferencePolicyTLS := &api.Policy{
-		Key:    pool.Namespace + "/" + pool.Name + ":inferencetls",
-		Name:   TypedResourceName(wellknown.InferencePoolGVK.Kind, pool),
-		Target: &api.PolicyTarget{Kind: utils.ServiceTargetWithHostname(pool.Namespace, eppSvc, new(strconv.Itoa(int(eppPort))))},
+		Key:               pool.Namespace + "/" + pool.Name + ":inferencetls",
+		Name:              TypedResourceName(wellknown.InferencePoolGVK.Kind, pool),
+		Target:            &api.PolicyTarget{Kind: utils.ServiceTargetWithHostname(pool.Namespace, eppSvc, new(strconv.Itoa(int(eppPort))))},
+		CreationTimestamp: max(pool.CreationTimestamp.Unix(), 0),
 		Kind: &api.Policy_Backend{
 			Backend: &api.BackendPolicySpec{
 				Kind: &api.BackendPolicySpec_BackendTls{
@@ -142,6 +167,9 @@ func translatePoliciesForInferencePool(
 
 func validateInferencePoolEndpointPickerRef(krtctx krt.HandlerContext, pool *inf.InferencePool, services krt.Collection[*corev1.Service]) error {
 	epr := pool.Spec.EndpointPickerRef
+	if epr == nil {
+		return fmt.Errorf("endpointPickerRef must be specified")
+	}
 	var errs []string
 
 	if epr.Group != nil && *epr.Group != "" {
@@ -207,11 +235,9 @@ func inferencePoolAttachedGateways(
 	gateways := make(map[types.NamespacedName]struct{})
 
 	targetRef := utils.TypedNamespacedName{
-		NamespacedName: types.NamespacedName{
-			Name:      pool.Name,
-			Namespace: pool.Namespace,
-		},
-		Kind: wellknown.InferencePoolKind,
+		Name:      pool.Name,
+		Namespace: pool.Namespace,
+		Kind:      wellknown.InferencePoolKind,
 	}
 
 	for gateway := range references.LookupGatewaysForBackend(krtctx, targetRef) {
@@ -231,30 +257,40 @@ func buildInferencePoolStatus(
 		status = &inf.InferencePoolStatus{}
 	}
 
-	existingOurs := make(map[string]inf.ParentStatus)
-	mergedParents := make([]inf.ParentStatus, 0, len(status.Parents)+len(attachedGateways)+1)
-	for _, p := range status.Parents {
-		if string(p.ControllerName) != controllerName {
-			mergedParents = append(mergedParents, p)
-			continue
-		}
-		existingOurs[inferencePoolParentMergeKey(p.ParentRef)] = p
-	}
-
 	conditions := inferencePoolConditionMap(controllerName, validationErr)
+	if pool.Spec.EndpointPickerRef == nil {
+		conditions[string(inf.InferencePoolConditionAccepted)].Error = &ConfigError{
+			Reason:  string(inf.InferencePoolReasonEndpointPickerRefMissing),
+			Message: "endpointPickerRef must be specified",
+		}
+	}
+	owned := func(p inf.ParentStatus) bool { return string(p.ControllerName) == controllerName }
+	sameRef := func(a, b inf.ParentStatus) bool {
+		return reports.CompareInferencePoolParentReference(a.ParentRef, b.ParentRef) == 0
+	}
+	ours := make([]inf.ParentStatus, 0, len(attachedGateways)+1)
 	for _, ref := range desiredInferencePoolParentRefs(attachedGateways, validationErr) {
 		existingConds := []metav1.Condition(nil)
-		if existing, found := existingOurs[inferencePoolParentMergeKey(ref)]; found {
-			existingConds = existing.Conditions
+		// Keep the stored ref on a match: the API server defaults its group and kind, so the computed one would differ.
+		if i := slices.IndexFunc(status.Parents, func(p inf.ParentStatus) bool {
+			return owned(p) && sameRef(p, inf.ParentStatus{ParentRef: ref})
+		}); i != -1 {
+			existingConds = status.Parents[i].Conditions
+			ref = status.Parents[i].ParentRef
 		}
-		mergedParents = append(mergedParents, inf.ParentStatus{
+		ours = append(ours, inf.ParentStatus{
 			ParentRef:      ref,
 			ControllerName: inf.ControllerName(controllerName),
 			Conditions:     setConditions(pool.Generation, existingConds, conditions),
 		})
 	}
 
-	status.Parents = mergedParents
+	// Keep existing entries in place so the desired order matches what the status syncer writes.
+	status.Parents = reports.MergeOwnedStatuses(status.Parents, ours, owned, sameRef,
+		func(a, b inf.ParentStatus) int {
+			return reports.CompareInferencePoolParentReference(a.ParentRef, b.ParentRef)
+		},
+	)
 	return status
 }
 
@@ -283,7 +319,7 @@ func desiredInferencePoolParentRefs(attachedGateways map[types.NamespacedName]st
 	refs := make([]inf.ParentReference, 0, len(gateways))
 	for _, g := range gateways {
 		refs = append(refs, inf.ParentReference{
-			Group:     ptr.Of(inf.Group(wellknown.GatewayGroup)),
+			Group:     new(inf.Group(wellknown.GatewayGroup)),
 			Kind:      wellknown.GatewayKind,
 			Namespace: inf.Namespace(g.Namespace),
 			Name:      inf.ObjectName(g.Name),
@@ -315,20 +351,4 @@ func inferencePoolConditionMap(controllerName string, validationErr error) map[s
 		}
 	}
 	return conds
-}
-
-func inferencePoolParentMergeKey(ref inf.ParentReference) string {
-	kind := string(ref.Kind)
-	if kind == "" {
-		kind = wellknown.GatewayKind
-	}
-
-	group := ""
-	if ref.Group != nil && *ref.Group != "" {
-		group = string(*ref.Group)
-	} else if kind == wellknown.GatewayKind {
-		// For Gateway parent refs, API defaulting implies gateway.networking.k8s.io.
-		group = wellknown.GatewayGroup
-	}
-	return fmt.Sprintf("%s/%s/%s/%s", group, kind, ref.Namespace, ref.Name)
 }

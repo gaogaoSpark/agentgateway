@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::future::pending;
@@ -16,7 +17,6 @@ use tokio::time::{Instant, sleep_until};
 use tracing::{trace, warn};
 
 use crate::client::Client;
-use crate::http::Body;
 
 const JWKS_TTL: Duration = Duration::from_mins(15);
 const OPENAPI_TTL: Duration = Duration::from_hours(24);
@@ -134,10 +134,17 @@ impl ResourceFetcher {
 				.await
 				.map(|r| r.content),
 			ResourceFetcherMode::FilesOnly => match normalized {
-				ResourceRef::File(path) => fs_err::tokio::read(&path)
-					.await
-					.with_context(|| format!("read resource file {}", path.display()))
-					.map(Bytes::from),
+				ResourceRef::File(path) => {
+					// CLI commands like `import` and `migrate` parse config without a runtime.
+					let content = if tokio::runtime::Handle::try_current().is_ok() {
+						fs_err::tokio::read(&path).await
+					} else {
+						fs_err::read(&path)
+					};
+					content
+						.with_context(|| format!("read resource file {}", path.display()))
+						.map(Bytes::from)
+				},
 				ResourceRef::Http { url, .. } => {
 					Err(anyhow!("resource fetcher cannot fetch HTTP resource {url}"))
 				},
@@ -185,6 +192,34 @@ impl ResourceFetcher {
 			tracking.insert(resource);
 		}
 	}
+}
+
+thread_local! {
+	static PARSE_FETCHER: RefCell<Option<ResourceFetcher>> = const { RefCell::new(None) };
+}
+
+/// Runs a synchronous config parse with `fetcher` available to serde hooks
+/// through [`parse_fetcher`].
+pub fn with_parse_fetcher<T>(fetcher: &ResourceFetcher, parse: impl FnOnce() -> T) -> T {
+	struct Clear;
+	impl Drop for Clear {
+		fn drop(&mut self) {
+			PARSE_FETCHER.with(|f| f.take());
+		}
+	}
+	PARSE_FETCHER.with(|f| f.replace(Some(fetcher.clone())));
+	let _clear = Clear;
+	parse()
+}
+
+/// The fetcher of the enclosing [`with_parse_fetcher`], or a files-only fetcher
+/// outside one.
+pub fn parse_fetcher() -> ResourceFetcher {
+	PARSE_FETCHER.with(|f| {
+		f.borrow()
+			.clone()
+			.unwrap_or_else(ResourceFetcher::files_only)
+	})
 }
 
 impl ResourceFetchScope<'_> {
@@ -353,11 +388,6 @@ impl ResourceManager {
 		self.inner.change_tx.subscribe()
 	}
 
-	pub async fn fetch_and_wait(&self, resource: ResourceRef) -> anyhow::Result<Bytes> {
-		let resource = normalize_resource(resource)?;
-		self.fetch_and_wait_normalized(resource).await
-	}
-
 	async fn fetch_and_wait_normalized(&self, resource: ResourceRef) -> anyhow::Result<Bytes> {
 		if let ResourceRef::File(path) = &resource {
 			self.watch_file(path)?;
@@ -368,11 +398,6 @@ impl ResourceManager {
 		let FetchResult { content, next } = self.fetch(&resource).await?;
 		self.store(resource, content.clone(), next);
 		Ok(content)
-	}
-
-	pub async fn fetch_cached_or_direct(&self, resource: ResourceRef) -> anyhow::Result<Bytes> {
-		let resource = normalize_resource(resource)?;
-		self.fetch_cached_or_direct_normalized(resource).await
 	}
 
 	async fn fetch_cached_or_direct_normalized(
@@ -388,12 +413,24 @@ impl ResourceManager {
 	}
 
 	pub fn retain_resources(&self, retained: HashSet<ResourceRef>) {
-		*self
-			.inner
-			.active_resources
-			.lock()
-			.expect("resource active set mutex poisoned") = retained.clone();
+		let previous = std::mem::replace(
+			&mut *self
+				.inner
+				.active_resources
+				.lock()
+				.expect("resource active set mutex poisoned"),
+			retained.clone(),
+		);
 		self.retain_cached_and_watched_resources(&retained);
+		// refresh_file ignores watch events for files that are not active yet, so a
+		// change between a new file's first read and this commit would be lost.
+		for resource in retained.difference(&previous) {
+			if let ResourceRef::File(path) = resource {
+				let manager = self.clone();
+				let path = path.clone();
+				tokio::spawn(async move { manager.refresh_file(path).await });
+			}
+		}
 	}
 
 	fn retain_active_resources(&self) {
@@ -477,6 +514,22 @@ impl ResourceManager {
 					return;
 				}
 				let next = Instant::now() + FAILED_HTTP_REFRESH;
+				// Keep the cached entry's `next_refresh` in sync with the retry being
+				// scheduled below. `should_refresh` gates the scheduler's eventual
+				// retry on this timestamp matching exactly; leaving it at the last
+				// success's (now past-due) value makes that retry silently no-op
+				// when it fires, and since only a `should_refresh`-approved refresh
+				// schedules the next one, this resource would never be refreshed
+				// again until the process restarts.
+				if let Some(entry) = self
+					.inner
+					.entries
+					.lock()
+					.expect("resource cache mutex poisoned")
+					.get_mut(&resource)
+				{
+					entry.next_refresh = Some(next);
+				}
 				let _ = self
 					.inner
 					.scheduler_tx
@@ -714,7 +767,7 @@ async fn fetch_direct(client: &Client, resource: &ResourceRef) -> anyhow::Result
 				.simple_call(
 					::http::Request::builder()
 						.uri(url)
-						.body(Body::empty())
+						.body(crate::http::Body::empty())
 						.expect("builder should succeed"),
 				)
 				.await
@@ -783,6 +836,7 @@ mod tests {
 			&crate::client::Config {
 				resolver_cfg: hickory_resolver::config::ResolverConfig::default(),
 				resolver_opts: hickory_resolver::config::ResolverOpts::default(),
+				max_ttl: None,
 			},
 			None,
 			crate::BackendConfig::default(),
@@ -961,5 +1015,140 @@ mod tests {
 			.await
 			.expect("resource deletion should notify")
 			.expect("change channel should remain open");
+	}
+
+	#[tokio::test]
+	async fn failed_http_refresh_reschedules_a_retry_that_will_actually_fire() {
+		// A server that drops every connection fails at the transport level
+		// (like a real transient network blip), rather than a non-2xx status --
+		// `fetch_direct` only treats transport-level failures as errors, not HTTP
+		// error statuses. Keeping the listener bound prevents another test from
+		// reusing the port.
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			while let Ok((conn, _)) = listener.accept().await {
+				drop(conn);
+			}
+		});
+
+		let manager = ResourceManager::new(test_client()).unwrap();
+		let url: http::Uri = format!("http://{addr}/resource").parse().unwrap();
+		let resource = normalize_resource(ResourceRef::Http {
+			url,
+			kind: ResourceKind::Generic,
+		})
+		.unwrap();
+
+		// Simulate steady state after a prior successful fetch: cached content,
+		// active, with its next scheduled refresh far in the future.
+		let far_future = Instant::now() + Duration::from_secs(9_999);
+		manager.retain_resources(HashSet::from([resource.clone()]));
+		manager.store(
+			resource.clone(),
+			Bytes::from_static(b"v1"),
+			Some(far_future),
+		);
+
+		// This is the periodic scheduler's refresh attempt firing, exactly as
+		// `start_http_scheduler` invokes it -- it hits the closed port above.
+		manager
+			.refetch_and_notify_if_changed(resource.clone())
+			.await;
+
+		let entries = manager
+			.inner
+			.entries
+			.lock()
+			.expect("resource cache mutex poisoned");
+		let entry = entries.get(&resource).expect("entry should remain cached");
+		// A failed refresh must not touch the last-known-good content.
+		assert_eq!(entry.content, Bytes::from_static(b"v1"));
+		// The retry scheduled after the failure must be reflected in the cached
+		// entry's `next_refresh`, because `should_refresh` gates the scheduler's
+		// eventual retry on that value matching exactly. Before the fix,
+		// `next_refresh` here is still `far_future` (untouched by the failure
+		// path), so when the scheduler later pops the retry it never matches,
+		// the retry is silently dropped, and no refresh is ever scheduled again.
+		let scheduled_retry = entry.next_refresh.expect("a retry should be scheduled");
+		assert!(
+			scheduled_retry < far_future,
+			"failed refresh should reschedule sooner than the stale next_refresh from the last success"
+		);
+	}
+
+	#[tokio::test]
+	async fn parse_fetcher_reads_through_the_enclosing_managed_fetcher() {
+		let dir = tempfile::tempdir().unwrap();
+		let file = dir.path().join("root.pem");
+		fs_err::write(&file, "cert").unwrap();
+		let resource = normalize_resource(ResourceRef::File(file.clone())).unwrap();
+		let ResourceRef::File(abspath) = resource.clone() else {
+			unreachable!()
+		};
+		let manager = ResourceManager::new(test_client()).unwrap();
+		let resources = ResourceFetcher::managed(manager.clone());
+
+		scoped(&resources, || async {
+			let content = with_parse_fetcher(&resources, || {
+				futures::executor::block_on(parse_fetcher().fetch(ResourceRef::File(file.clone())))
+			})?;
+			assert_eq!(content, Bytes::from("cert"));
+			Ok(())
+		})
+		.await
+		.unwrap();
+
+		assert_eq!(manager.cached(&resource), Some(Bytes::from("cert")));
+		assert!(manager.is_active(&resource));
+		assert!(manager.inner.watched_files.contains(&abspath));
+		PARSE_FETCHER.with(|f| assert!(f.borrow().is_none()));
+	}
+
+	#[test]
+	fn parse_fetcher_reads_files_without_a_runtime() {
+		// `agentgateway migrate` parsing a config with a file-backed secret.
+		let dir = tempfile::tempdir().unwrap();
+		let file = dir.path().join("secret");
+		fs_err::write(&file, "s3cret").unwrap();
+
+		let content =
+			futures::executor::block_on(parse_fetcher().fetch(ResourceRef::File(file))).unwrap();
+		assert_eq!(content, Bytes::from("s3cret"));
+	}
+
+	#[tokio::test]
+	async fn a_change_after_the_parse_read_is_published() {
+		let dir = tempfile::tempdir().unwrap();
+		let file = dir.path().join("root.pem");
+		fs_err::write(&file, "old").unwrap();
+		let resource = normalize_resource(ResourceRef::File(file.clone())).unwrap();
+		let manager = ResourceManager::new(test_client()).unwrap();
+		let resources = ResourceFetcher::managed(manager.clone());
+		let mut changes = manager.subscribe_changes();
+
+		scoped(&resources, || async {
+			let content = with_parse_fetcher(&resources, || {
+				futures::executor::block_on(parse_fetcher().fetch(ResourceRef::File(file.clone())))
+			})?;
+			assert_eq!(content, Bytes::from("old"));
+			// The rest of the computation runs after the parse read.
+			fs_err::write(&file, "new").unwrap();
+			tokio::time::sleep(Duration::from_millis(500)).await;
+			Ok(())
+		})
+		.await
+		.unwrap();
+
+		tokio::time::timeout(Duration::from_secs(10), async {
+			loop {
+				if manager.cached(&resource) == Some(Bytes::from("new")) {
+					return;
+				}
+				changes.changed().await.unwrap();
+			}
+		})
+		.await
+		.expect("a change made after the parse read reaches the cache and is published");
 	}
 }

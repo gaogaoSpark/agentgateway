@@ -1,0 +1,59 @@
+name: Controller toolchains
+description: Set up the Go toolchain and optional Rust toolchain and build cache
+
+inputs:
+  rust:
+    description: Set up Rust and its build cache
+    required: false
+    default: "false"
+  go-version-file:
+    description: File containing the Go toolchain version
+    required: false
+    default: go.mod
+  save:
+    description: Save the Rust build cache after a successful job
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+  - name: Check runner info
+    if: ${{ inputs.rust == 'true' }}
+    shell: bash
+    run: |
+      cat /sys/fs/cgroup/cpu.stat || true
+      cat /proc/pressure/cpu || true
+      lscpu || true
+      openssl speed -seconds 1 -bytes 256 sha256 || true
+
+  - name: Set tools path
+    shell: bash
+    run: echo "$GITHUB_WORKSPACE/tools" >> "$GITHUB_PATH"
+
+  - name: Set up Rust build cache
+    if: ${{ inputs.rust == 'true' }}
+    uses: ./.github/actions/rust-build-cache
+    with:
+      cache-key: controller-e2e
+      save: ${{ inputs.save }}
+
+  - name: Install Go
+    uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+    with:
+      go-version-file: ${{ inputs.go-version-file }}
+      cache: false
+
+  - name: Locate Go module cache
+    id: go-env
+    shell: bash
+    run: echo "modcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+  - name: Mount Go module cache
+    uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
+    with:
+      # Each snapshot replaces the whole disk, so jobs that download different modules need their own key.
+      key: ${{ github.repository }}-go-mod-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}
+      path: ${{ steps.go-env.outputs.modcache }}
+      # PRs reuse the default branch's modules, but only postsubmit updates them.
+      commit: ${{ github.ref == 'refs/heads/main' && 'on-change' || 'false' }}

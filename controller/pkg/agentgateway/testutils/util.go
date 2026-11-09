@@ -16,12 +16,13 @@ import (
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/file"
+	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	inf "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwv1b1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	gwxv1a1 "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 	"sigs.k8s.io/yaml"
 
 	apitests "github.com/agentgateway/agentgateway/controller/api/tests"
@@ -33,8 +34,8 @@ import (
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/translator"
 	"github.com/agentgateway/agentgateway/controller/pkg/apiclient/fake"
 	"github.com/agentgateway/agentgateway/controller/pkg/controller"
+	"github.com/agentgateway/agentgateway/controller/pkg/deployer"
 	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/krtutil"
-	"github.com/agentgateway/agentgateway/controller/pkg/schemes"
 	"github.com/agentgateway/agentgateway/controller/pkg/syncer"
 	"github.com/agentgateway/agentgateway/controller/pkg/syncer/status"
 	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
@@ -79,11 +80,6 @@ func isSpace(r rune) bool {
 		}
 	}
 	return false
-}
-
-func init() {
-	// Add our types to Istio since we are using their library
-	utilruntime.Must(schemes.AddToScheme(kube.IstioScheme))
 }
 
 func GetTestResource[T any](t *testing.T, collection krt.Collection[T]) T {
@@ -153,11 +149,32 @@ type testOutput[Status any, Output any] struct {
 	Output []Output `json:"output"`
 }
 
-func Syncer(t *testing.T, ctx plugins.PolicyCtx, includeStatusKinds ...string) (*TestStatusQueue, *syncer.Syncer) {
+func Syncer(t testing.TB, ctx plugins.PolicyCtx, includeStatusKinds ...string) (*TestStatusQueue, *syncer.Syncer) {
+	return SyncerWithOptions(t, ctx, includeStatusKinds)
+}
+
+// SyncerWithOptions is Syncer, with syncer options applied.
+func SyncerWithOptions(
+	t testing.TB,
+	ctx plugins.PolicyCtx,
+	includeStatusKinds []string,
+	opts ...syncer.AgentgatewaySyncerOption,
+) (*TestStatusQueue, *syncer.Syncer) {
+	return SyncerWithExtensions(t, ctx, includeStatusKinds, plugins.AgwPlugin{}, nil, opts...)
+}
+
+func SyncerWithExtensions(
+	t testing.TB,
+	ctx plugins.PolicyCtx,
+	includeStatusKinds []string,
+	extensions plugins.AgwPlugin,
+	additionalGatewayClasses map[string]*deployer.GatewayClassInfo,
+	opts ...syncer.AgentgatewaySyncerOption,
+) (*TestStatusQueue, *syncer.Syncer) {
 	fc := fake.NewClient(t)
 	stop := test.NewStop(t)
 	debugger := new(krt.DebugHandler)
-	opts := krtutil.NewKrtOptions(stop, debugger)
+	krtOpts := krtutil.NewKrtOptions(stop, debugger)
 	resolver := BuildRemoteHTTPResolver(ctx.Collections)
 	jwksLookup := BuildJWKSLookup(ctx.Collections)
 	t.Cleanup(func() {
@@ -171,10 +188,11 @@ func Syncer(t *testing.T, ctx plugins.PolicyCtx, includeStatusKinds ...string) (
 		// Only used for NACK, so no need to do anything special here.
 		fc,
 		ctx.Collections,
-		agwPluginFactory(ctx.Collections, resolver, jwksLookup),
+		plugins.MergePlugins(agwPluginFactory(ctx.Collections, resolver, jwksLookup), extensions),
+		additionalGatewayClasses,
+		krtOpts,
 		nil,
-		opts,
-		nil,
+		opts...,
 	)
 	fc.RunAndWait(stop)
 	sq := &TestStatusQueue{
@@ -204,6 +222,13 @@ func BuildMockPolicyContext(t test.Failer, inputs []any) plugins.PolicyCtx {
 	collections := BuildMockCollection(t, inputs)
 	resolver := BuildRemoteHTTPResolver(collections)
 	grants := BuildReferenceGrants(collections)
+	jwksCollections := jwks.NewCollections(jwks.CollectionInputs{
+		AgentgatewayPolicies: collections.AgentgatewayPolicies,
+		Backends:             collections.Backends,
+		Resolver:             jwks.NewResolver(resolver, grants, collections.Settings.BackendRefGrantMode),
+		KrtOpts:              collections.KrtOpts,
+	})
+	jwksCollections.ResolvedOwners.WaitUntilSynced(collections.KrtOpts.Stop)
 	return plugins.PolicyCtx{
 		Krt:         krt.TestingDummyContext{},
 		Collections: collections,
@@ -212,7 +237,7 @@ func BuildMockPolicyContext(t test.Failer, inputs []any) plugins.PolicyCtx {
 		Resolver:    resolver,
 		JWKSLookup: jwks.NewLookup(
 			jwks.NewPersistedEntriesFromCollection(collections.ConfigMaps, jwks.DefaultJwksStorePrefix, collections.SystemNamespace, collections.KrtOpts.ToOptions("jwks/PersistedEntries")...),
-			jwks.NewResolver(resolver, grants, collections.Settings.BackendRefGrantMode),
+			jwksCollections.ResolvedOwners,
 		),
 
 		CredentialResolver: plugins.DefaultCredentialResolverFactory(collections),
@@ -230,6 +255,7 @@ func BuildMockCollection(t test.Failer, inputs []any) *plugins.AgwCollections {
 		Services:             krttest.GetMockCollection[*corev1.Service](mock),
 		Secrets:              krttest.GetMockCollection[*corev1.Secret](mock),
 		ConfigMaps:           krttest.GetMockCollection[*corev1.ConfigMap](mock),
+		ClusterTrustBundles:  krttest.GetMockCollection[*certificatesv1.ClusterTrustBundle](mock),
 		EndpointSlices:       krttest.GetMockCollection[*discovery.EndpointSlice](mock),
 		WorkloadEntries:      krttest.GetMockCollection[*networkingclient.WorkloadEntry](mock),
 		ServiceEntries:       krttest.GetMockCollection[*networkingclient.ServiceEntry](mock),
@@ -242,6 +268,7 @@ func BuildMockCollection(t test.Failer, inputs []any) *plugins.AgwCollections {
 		ReferenceGrants:      krttest.GetMockCollection[*gwv1b1.ReferenceGrant](mock),
 		BackendTLSPolicies:   krttest.GetMockCollection[*gwv1.BackendTLSPolicy](mock),
 		ListenerSets:         krttest.GetMockCollection[*gwv1.ListenerSet](mock),
+		XBackends:            krttest.GetMockCollection[*gwxv1a1.XBackend](mock),
 		InferencePools:       krttest.GetMockCollection[*inf.InferencePool](mock),
 		Backends:             krttest.GetMockCollection[*agwv1alpha1.AgentgatewayBackend](mock),
 		Models:               krttest.GetMockCollection[*agwv1alpha1.AgentgatewayModel](mock),
@@ -273,6 +300,7 @@ func BuildReferenceGrants(collections *plugins.AgwCollections) translator.Refere
 func BuildRemoteHTTPResolver(collections *plugins.AgwCollections) remotehttp.Resolver {
 	return remotehttp.NewResolver(remotehttp.Inputs{
 		ConfigMaps:     collections.ConfigMaps,
+		Secrets:        collections.Secrets,
 		Services:       collections.Services,
 		Backends:       collections.Backends,
 		PolicySelector: policyselection.NewSelector(collections.AgentgatewayPolicies, collections.BackendTLSPolicies),
@@ -280,13 +308,16 @@ func BuildRemoteHTTPResolver(collections *plugins.AgwCollections) remotehttp.Res
 }
 
 func BuildJWKSLookup(collections *plugins.AgwCollections) jwks.Lookup {
-	persistedJWKS := jwks.NewPersistedEntriesFromCollection(collections.ConfigMaps, jwks.DefaultJwksStorePrefix, collections.SystemNamespace)
-	return jwks.NewLookup(
-		persistedJWKS,
-		jwks.NewResolver(
+	persistedJWKS := jwks.NewPersistedEntriesFromCollection(collections.ConfigMaps, jwks.DefaultJwksStorePrefix, collections.SystemNamespace, collections.KrtOpts.ToOptions("jwks/PersistedEntries")...)
+	jwksCollections := jwks.NewCollections(jwks.CollectionInputs{
+		AgentgatewayPolicies: collections.AgentgatewayPolicies,
+		Backends:             collections.Backends,
+		Resolver: jwks.NewResolver(
 			BuildRemoteHTTPResolver(collections),
 			BuildReferenceGrants(collections),
 			collections.Settings.BackendRefGrantMode,
 		),
-	)
+		KrtOpts: collections.KrtOpts,
+	})
+	return jwks.NewLookup(persistedJWKS, jwksCollections.ResolvedOwners)
 }

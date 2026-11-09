@@ -3,7 +3,7 @@ use agent_core::strng;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{RequestType, messages};
+use crate::types::{ContentScope, NormalizedMessage, RequestType, messages};
 use crate::{
 	AIError, InputFormat, LLMRequest, SimpleChatCompletionMessage, logged_response_parsing,
 };
@@ -20,6 +20,12 @@ pub struct Request {
 }
 
 impl RequestType for Request {
+	fn input_format() -> crate::InputFormat {
+		crate::InputFormat::CountTokens
+	}
+	fn body_is_json(&self) -> bool {
+		true
+	}
 	fn model(&mut self) -> &mut Option<String> {
 		&mut self.model
 	}
@@ -44,6 +50,7 @@ impl RequestType for Request {
 			input_format: InputFormat::CountTokens,
 			cache_convention: crate::CacheTokenConvention::pending(),
 			request_model: model,
+			original_model: None,
 			provider,
 			streaming: false,
 			params: Default::default(),
@@ -56,13 +63,17 @@ impl RequestType for Request {
 		messages::get_messages_helper(&self.messages, &self.system)
 	}
 
+	fn get_messages_v2(&self) -> Vec<NormalizedMessage> {
+		messages::get_messages_v2_helper(&self.messages, &self.system)
+	}
+
 	fn set_messages(&mut self, _messages: Vec<SimpleChatCompletionMessage>) {
 		unimplemented!(
 			"set_messages is used for prompt guard; prompt guard is disable for token counting."
 		)
 	}
 
-	fn visit_text_mut(&mut self, _f: &mut dyn FnMut(&mut String)) {
+	fn visit_text_mut(&mut self, _f: &mut dyn FnMut(ContentScope, &mut String)) {
 		unimplemented!(
 			"visit_text_mut is used for prompt guard; prompt guard is disable for token counting."
 		)

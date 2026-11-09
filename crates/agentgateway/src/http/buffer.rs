@@ -1,3 +1,4 @@
+use crate::proxy::ProxyError;
 use crate::*;
 
 #[cfg(test)]
@@ -39,10 +40,7 @@ impl Buffer {
 	/// Applies request body buffering before forwarding.
 	/// No-op when buffering is disabled or for upgrade requests (whose "body" only exists
 	/// post-handshake as the upgraded byte stream).
-	pub async fn apply_to_request(
-		&self,
-		req: &mut crate::http::Request,
-	) -> Result<(), crate::proxy::ProxyResponse> {
+	pub async fn apply_to_request(&self, req: &mut crate::http::Request) -> Result<(), ProxyError> {
 		let Some(request) = self.request.as_ref() else {
 			trace!("request buffering disabled");
 			return Ok(());
@@ -55,22 +53,19 @@ impl Buffer {
 		let limit = request
 			.max_bytes
 			.unwrap_or_else(|| crate::http::buffer_limit(req));
-		let body = std::mem::replace(req.body_mut(), crate::http::Body::empty());
-		let buffered = match buffer_body(body, limit, request.failure_mode).await {
-			Ok(b) => b,
+		match buffer_body(req.body_mut(), limit, request.failure_mode).await {
+			Ok(()) => {},
 			Err(e) => {
 				warn!(limit, error = %e, "failed to buffer request body");
-				let resp = ::http::Response::builder()
-					.status(::http::StatusCode::PAYLOAD_TOO_LARGE)
-					.body(crate::http::Body::empty())
-					.expect("static response builds");
-				return Err(crate::proxy::ProxyResponse::DirectResponse(Box::new(resp)));
+				return Err(ProxyError::RequestBodyBufferFailed(e));
 			},
-		};
-		*req.body_mut() = buffered;
-		req
-			.extensions_mut()
-			.insert(crate::transport::BufferLimit::new(limit));
+		}
+		// Explicit policy limits override the request's default.
+		if let Some(limit) = request.max_bytes {
+			req
+				.extensions_mut()
+				.insert(crate::transport::BufferLimit::new(limit));
+		}
 		Ok(())
 	}
 
@@ -80,7 +75,7 @@ impl Buffer {
 	pub async fn apply_to_response(
 		&self,
 		resp: &mut crate::http::Response,
-	) -> Result<(), crate::proxy::ProxyResponse> {
+	) -> Result<(), ProxyError> {
 		let Some(response) = self.response.as_ref() else {
 			trace!("response buffering disabled");
 			return Ok(());
@@ -93,19 +88,13 @@ impl Buffer {
 		let limit = response
 			.max_bytes
 			.unwrap_or_else(|| crate::http::response_buffer_limit(resp));
-		let body = std::mem::replace(resp.body_mut(), crate::http::Body::empty());
-		let buffered = match buffer_body(body, limit, response.failure_mode).await {
-			Ok(b) => b,
+		match buffer_body(resp.body_mut(), limit, response.failure_mode).await {
+			Ok(()) => {},
 			Err(e) => {
 				warn!(limit, error = %e, "failed to buffer response body");
-				let err = ::http::Response::builder()
-					.status(::http::StatusCode::BAD_GATEWAY)
-					.body(crate::http::Body::empty())
-					.expect("static response builds");
-				return Err(crate::proxy::ProxyResponse::DirectResponse(Box::new(err)));
+				return Err(ProxyError::ResponseBodyBufferFailed(e));
 			},
-		};
-		*resp.body_mut() = buffered;
+		}
 		resp
 			.extensions_mut()
 			.insert(crate::transport::BufferLimit::new(limit));
@@ -116,27 +105,27 @@ impl Buffer {
 
 // Buffers `body` up to `limit`, picking what to do on overflow.
 //
-// `FailClosed` drains the whole body now and fails (so the caller can send a 413/502) if it's bigger than `limit`.
+// `FailClosed` fails (so the caller can send a 413/502) if the body is bigger than `limit`.
 // `FailOpen` buffers up to `limit` and streams the rest.
 async fn buffer_body(
-	body: crate::http::Body,
+	body: &mut crate::http::Body,
 	limit: usize,
 	failure_mode: FailureMode,
-) -> anyhow::Result<crate::http::Body> {
-	match failure_mode {
-		FailureMode::FailClosed => {
-			let b = crate::http::read_body_with_limit(body, limit).await?;
-			debug!(b = b.len(), "buffered body");
-			Ok(crate::http::Body::from(b))
+) -> anyhow::Result<()> {
+	if failure_mode == FailureMode::FailOpen && limit == 0 {
+		return Ok(());
+	}
+	match body.inspect(limit).await? {
+		crate::http::BodyInspection::Complete(body) => {
+			debug!(b = body.len(), "buffered body");
+			Ok(())
 		},
-		FailureMode::FailOpen => {
-			debug!(limit, "buffering up to limit, then streaming the rest");
-			if limit == 0 {
-				return Ok(body);
-			}
-			let mut body = body;
-			let _ = crate::http::inspect_body_with_limit(&mut body, limit).await?;
-			Ok(body)
+		crate::http::BodyInspection::Partial(_) if failure_mode == FailureMode::FailClosed => {
+			anyhow::bail!("body exceeds buffer limit of {limit} bytes")
+		},
+		crate::http::BodyInspection::Partial(_) => {
+			debug!(limit, "buffered up to limit, streaming the rest");
+			Ok(())
 		},
 	}
 }
@@ -147,7 +136,7 @@ impl crate::store::RequestPolicyTrait for Buffer {
 		_client: &crate::proxy::httpproxy::PolicyClient,
 		_log: &mut crate::telemetry::log::RequestLog,
 		req: &mut crate::http::Request,
-	) -> Result<crate::http::PolicyResponse, crate::proxy::ProxyResponse> {
+	) -> Result<crate::http::PolicyResponse, ProxyError> {
 		self.apply_to_request(req).await?;
 		Ok(Default::default())
 	}
@@ -158,7 +147,7 @@ impl crate::store::ResponsePolicyTrait for Buffer {
 		&self,
 		_log: &mut crate::telemetry::log::RequestLog,
 		res: &mut crate::http::Response,
-	) -> Result<crate::http::PolicyResponse, crate::proxy::ProxyResponse> {
+	) -> Result<crate::http::PolicyResponse, ProxyError> {
 		self.apply_to_response(res).await?;
 		Ok(Default::default())
 	}

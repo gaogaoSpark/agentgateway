@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use agent_xds::XdsUpdate;
+use hashbrown::HashMap as HbHashMap;
 use itertools::Itertools;
 use tokio::sync::watch::Sender;
 use tracing::{Level, instrument};
@@ -231,7 +232,7 @@ pub struct WorkloadStore {
 	/// by_addr maps workload network addresses to workloads
 	by_addr: HashMap<NetworkAddress, WorkloadByAddr>,
 	/// by_uid maps workload UIDs to workloads
-	pub(super) by_uid: HashMap<Strng, Arc<Workload>>,
+	pub(super) by_uid: HbHashMap<Strng, Arc<Workload>>,
 }
 
 impl WorkloadStore {
@@ -296,8 +297,12 @@ impl WorkloadStore {
 }
 
 impl WorkloadStore {
+	pub fn find_uid_ref(&self, uid: &Strng) -> Option<&Arc<Workload>> {
+		self.by_uid.get(uid)
+	}
+
 	pub fn find_uid(&self, uid: &Strng) -> Option<Arc<Workload>> {
-		self.by_uid.get(uid).cloned()
+		self.find_uid_ref(uid).cloned()
 	}
 
 	/// Finds the workload by address, as an arc.
@@ -627,11 +632,15 @@ impl StoreUpdater {
 	pub fn new(state: Arc<RwLock<Store>>) -> Self {
 		Self { state }
 	}
-	pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Store> {
-		self.state.read().expect("mutex acquired")
+	#[track_caller]
+	pub fn read(&self) -> crate::store::ReadGuard<'_, Store> {
+		thread_local! {
+			static DISCOVERY_READ_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+		}
+		crate::store::ReadGuard::new(&self.state, &DISCOVERY_READ_DEPTH)
 	}
 	pub fn dump(&self) -> Dump {
-		let store = self.state.read().expect("mutex");
+		let store = self.read();
 		// Services all have hostname, so use that as the key
 		let services: Vec<_> = store
 			.services
@@ -754,10 +763,12 @@ pub struct PreviousState {
 	pub services: HashSet<NamespacedHostname>,
 }
 
+#[serde_with::serde_as]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocalWorkload {
 	#[serde(flatten)]
 	pub workload: Workload,
+	#[serde_as(as = "HashMap<_, HashMap<crate::types::discovery::PortKey, _>>")]
 	pub services: HashMap<String, HashMap<u16, u16>>,
 }

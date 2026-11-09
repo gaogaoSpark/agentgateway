@@ -259,18 +259,6 @@ spec:
         - name: NETWORK
           value: {{ $gateway.istio.network | quote }}
         {{- end }}
-      {{- $catalogPaths := list }}
-      {{- range ($gateway.modelCatalog).sources }}
-      {{- if .configMap }}
-      {{- $catalogPaths = append $catalogPaths (printf "/etc/agentgateway/model-catalog/%s/%s.json" .configMap.name .configMap.name) }}
-      {{- end }}
-      {{- end }}
-      {{- if $catalogPaths }}
-        {{- if not (hasKey $userEnvNames "MODEL_CATALOG_PATHS") }}
-        - name: MODEL_CATALOG_PATHS
-          value: {{ $catalogPaths | join "," | quote }}
-        {{- end }}
-      {{- end }}
       {{- /* User-specified env vars */}}
       {{- with $gateway.env }}
         {{- toYaml . | nindent 8 }}
@@ -303,6 +291,12 @@ spec:
           mountPath: /etc/agentgateway/model-catalog/{{ .configMap.name }}
           readOnly: true
         {{- end }}
+        {{- end }}
+        {{- if hasKey $gateway "spiffe" }}
+        {{- $spiffeSrc := ($gateway.spiffe).source | default dict }}
+        - name: spiffe-workload-api
+          mountPath: {{ $spiffeSrc.mountPath | default "/spiffe-workload-api" | quote }}
+          readOnly: true
         {{- end }}
   volumes:
     - name: config-volume
@@ -346,6 +340,19 @@ spec:
         - key: {{ .configMap.key | default "catalog.json" }}
           path: {{ .configMap.name }}.json
     {{- end }}
+    {{- end }}
+    {{- if hasKey $gateway "spiffe" }}
+    {{- $spiffeSrc := ($gateway.spiffe).source | default dict }}
+    - name: spiffe-workload-api
+      {{- if $spiffeSrc.hostPath }}
+      hostPath:
+        path: {{ $spiffeSrc.hostPath.path | quote }}
+        type: Directory
+      {{- else }}
+      csi:
+        driver: {{ ($spiffeSrc.csi).driver | default "csi.spiffe.io" | quote }}
+        readOnly: true
+      {{- end }}
     {{- end }}
   terminationGracePeriodSeconds: {{($gateway.shutdown).max|default 60|int}}
 {{- end -}}

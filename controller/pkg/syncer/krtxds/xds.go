@@ -55,6 +55,12 @@ var (
 			Name:      "rejects_total",
 			Help:      "Total number of xDS responses rejected by agentgateway proxy",
 		}, nil)
+	xdsWarningsTotal = metrics.NewCounter(
+		metrics.CounterOpts{
+			Subsystem: agentGwXdsSubsystem,
+			Name:      "warnings_total",
+			Help:      "Total number of xDS responses with configuration warnings from agentgateway proxy",
+		}, nil)
 )
 
 type CollectionRegistration struct {
@@ -140,7 +146,7 @@ func PerGatewayCollection[T IntoProto[TT], TT proto.Message](collection krt.Coll
 			if extract != nil {
 				forGateway = new(extract(i))
 			}
-			resource := protoconv.MessageToAny(i.IntoProto())
+			resource := protoconv.MessageToAnyDeterministic(i.IntoProto())
 			return &DiscoveryResource{
 				Resource: &discovery.Resource{
 					Name: getKey(i),
@@ -550,37 +556,50 @@ func (s *DiscoveryServer) processDeltaRequest(req *discovery.DeltaDiscoveryReque
 func shouldRespondDelta(con *Connection, request *discovery.DeltaDiscoveryRequest, nackPublisher *nack.Publisher) bool {
 	stype := GetShortType(request.TypeUrl)
 
-	// If there is an error in request that means previous response is erroneous.
-	// We do not have to respond in that case. In this case request's version info
-	// will be different from the version sent. But it is fragile to rely on that.
+	// Feedback is reported even for an expired nonce: a later response may not have replaced the
+	// resources it describes.
 	if request.ErrorDetail != nil {
 		message := request.ErrorDetail.GetMessage()
 		// nolint: gosec // error side is bounded
 		errCode := codes.Code(request.ErrorDetail.Code)
-		var mlog any
-		if diagnostics, ok := parseNackDiagnostics(message); ok {
-			mlog = diagnostics
-		} else {
-			mlog = message
+		diagnostics, structured := parseNackDiagnostics(message)
+		hasErrors := !structured
+		hasWarnings := false
+		for _, diagnostic := range diagnostics {
+			hasErrors = hasErrors || diagnostic.Error != ""
+			hasWarnings = hasWarnings || diagnostic.Warn != ""
 		}
-		log.Warn("ADS: ACK ERROR", "type", stype, "connection", con.ID(), "code", errCode.String(), "message", mlog)
-		xdsRejectsTotal.Inc()
-		con.proxy.UpdateWatchedResource(request.TypeUrl, func(wr *model.WatchedResource) *model.WatchedResource {
-			wr.LastError = message
-			return wr
-		})
-
-		if nackPublisher != nil {
-			gateway := AgentgatewayID(con.node)
-			nackEvent := nack.NackEvent{
-				Gateway:   gateway,
-				TypeUrl:   request.TypeUrl,
-				ErrorMsg:  message,
-				Timestamp: time.Now(),
+		if hasWarnings {
+			log.Warn("ADS: CONFIG WARNING", "type", stype, "connection", con.ID(), "message", diagnostics)
+			xdsWarningsTotal.Inc()
+			if nackPublisher != nil {
+				nackPublisher.PublishWarning(AgentgatewayID(con.node), message)
 			}
-			nackPublisher.PublishNack(&nackEvent)
 		}
-		return false
+		if hasErrors {
+			var mlog any = message
+			if structured {
+				mlog = diagnostics
+			}
+			log.Warn("ADS: ACK ERROR", "type", stype, "connection", con.ID(), "code", errCode.String(), "message", mlog)
+			xdsRejectsTotal.Inc()
+			con.proxy.UpdateWatchedResource(request.TypeUrl, func(wr *model.WatchedResource) *model.WatchedResource {
+				wr.LastError = message
+				return wr
+			})
+
+			if nackPublisher != nil {
+				gateway := AgentgatewayID(con.node)
+				nackEvent := nack.NackEvent{
+					Gateway:   gateway,
+					TypeUrl:   request.TypeUrl,
+					ErrorMsg:  message,
+					Timestamp: time.Now(),
+				}
+				nackPublisher.PublishNack(&nackEvent)
+			}
+			return false
+		}
 	}
 
 	log.Debug("ADS: REQUEST", "type", stype, "connection", con.ID(), "subscribe", request.ResourceNamesSubscribe, "unsubscribe", request.ResourceNamesUnsubscribe, "initial", request.InitialResourceVersions)
@@ -705,8 +724,7 @@ func (s *DiscoveryServer) pushDeltaXds(con *Connection, w *model.WatchedResource
 		log.Debug("ADS: REMOVE", "type", GetShortType(w.TypeUrl), "node", con.ID(), "removed", resp.RemovedResources)
 	}
 
-	configSize := ResourceSize(res)
-	//configSizeBytes.With(typeTag.Value(w.TypeUrl)).Record(float64(configSize))
+	configSize := ResourceSize(resp)
 
 	if err := con.sendDelta(resp); err != nil {
 		log.Debug("send failure", "type", GetShortType(w.TypeUrl), "node", con.proxy.ID, "resources", len(res), "size", ByteCount(configSize), "error", err)
@@ -1388,12 +1406,20 @@ func (node *Proxy) DeepCloneWatchedResources() map[string]model.WatchedResource 
 	return m
 }
 
-func ResourceSize(r model.Resources) int {
-	// Approximate size by looking at the Any marshaled size. This avoids high cost
-	// proto.Size, at the expense of slightly under counting.
-	size := 0
-	for _, r := range r {
-		size += len(r.Resource.Value)
+func ResourceSize(resp *discovery.DeltaDiscoveryResponse) int {
+	// Approximate size using payload and string lengths, excluding protobuf framing.
+	size := len(resp.TypeUrl) + len(resp.SystemVersionInfo) + len(resp.Nonce)
+	for _, r := range resp.Resources {
+		size += len(r.GetName()) + len(r.GetVersion())
+		for _, alias := range r.GetAliases() {
+			size += len(alias)
+		}
+		if resource := r.GetResource(); resource != nil {
+			size += len(resource.TypeUrl) + len(resource.Value)
+		}
+	}
+	for _, name := range resp.RemovedResources {
+		size += len(name)
 	}
 	return size
 }

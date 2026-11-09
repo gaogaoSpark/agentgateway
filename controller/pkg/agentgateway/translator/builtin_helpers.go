@@ -6,6 +6,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/durationpb"
 	"istio.io/istio/pkg/ptr"
+	infv1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/agentgateway/agentgateway/api"
@@ -81,7 +82,7 @@ func ApplyRetries(rule *gwv1.HTTPRouteRule, route *api.Route) error {
 	}
 	if rule.Retry.Attempts != nil {
 		// Agentgateway stores this as a u8 so has a max of 255
-		tpRetry.Attempts = int32(min(*rule.Retry.Attempts, 255)) //nolint:gosec // G115: kubebuilder validation ensures 0 <= value, safe for int32
+		tpRetry.Attempts = new(int32(min(*rule.Retry.Attempts, 255))) //nolint:gosec // G115: kubebuilder validation ensures 0 <= value, safe for int32
 	}
 	route.TrafficPolicies = append(route.TrafficPolicies, &api.TrafficPolicySpec{
 		Kind: &api.TrafficPolicySpec_Retry{
@@ -108,6 +109,10 @@ func GetStatus[I, IS any](spec I) IS {
 	case *agentgateway.AgentgatewayPolicy:
 		return any(t.Status).(IS)
 	case *agentgateway.AgentgatewayBackend:
+		return any(t.Status).(IS)
+	case *agentgateway.AgentgatewayModel:
+		return any(t.Status).(IS)
+	case *infv1.InferencePool:
 		return any(t.Status).(IS)
 	default:
 		// For external resources (registered via extraGVKs), we don't introspect the object here.

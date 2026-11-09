@@ -1,1012 +1,1321 @@
+import { dump } from 'js-yaml';
 import {
-  AlertTriangle,
-  CheckCircle2,
-  ChevronDown,
-  HelpCircle,
-  Info,
-  Loader2,
-  X,
-  XCircle,
-} from "lucide-react";
-import yaml from "js-yaml";
-import {
-  useEffect,
-  useId,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+	AlertTriangle,
+	CheckCircle2,
+	ChevronDown,
+	Code,
+	HelpCircle,
+	Info,
+	Loader2,
+	X,
+	XCircle
+} from 'lucide-react';
 import type {
-  CSSProperties,
-  KeyboardEvent as ReactKeyboardEvent,
-  MouseEvent as ReactMouseEvent,
-  ReactNode,
-} from "react";
+	CSSProperties,
+	ReactElement,
+	KeyboardEvent as ReactKeyboardEvent,
+	MouseEvent as ReactMouseEvent,
+	ReactNode
+} from 'react';
+import {
+	cloneElement,
+	createContext,
+	useCallback,
+	useContext,
+	useEffect,
+	useId,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState
+} from 'react';
+
+import { SchemaHelpPanel } from '@/components/SchemaHelpPanel';
+import { parseSchemaYamlEditorValue, SchemaYamlEditor } from '@/components/SchemaYamlEditor';
+import {
+	type ConfigValueError,
+	configSchemaNode,
+	configValueError,
+	configValueErrors,
+	schemaRequires
+} from '@/configValidation';
+import { useSchemaHelp } from '@/schemaHelp';
 
 const drawerStack: symbol[] = [];
 
-export function PageHeader(props: {
-  title: string;
-  description?: string;
-  actions?: ReactNode;
+// Lets a drawer's form edit its value as raw YAML instead.
+export type DrawerRaw = {
+	// Config schema node for the value, such as ['$defs', 'LocalLLMVirtualModel'].
+	// Only edits valid against it reach the form.
+	schemaPath: string[];
+	// The form's current value, or undefined while the form is invalid.
+	value: () => unknown;
+	// Raw mode opened with `value`.
+	onOpen?: (value: unknown) => void;
+	// Each valid raw edit. The form reloads from the last one when raw mode closes.
+	onChange: (value: unknown) => void;
+	// The value of a blank form. Clearing the raw text loads it, so the form can
+	// start over.
+	empty?: unknown;
+};
+
+// Provided by a drawer with raw mode; pins it to raw with a reason.
+export const PinRawContext = createContext<((reason: string) => void) | null>(null);
+
+// Checks a drawer's form value against its config schema before saving: false
+// (with the errors shown on the form) when it is invalid.
+export const DrawerCheckContext = createContext<(() => boolean) | null>(null);
+
+// A drawer footer's primary button, which checks the form first (see
+// DrawerCheckContext).
+export function DrawerSaveButton(props: {
+	disabled?: boolean;
+	onClick: () => void;
+	children: ReactNode;
 }) {
-  return (
-    <div className="page-header">
-      <div>
-        <h2>{props.title}</h2>
-        {props.description ? <p>{props.description}</p> : null}
-      </div>
-      {props.actions ? (
-        <div className="page-actions">{props.actions}</div>
-      ) : null}
-    </div>
-  );
+	const check = useContext(DrawerCheckContext);
+	return (
+		<button
+			className="button primary"
+			type="button"
+			disabled={props.disabled}
+			onClick={() => {
+				if (!check || check()) props.onClick();
+			}}
+		>
+			{props.children}
+		</button>
+	);
+}
+
+// Schema errors for a drawer's form, which Field and FieldGroup show for their
+// `path`.
+const FieldErrorsContext = createContext<{
+	schemaPath: string[];
+	// Errors for the current value once a save was attempted; null before.
+	errors: () => ConfigValueError[] | null;
+	register: (path: string) => () => void;
+	// Fields the form needs that are empty (see Field's `missing`).
+	missing: Set<symbol>;
+} | null>(null);
+
+// Forms hold unset text fields as '' (or whitespace), which the schema would
+// accept as set. Only the check sees this; the saved value is unchanged.
+function withoutEmptyStrings(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(withoutEmptyStrings);
+	if (!value || typeof value !== 'object') return value;
+	return Object.fromEntries(
+		Object.entries(value).flatMap(([key, item]) =>
+			typeof item === 'string' && !item.trim() ? [] : [[key, withoutEmptyStrings(item)]]
+		)
+	);
+}
+
+function pathsOverlap(error: string, field: string) {
+	return (
+		error !== '' &&
+		(error === field || error.startsWith(`${field}.`) || field.startsWith(`${error}.`))
+	);
+}
+
+function useFieldError(path: string | undefined, missing: boolean | undefined) {
+	const context = useContext(FieldErrorsContext);
+	const [id] = useState(() => Symbol('field'));
+	useLayoutEffect(() => (path && context ? context.register(path) : undefined), [context, path]);
+	useLayoutEffect(() => {
+		if (!context || !missing) return;
+		context.missing.add(id);
+		return () => {
+			context.missing.delete(id);
+		};
+	}, [context, missing, id]);
+	if (!context) return { required: false, error: undefined };
+	const errors = context.errors();
+	return {
+		required: missing !== undefined || (path ? schemaRequires(context.schemaPath, path) : false),
+		error:
+			(path ? errors?.find(error => pathsOverlap(error.path, path))?.message : undefined) ??
+			(errors && missing ? 'Required' : undefined)
+	};
+}
+
+export function PageHeader(props: { title: string; description?: string; actions?: ReactNode }) {
+	return (
+		<div className="page-header">
+			<div>
+				<h2>{props.title}</h2>
+				{props.description ? <p>{props.description}</p> : null}
+			</div>
+			{props.actions ? <div className="page-actions">{props.actions}</div> : null}
+		</div>
+	);
 }
 
 export function Panel(props: { children: ReactNode; className?: string }) {
-  return (
-    <section className={props.className ? `panel ${props.className}` : "panel"}>
-      {props.children}
-    </section>
-  );
+	return (
+		<section className={props.className ? `panel ${props.className}` : 'panel'}>
+			{props.children}
+		</section>
+	);
 }
 
-export function useDismissiblePopover<T extends HTMLElement>(
-  open: boolean,
-  onClose: () => void,
-) {
-  const ref = useRef<T>(null);
+export function useDismissiblePopover<T extends HTMLElement>(open: boolean, onClose: () => void) {
+	const ref = useRef<T>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    function onPointerDown(event: PointerEvent) {
-      if (!ref.current?.contains(event.target as Node)) onClose();
-    }
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") onClose();
-    }
-    document.addEventListener("pointerdown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("pointerdown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open, onClose]);
+	useEffect(() => {
+		if (!open) return;
+		function onPointerDown(event: PointerEvent) {
+			if (!ref.current?.contains(event.target as Node)) onClose();
+		}
+		function onKeyDown(event: KeyboardEvent) {
+			if (event.key === 'Escape') onClose();
+		}
+		document.addEventListener('pointerdown', onPointerDown);
+		document.addEventListener('keydown', onKeyDown);
+		return () => {
+			document.removeEventListener('pointerdown', onPointerDown);
+			document.removeEventListener('keydown', onKeyDown);
+		};
+	}, [open, onClose]);
 
-  return ref;
+	return ref;
+}
+
+// Horizontal space a menu can use: the viewport, narrowed by any ancestor that clips it.
+function dropdownMenuBounds(menu: HTMLElement) {
+	const margin = 8;
+	let left = margin;
+	let right = document.documentElement.clientWidth - margin;
+	for (
+		let element = menu.parentElement;
+		element && element !== document.body;
+		element = element.parentElement
+	) {
+		const style = getComputedStyle(element);
+		if (style.overflowX !== 'visible') {
+			const start = element.getBoundingClientRect().left + element.clientLeft;
+			left = Math.max(left, start + margin);
+			right = Math.min(right, start + element.clientWidth - margin);
+		}
+		// Ancestors of a fixed element don't clip it.
+		if (style.position === 'fixed') break;
+	}
+	return { left, right };
+}
+
+// Fits the menu to its longest option and keeps it in bounds. The width only grows, so the menu
+// doesn't resize as a search narrows the options.
+function fitDropdownMenu(menu: HTMLElement) {
+	const currentWidth = Number.parseFloat(menu.style.width) || 0;
+	menu.style.width = '';
+	menu.style.left = '';
+	const bounds = dropdownMenuBounds(menu);
+	const width = Math.max(menu.getBoundingClientRect().width, currentWidth);
+	menu.style.width = `${Math.ceil(Math.min(width, bounds.right - bounds.left))}px`;
+	const rect = menu.getBoundingClientRect();
+	const shift = Math.min(0, Math.max(bounds.right - rect.right, bounds.left - rect.left));
+	if (shift) menu.style.left = `${shift}px`;
 }
 
 export function Dropdown(props: {
-  value: string;
-  options: Array<{
-    value: string;
-    label: ReactNode;
-    description?: ReactNode;
-    icon?: ReactNode;
-    searchText?: string;
-  }>;
-  onChange: (value: string) => void;
-  ariaLabel: string;
-  placeholder?: ReactNode;
-  searchable?: boolean;
-  className?: string;
-  allowEmpty?: boolean;
-  disabled?: boolean;
+	value: string;
+	options: Array<{
+		value: string;
+		label: ReactNode;
+		description?: ReactNode;
+		icon?: ReactNode;
+		searchText?: string;
+	}>;
+	onChange: (value: string) => void;
+	id?: string;
+	ariaLabel: string;
+	placeholder?: ReactNode;
+	searchable?: boolean;
+	className?: string;
+	allowEmpty?: boolean;
+	disabled?: boolean;
 }) {
-  const id = useId();
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
-  const [activeIndex, setActiveIndex] = useState(0);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const searchRef = useRef<HTMLInputElement>(null);
-  const optionRefs = useRef<Array<HTMLDivElement | null>>([]);
-  const typeaheadRef = useRef("");
-  const typeaheadTimerRef = useRef<number | null>(null);
-  const selected =
-    props.options.find((option) => option.value === props.value) ??
-    (props.allowEmpty ? undefined : props.options[0]);
-  const filteredOptions = useMemo(() => {
-    if (!props.searchable || !query.trim()) return props.options;
-    const normalized = query.trim().toLowerCase();
-    return props.options.filter((option) =>
-      optionSearchText(option).includes(normalized),
-    );
-  }, [props.options, props.searchable, query]);
-  const activeOption = open ? filteredOptions[activeIndex] : undefined;
-  const activeOptionId = activeOption
-    ? `${id}-option-${activeIndex}`
-    : undefined;
+	const id = useId();
+	const [open, setOpen] = useState(false);
+	const [query, setQuery] = useState('');
+	const [activeIndex, setActiveIndex] = useState(0);
+	const containerRef = useRef<HTMLDivElement>(null);
+	const triggerRef = useRef<HTMLButtonElement>(null);
+	const menuRef = useRef<HTMLDivElement>(null);
+	const searchRef = useRef<HTMLInputElement>(null);
+	const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+	const typeaheadRef = useRef('');
+	const typeaheadTimerRef = useRef<number | null>(null);
+	const selected =
+		props.options.find(option => option.value === props.value) ??
+		(props.allowEmpty ? undefined : props.options[0]);
+	const filteredOptions = useMemo(() => {
+		if (!props.searchable || !query.trim()) return props.options;
+		const normalized = query.trim().toLowerCase();
+		return props.options.filter(option => optionSearchText(option).includes(normalized));
+	}, [props.options, props.searchable, query]);
+	const activeOption = open ? filteredOptions[activeIndex] : undefined;
+	const activeOptionId = activeOption ? `${id}-option-${activeIndex}` : undefined;
 
-  useEffect(() => {
-    if (open && props.searchable) searchRef.current?.focus();
-    if (!open) setQuery("");
-  }, [open, props.searchable]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: refit when the rendered options change.
+	useLayoutEffect(() => {
+		if (open && menuRef.current) fitDropdownMenu(menuRef.current);
+	}, [open, filteredOptions]);
 
-  useEffect(
-    () => () => {
-      if (typeaheadTimerRef.current)
-        window.clearTimeout(typeaheadTimerRef.current);
-    },
-    [],
-  );
+	useEffect(() => {
+		if (open && props.searchable) searchRef.current?.focus();
+		if (!open) setQuery('');
+	}, [open, props.searchable]);
 
-  useEffect(() => {
-    const selectedIndex = filteredOptions.findIndex(
-      (option) => option.value === selected?.value,
-    );
-    setActiveIndex(selectedIndex >= 0 ? selectedIndex : 0);
-  }, [filteredOptions, selected?.value]);
+	useEffect(
+		() => () => {
+			if (typeaheadTimerRef.current) window.clearTimeout(typeaheadTimerRef.current);
+		},
+		[]
+	);
 
-  useEffect(() => {
-    if (!open) return;
-    optionRefs.current[activeIndex]?.scrollIntoView({ block: "nearest" });
-  }, [activeIndex, open]);
+	useEffect(() => {
+		const selectedIndex = filteredOptions.findIndex(option => option.value === selected?.value);
+		setActiveIndex(selectedIndex >= 0 ? selectedIndex : 0);
+	}, [filteredOptions, selected?.value]);
 
-  function selectOption(option: { value: string } | undefined) {
-    if (!option) return;
-    props.onChange(option.value);
-    setOpen(false);
-    window.requestAnimationFrame(() => triggerRef.current?.focus());
-  }
+	useEffect(() => {
+		if (!open) return;
+		optionRefs.current[activeIndex]?.scrollIntoView({ block: 'nearest' });
+	}, [activeIndex, open]);
 
-  function openAtSelected() {
-    const selectedIndex = filteredOptions.findIndex(
-      (option) => option.value === selected?.value,
-    );
-    setActiveIndex(selectedIndex >= 0 ? selectedIndex : 0);
-    setOpen(true);
-  }
+	function selectOption(option: { value: string } | undefined) {
+		if (!option) return;
+		props.onChange(option.value);
+		setOpen(false);
+		window.requestAnimationFrame(() => triggerRef.current?.focus());
+	}
 
-  function moveActive(delta: number) {
-    setActiveIndex((current) => {
-      if (!filteredOptions.length) return 0;
-      return (
-        (current + delta + filteredOptions.length) % filteredOptions.length
-      );
-    });
-  }
+	function openAtSelected() {
+		const selectedIndex = filteredOptions.findIndex(option => option.value === selected?.value);
+		setActiveIndex(selectedIndex >= 0 ? selectedIndex : 0);
+		setOpen(true);
+	}
 
-  function setActiveBoundary(position: "first" | "last") {
-    setActiveIndex(
-      position === "first" ? 0 : Math.max(filteredOptions.length - 1, 0),
-    );
-  }
+	function moveActive(delta: number) {
+		setActiveIndex(current => {
+			if (!filteredOptions.length) return 0;
+			return (current + delta + filteredOptions.length) % filteredOptions.length;
+		});
+	}
 
-  function clearTypeaheadLater() {
-    if (typeaheadTimerRef.current)
-      window.clearTimeout(typeaheadTimerRef.current);
-    typeaheadTimerRef.current = window.setTimeout(() => {
-      typeaheadRef.current = "";
-    }, 700);
-  }
+	function setActiveBoundary(position: 'first' | 'last') {
+		setActiveIndex(position === 'first' ? 0 : Math.max(filteredOptions.length - 1, 0));
+	}
 
-  function runTypeahead(key: string) {
-    if (!key.trim()) return;
-    const nextQuery = `${typeaheadRef.current}${key}`.toLowerCase();
-    typeaheadRef.current = nextQuery;
-    clearTypeaheadLater();
-    const options = props.searchable ? filteredOptions : props.options;
-    if (!options.length) return;
-    const current = open
-      ? activeIndex
-      : options.findIndex((option) => option.value === selected?.value);
-    const start = current >= 0 ? current + 1 : 0;
-    const ordered = [...options.slice(start), ...options.slice(0, start)];
-    const match = ordered.find(
-      (option) =>
-        optionSearchText(option).startsWith(nextQuery) ||
-        optionSearchText(option).includes(` ${nextQuery}`),
-    );
-    if (!match) return;
-    const index = options.findIndex((option) => option.value === match.value);
-    if (index >= 0) {
-      setActiveIndex(index);
-      setOpen(true);
-    }
-  }
+	function clearTypeaheadLater() {
+		if (typeaheadTimerRef.current) window.clearTimeout(typeaheadTimerRef.current);
+		typeaheadTimerRef.current = window.setTimeout(() => {
+			typeaheadRef.current = '';
+		}, 700);
+	}
 
-  function onComboboxKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
-    if (event.altKey || event.ctrlKey || event.metaKey) return;
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      if (!open) openAtSelected();
-      else moveActive(1);
-      return;
-    }
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      if (!open) openAtSelected();
-      else moveActive(-1);
-      return;
-    }
-    if (event.key === "Home" && open) {
-      event.preventDefault();
-      setActiveBoundary("first");
-      return;
-    }
-    if (event.key === "End" && open) {
-      event.preventDefault();
-      setActiveBoundary("last");
-      return;
-    }
-    if (event.key === "Enter") {
-      event.preventDefault();
-      if (open) selectOption(filteredOptions[activeIndex]);
-      else openAtSelected();
-      return;
-    }
-    if (event.key === " ") {
-      if (props.searchable && document.activeElement === searchRef.current)
-        return;
-      event.preventDefault();
-      if (open) selectOption(filteredOptions[activeIndex]);
-      else openAtSelected();
-      return;
-    }
-    if (event.key === "Escape") {
-      if (!open) return;
-      event.preventDefault();
-      setOpen(false);
-      triggerRef.current?.focus();
-      return;
-    }
-    if (
-      event.key.length === 1 &&
-      props.searchable &&
-      document.activeElement !== searchRef.current
-    ) {
-      event.preventDefault();
-      typeaheadRef.current = "";
-      setQuery(event.key);
-      setOpen(true);
-      return;
-    }
-    if (event.key.length === 1 && !props.searchable) {
-      runTypeahead(event.key);
-    }
-  }
+	function runTypeahead(key: string) {
+		if (!key.trim()) return;
+		const nextQuery = `${typeaheadRef.current}${key}`.toLowerCase();
+		typeaheadRef.current = nextQuery;
+		clearTypeaheadLater();
+		const options = props.searchable ? filteredOptions : props.options;
+		if (!options.length) return;
+		const current = open
+			? activeIndex
+			: options.findIndex(option => option.value === selected?.value);
+		const start = current >= 0 ? current + 1 : 0;
+		const ordered = [...options.slice(start), ...options.slice(0, start)];
+		const match = ordered.find(
+			option =>
+				optionSearchText(option).startsWith(nextQuery) ||
+				optionSearchText(option).includes(` ${nextQuery}`)
+		);
+		if (!match) return;
+		const index = options.findIndex(option => option.value === match.value);
+		if (index >= 0) {
+			setActiveIndex(index);
+			setOpen(true);
+		}
+	}
 
-  return (
-    <div
-      className={["custom-select", props.className].filter(Boolean).join(" ")}
-      onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
-      }}
-    >
-      <button
-        className="custom-select-trigger"
-        type="button"
-        role="combobox"
-        ref={triggerRef}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        aria-controls={`${id}-listbox`}
-        aria-activedescendant={activeOptionId}
-        aria-label={props.ariaLabel}
-        disabled={props.disabled}
-        onClick={() => setOpen((current) => !current)}
-        onKeyDown={onComboboxKeyDown}
-      >
-        {selected ? (
-          <DropdownOptionContent option={selected} />
-        ) : (
-          <span className="muted">{props.placeholder ?? "No options"}</span>
-        )}
-        <ChevronDown size={16} />
-      </button>
-      {open ? (
-        <div
-          className="custom-select-menu"
-          role="listbox"
-          id={`${id}-listbox`}
-          aria-label={props.ariaLabel}
-        >
-          {props.searchable ? (
-            <input
-              className="custom-select-search"
-              ref={searchRef}
-              role="combobox"
-              aria-expanded={open}
-              aria-controls={`${id}-listbox`}
-              aria-activedescendant={activeOptionId}
-              aria-label={`Search ${props.ariaLabel}`}
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={onComboboxKeyDown}
-              placeholder={`Search ${props.ariaLabel.toLowerCase()}...`}
-            />
-          ) : null}
-          {filteredOptions.map((option, index) => (
-            <div
-              className={[
-                "custom-select-option",
-                index === activeIndex ? "active" : null,
-                option.value === selected?.value ? "selected" : null,
-              ]
-                .filter(Boolean)
-                .join(" ")}
-              role="option"
-              aria-selected={option.value === selected?.value}
-              id={`${id}-option-${index}`}
-              key={option.value}
-              ref={(node) => {
-                optionRefs.current[index] = node;
-              }}
-              tabIndex={-1}
-              onMouseEnter={() => setActiveIndex(index)}
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => selectOption(option)}
-            >
-              <DropdownOptionContent option={option} showDescription />
-            </div>
-          ))}
-          {filteredOptions.length === 0 ? (
-            <div className="custom-select-empty">No matches</div>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-  );
+	function onComboboxKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+		if (event.altKey || event.ctrlKey || event.metaKey) return;
+		if (event.key === 'ArrowDown') {
+			event.preventDefault();
+			if (!open) openAtSelected();
+			else moveActive(1);
+			return;
+		}
+		if (event.key === 'ArrowUp') {
+			event.preventDefault();
+			if (!open) openAtSelected();
+			else moveActive(-1);
+			return;
+		}
+		if (event.key === 'Home' && open) {
+			event.preventDefault();
+			setActiveBoundary('first');
+			return;
+		}
+		if (event.key === 'End' && open) {
+			event.preventDefault();
+			setActiveBoundary('last');
+			return;
+		}
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			if (open) selectOption(filteredOptions[activeIndex]);
+			else openAtSelected();
+			return;
+		}
+		if (event.key === ' ') {
+			if (props.searchable && document.activeElement === searchRef.current) return;
+			event.preventDefault();
+			if (open) selectOption(filteredOptions[activeIndex]);
+			else openAtSelected();
+			return;
+		}
+		if (event.key === 'Escape') {
+			if (!open) return;
+			event.preventDefault();
+			setOpen(false);
+			triggerRef.current?.focus();
+			return;
+		}
+		if (
+			event.key.length === 1 &&
+			props.searchable &&
+			document.activeElement !== searchRef.current
+		) {
+			event.preventDefault();
+			typeaheadRef.current = '';
+			setQuery(event.key);
+			setOpen(true);
+			return;
+		}
+		if (event.key.length === 1 && !props.searchable) {
+			runTypeahead(event.key);
+		}
+	}
+
+	return (
+		<div
+			className={['custom-select', props.className].filter(Boolean).join(' ')}
+			ref={containerRef}
+		>
+			<button
+				className="custom-select-trigger"
+				type="button"
+				role="combobox"
+				ref={triggerRef}
+				id={props.id}
+				aria-haspopup="listbox"
+				aria-expanded={open}
+				aria-controls={`${id}-listbox`}
+				aria-activedescendant={activeOptionId}
+				aria-label={props.ariaLabel}
+				disabled={props.disabled}
+				onBlur={event => {
+					if (!containerRef.current?.contains(event.relatedTarget)) setOpen(false);
+				}}
+				onClick={() => setOpen(current => !current)}
+				onKeyDown={onComboboxKeyDown}
+			>
+				{selected ? (
+					<DropdownOptionContent option={selected} />
+				) : (
+					<span className="muted">{props.placeholder ?? 'No options'}</span>
+				)}
+				<ChevronDown size={16} />
+			</button>
+			{open ? (
+				<div
+					className="custom-select-menu"
+					ref={menuRef}
+					role="listbox"
+					id={`${id}-listbox`}
+					aria-label={props.ariaLabel}
+				>
+					{props.searchable ? (
+						<input
+							className="custom-select-search"
+							ref={searchRef}
+							role="combobox"
+							aria-expanded={open}
+							aria-controls={`${id}-listbox`}
+							aria-activedescendant={activeOptionId}
+							aria-label={`Search ${props.ariaLabel}`}
+							value={query}
+							onBlur={event => {
+								if (!containerRef.current?.contains(event.relatedTarget)) setOpen(false);
+							}}
+							onChange={event => setQuery(event.target.value)}
+							onKeyDown={onComboboxKeyDown}
+							placeholder={`Search ${props.ariaLabel.toLowerCase()}...`}
+						/>
+					) : null}
+					{filteredOptions.map((option, index) => (
+						<button
+							type="button"
+							className={[
+								'custom-select-option',
+								index === activeIndex ? 'active' : null,
+								option.value === selected?.value ? 'selected' : null
+							]
+								.filter(Boolean)
+								.join(' ')}
+							role="option"
+							aria-selected={option.value === selected?.value}
+							id={`${id}-option-${index}`}
+							key={option.value}
+							ref={node => {
+								optionRefs.current[index] = node;
+							}}
+							tabIndex={-1}
+							onMouseEnter={() => setActiveIndex(index)}
+							onMouseDown={event => event.preventDefault()}
+							onClick={() => selectOption(option)}
+						>
+							<DropdownOptionContent option={option} showDescription />
+						</button>
+					))}
+					{filteredOptions.length === 0 ? (
+						<div className="custom-select-empty">No matches</div>
+					) : null}
+				</div>
+			) : null}
+		</div>
+	);
 }
 
 function DropdownOptionContent(props: {
-  option: { label: ReactNode; description?: ReactNode; icon?: ReactNode };
-  showDescription?: boolean;
+	option: { label: ReactNode; description?: ReactNode; icon?: ReactNode };
+	showDescription?: boolean;
 }) {
-  return (
-    <span className="custom-select-value">
-      {props.option.icon}
-      <span className="custom-select-copy">
-        <span>{props.option.label}</span>
-        {props.showDescription && props.option.description ? (
-          <small>{props.option.description}</small>
-        ) : null}
-      </span>
-    </span>
-  );
+	return (
+		<span className="custom-select-value">
+			{props.option.icon}
+			<span className="custom-select-copy">
+				<span>{props.option.label}</span>
+				{props.showDescription && props.option.description ? (
+					<small>{props.option.description}</small>
+				) : null}
+			</span>
+		</span>
+	);
 }
 
 function optionSearchText(option: {
-  value: string;
-  label: ReactNode;
-  description?: ReactNode;
-  searchText?: string;
+	value: string;
+	label: ReactNode;
+	description?: ReactNode;
+	searchText?: string;
 }) {
-  const label =
-    typeof option.label === "string" || typeof option.label === "number"
-      ? String(option.label)
-      : "";
-  const description =
-    typeof option.description === "string" ||
-    typeof option.description === "number"
-      ? String(option.description)
-      : "";
-  return `${option.searchText ?? ""} ${option.value} ${label} ${description}`.toLowerCase();
+	const label =
+		typeof option.label === 'string' || typeof option.label === 'number'
+			? String(option.label)
+			: '';
+	const description =
+		typeof option.description === 'string' || typeof option.description === 'number'
+			? String(option.description)
+			: '';
+	return `${option.searchText ?? ''} ${option.value} ${label} ${description}`.toLowerCase();
 }
 
 export function SegmentedControl<T extends string>(props: {
-  value: T;
-  options: Array<{ value: T; label: ReactNode; description?: ReactNode }>;
-  onChange: (value: T) => void;
-  ariaLabel: string;
-  className?: string;
+	value: T;
+	options: Array<{ value: T; label: ReactNode; description?: ReactNode }>;
+	onChange: (value: T) => void;
+	ariaLabel: string;
+	className?: string;
 }) {
-  return (
-    <div
-      className={["segmented-control", props.className]
-        .filter(Boolean)
-        .join(" ")}
-      role="radiogroup"
-      aria-label={props.ariaLabel}
-    >
-      {props.options.map((option) => (
-        <button
-          className={option.value === props.value ? "active" : ""}
-          type="button"
-          role="radio"
-          aria-checked={option.value === props.value}
-          key={option.value}
-          onClick={() => props.onChange(option.value)}
-        >
-          <span>{option.label}</span>
-          {option.description ? <small>{option.description}</small> : null}
-        </button>
-      ))}
-    </div>
-  );
+	return (
+		<fieldset
+			className={['segmented-control', props.className].filter(Boolean).join(' ')}
+			aria-label={props.ariaLabel}
+		>
+			{props.options.map(option => (
+				<button
+					className={option.value === props.value ? 'active' : ''}
+					type="button"
+					aria-pressed={option.value === props.value}
+					key={option.value}
+					onClick={() => props.onChange(option.value)}
+				>
+					<span>{option.label}</span>
+					{option.description ? <small>{option.description}</small> : null}
+				</button>
+			))}
+		</fieldset>
+	);
 }
 
 export function Tooltip(props: {
-  content: ReactNode;
-  children: ReactNode;
-  side?: "top" | "right" | "bottom" | "left";
+	content: ReactNode;
+	children: ReactNode;
+	side?: 'top' | 'right' | 'bottom' | 'left';
 }) {
-  const id = useId();
-  const anchorRef = useRef<HTMLSpanElement>(null);
-  const popoverRef = useRef<HTMLSpanElement>(null);
-  const [open, setOpen] = useState(false);
-  const [style, setStyle] = useState<CSSProperties>({
-    left: 0,
-    top: 0,
-    visibility: "hidden",
-  });
+	const id = useId();
+	const anchorRef = useRef<HTMLSpanElement>(null);
+	const popoverRef = useRef<HTMLSpanElement>(null);
+	const [open, setOpen] = useState(false);
+	const [style, setStyle] = useState<CSSProperties>({
+		left: 0,
+		top: 0,
+		visibility: 'hidden'
+	});
 
-  useLayoutEffect(() => {
-    if (!open) return;
+	useLayoutEffect(() => {
+		if (!open) return;
 
-    function updatePosition() {
-      const anchor = anchorRef.current;
-      const popover = popoverRef.current;
-      if (!anchor || !popover) return;
+		function updatePosition() {
+			const anchor = anchorRef.current;
+			const popover = popoverRef.current;
+			if (!anchor || !popover) return;
 
-      const anchorRect = anchor.getBoundingClientRect();
-      const popoverRect = popover.getBoundingClientRect();
-      const gap = 8;
-      const margin = 8;
-      const viewportWidth = window.innerWidth;
-      const viewportHeight = window.innerHeight;
+			const anchorRect = anchor.getBoundingClientRect();
+			const popoverRect = popover.getBoundingClientRect();
+			const gap = 8;
+			const margin = 8;
+			const viewportWidth = window.innerWidth;
+			const viewportHeight = window.innerHeight;
 
-      const candidates = orderedSides(props.side ?? "top").map((side) => {
-        if (side === "top") {
-          return {
-            side,
-            left:
-              anchorRect.left + anchorRect.width / 2 - popoverRect.width / 2,
-            top: anchorRect.top - popoverRect.height - gap,
-          };
-        }
-        if (side === "bottom") {
-          return {
-            side,
-            left:
-              anchorRect.left + anchorRect.width / 2 - popoverRect.width / 2,
-            top: anchorRect.bottom + gap,
-          };
-        }
-        if (side === "right") {
-          return {
-            side,
-            left: anchorRect.right + gap,
-            top:
-              anchorRect.top + anchorRect.height / 2 - popoverRect.height / 2,
-          };
-        }
-        return {
-          side,
-          left: anchorRect.left - popoverRect.width - gap,
-          top: anchorRect.top + anchorRect.height / 2 - popoverRect.height / 2,
-        };
-      });
+			const candidates = orderedSides(props.side ?? 'top').map(side => {
+				if (side === 'top') {
+					return {
+						side,
+						left: anchorRect.left + anchorRect.width / 2 - popoverRect.width / 2,
+						top: anchorRect.top - popoverRect.height - gap
+					};
+				}
+				if (side === 'bottom') {
+					return {
+						side,
+						left: anchorRect.left + anchorRect.width / 2 - popoverRect.width / 2,
+						top: anchorRect.bottom + gap
+					};
+				}
+				if (side === 'right') {
+					return {
+						side,
+						left: anchorRect.right + gap,
+						top: anchorRect.top + anchorRect.height / 2 - popoverRect.height / 2
+					};
+				}
+				return {
+					side,
+					left: anchorRect.left - popoverRect.width - gap,
+					top: anchorRect.top + anchorRect.height / 2 - popoverRect.height / 2
+				};
+			});
 
-      const fitting =
-        candidates.find(
-          (candidate) =>
-            candidate.left >= margin &&
-            candidate.top >= margin &&
-            candidate.left + popoverRect.width <= viewportWidth - margin &&
-            candidate.top + popoverRect.height <= viewportHeight - margin,
-        ) ?? candidates[0];
+			const fitting =
+				candidates.find(
+					candidate =>
+						candidate.left >= margin &&
+						candidate.top >= margin &&
+						candidate.left + popoverRect.width <= viewportWidth - margin &&
+						candidate.top + popoverRect.height <= viewportHeight - margin
+				) ?? candidates[0];
 
-      setStyle({
-        left: clamp(
-          fitting.left,
-          margin,
-          viewportWidth - popoverRect.width - margin,
-        ),
-        top: clamp(
-          fitting.top,
-          margin,
-          viewportHeight - popoverRect.height - margin,
-        ),
-        visibility: "visible",
-      });
-    }
+			setStyle({
+				left: clamp(fitting.left, margin, viewportWidth - popoverRect.width - margin),
+				top: clamp(fitting.top, margin, viewportHeight - popoverRect.height - margin),
+				visibility: 'visible'
+			});
+		}
 
-    updatePosition();
-    window.addEventListener("resize", updatePosition);
-    window.addEventListener("scroll", updatePosition, true);
-    return () => {
-      window.removeEventListener("resize", updatePosition);
-      window.removeEventListener("scroll", updatePosition, true);
-    };
-  }, [open, props.side]);
+		updatePosition();
+		window.addEventListener('resize', updatePosition);
+		window.addEventListener('scroll', updatePosition, true);
+		return () => {
+			window.removeEventListener('resize', updatePosition);
+			window.removeEventListener('scroll', updatePosition, true);
+		};
+	}, [open, props.side]);
 
-  return (
-    <span
-      className="tooltip-wrap"
-      onMouseEnter={() => setOpen(true)}
-      onMouseLeave={() => setOpen(false)}
-      onFocus={() => setOpen(true)}
-      onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
-      }}
-    >
-      <span
-        className="tooltip-anchor"
-        aria-describedby={open ? id : undefined}
-        ref={anchorRef}
-      >
-        {props.children}
-      </span>
-      {open ? (
-        <span
-          className="tooltip-popover"
-          role="tooltip"
-          id={id}
-          ref={popoverRef}
-          style={style}
-        >
-          {formatTooltipContent(props.content)}
-        </span>
-      ) : null}
-    </span>
-  );
+	return (
+		<span
+			className="tooltip-wrap"
+			role="none"
+			onMouseEnter={() => setOpen(true)}
+			onMouseLeave={() => setOpen(false)}
+			onFocus={() => setOpen(true)}
+			onBlur={event => {
+				if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+			}}
+		>
+			<span className="tooltip-anchor" aria-describedby={open ? id : undefined} ref={anchorRef}>
+				{props.children}
+			</span>
+			{open ? (
+				<span className="tooltip-popover" role="tooltip" id={id} ref={popoverRef} style={style}>
+					{formatTooltipContent(props.content)}
+				</span>
+			) : null}
+		</span>
+	);
 }
 
 function formatTooltipContent(content: ReactNode) {
-  if (typeof content !== "string") return content;
-  const parts = content.split(/(`[^`]+`)/g);
-  return parts.map((part, index) => {
-    if (part.startsWith("`") && part.endsWith("`") && part.length > 1) {
-      return <code key={index}>{part.slice(1, -1)}</code>;
-    }
-    return <span key={index}>{part}</span>;
-  });
+	if (typeof content !== 'string') return content;
+	const parts = content.split(/(`[^`]+`)/g);
+	return parts.map((part, index) => {
+		if (part.startsWith('`') && part.endsWith('`') && part.length > 1) {
+			// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+			return <code key={index}>{part.slice(1, -1)}</code>;
+		}
+		// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+		return <span key={index}>{part}</span>;
+	});
 }
 
-function orderedSides(preferred: "top" | "right" | "bottom" | "left") {
-  const all = ["top", "bottom", "right", "left"] as const;
-  return [preferred, ...all.filter((side) => side !== preferred)];
+function orderedSides(preferred: 'top' | 'right' | 'bottom' | 'left') {
+	const all = ['top', 'bottom', 'right', 'left'] as const;
+	return [preferred, ...all.filter(side => side !== preferred)];
 }
 
 function clamp(value: number, min: number, max: number) {
-  return Math.min(Math.max(value, min), max);
+	return Math.min(Math.max(value, min), max);
+}
+
+function checkRaw(text: string, raw: DrawerRaw): { value?: unknown; error: string | null } {
+	if (!text.trim() && 'empty' in raw) return { value: raw.empty, error: null };
+	try {
+		const value = parseSchemaYamlEditorValue(text);
+		return { value, error: configValueError(raw.schemaPath, value) || null };
+	} catch (err) {
+		return { error: err instanceof Error ? err.message : 'Invalid YAML' };
+	}
 }
 
 export function Drawer(props: {
-  title: string;
-  children: ReactNode;
-  footer?:
-    | ReactNode
-    | ((requestClose: () => void, dirty: boolean) => ReactNode);
-  headerActions?: ReactNode;
-  onClose: () => void;
-  variant?: "default" | "nested";
-  dirty?: boolean;
-  saving?: boolean;
+	title: string;
+	children: ReactNode;
+	footer?: ReactNode | ((requestClose: () => void, dirty: boolean) => ReactNode);
+	headerActions?: ReactNode;
+	onClose: () => void;
+	variant?: 'default' | 'nested';
+	dirty?: boolean;
+	saving?: boolean;
+	raw?: DrawerRaw;
+	// Save errors, shown in form and raw mode alike.
+	error?: string | null;
 }) {
-  const drawerRef = useRef<HTMLElement>(null);
-  const drawerId = useRef(Symbol("drawer"));
-  const [formChanged, setFormChanged] = useState(false);
-  const [confirmClose, setConfirmClose] = useState(false);
-  const dirty = props.dirty ?? formChanged;
-  const closeStateRef = useRef({
-    dirty,
-    saving: props.saving,
-    confirmClose,
-    onClose: props.onClose,
-  });
-  closeStateRef.current = {
-    dirty,
-    saving: props.saving,
-    confirmClose,
-    onClose: props.onClose,
-  };
+	const drawerRef = useRef<HTMLElement>(null);
+	const [rawText, setRawText] = useState<string | null>(null);
+	const [rawPinned, setRawPinned] = useState<string | null>(null);
+	// Raw mode was asked for while the form had no value to show.
+	const [rawBlocked, setRawBlocked] = useState(false);
+	// Raw edits can change fields an editor's own `dirty` check does not see.
+	const [rawEdited, setRawEdited] = useState(false);
+	const schemaHelp = useSchemaHelp();
+	const rawRef = useRef(props.raw);
+	rawRef.current = props.raw;
+	const pinRaw = useCallback((reason: string) => {
+		setRawPinned(reason);
+		setRawText(
+			text => text ?? dump(rawRef.current?.value() ?? {}, { noRefs: true, lineWidth: 100 })
+		);
+	}, []);
 
-  function requestClose() {
-    const state = closeStateRef.current;
-    if (state.dirty && !state.saving) setConfirmClose(true);
-    else state.onClose();
-  }
+	function toggleRaw() {
+		// Leaving raw drops any invalid text; the form holds the last valid value.
+		if (rawText !== null) {
+			setRawText(null);
+			return;
+		}
+		const value = props.raw?.value();
+		setRawBlocked(value === undefined);
+		if (value === undefined) return;
+		props.raw?.onOpen?.(value);
+		setRawText(dump(value ?? {}, { noRefs: true, lineWidth: 100 }));
+	}
 
-  useEffect(() => {
-    const id = drawerId.current;
-    drawerStack.push(id);
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key !== "Escape") return;
-      if (drawerStack.at(-1) !== id) return;
-      const state = closeStateRef.current;
-      if (state.confirmClose) return;
-      event.preventDefault();
-      if (state.dirty && !state.saving) setConfirmClose(true);
-      else state.onClose();
-    }
-    document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("keydown", closeOnEscape);
-      const index = drawerStack.indexOf(id);
-      if (index >= 0) drawerStack.splice(index, 1);
-    };
-  }, []);
+	// Form fields that show errors for a path, which also pick the shape errors
+	// are reported against (see configValueErrors).
+	const fieldPaths = useRef(new Map<string, number>());
+	const missingFields = useRef(new Set<symbol>());
+	const lastErrors = useRef<{ value: unknown; errors: ConfigValueError[] } | null>(null);
+	const [checked, setChecked] = useState(false);
+	const formErrors = useCallback(() => {
+		const raw = rawRef.current;
+		if (!raw) return [];
+		const value = raw.value();
+		// No value: the editor's own validation reports why.
+		if (value === undefined || value === null) return [];
+		if (lastErrors.current?.value !== value) {
+			lastErrors.current = {
+				value,
+				errors: configValueErrors(raw.schemaPath, withoutEmptyStrings(value), [
+					...fieldPaths.current.keys()
+				])
+			};
+		}
+		return lastErrors.current.errors;
+	}, []);
+	const schemaPathKey = props.raw?.schemaPath.join('/');
+	const fieldErrors = useMemo(
+		() =>
+			schemaPathKey !== undefined && rawRef.current
+				? {
+						schemaPath: rawRef.current.schemaPath,
+						errors: () => (checked ? formErrors() : null),
+						register(path: string) {
+							fieldPaths.current.set(path, (fieldPaths.current.get(path) ?? 0) + 1);
+							return () => {
+								const count = (fieldPaths.current.get(path) ?? 1) - 1;
+								if (count) fieldPaths.current.set(path, count);
+								else fieldPaths.current.delete(path);
+							};
+						},
+						missing: missingFields.current
+					}
+				: null,
+		[checked, formErrors, schemaPathKey]
+	);
+	function check() {
+		// Raw text is validated as it is edited.
+		if (rawText !== null) return true;
+		lastErrors.current = null;
+		setChecked(true);
+		return !formErrors().length && !missingFields.current.size;
+	}
+	const unshownErrors =
+		checked && rawText === null
+			? formErrors().filter(
+					error => ![...fieldPaths.current.keys()].some(path => pathsOverlap(error.path, path))
+				)
+			: [];
 
-  useEffect(() => {
-    if (!dirty || props.saving) return;
-    function preventUnload(event: BeforeUnloadEvent) {
-      event.preventDefault();
-      event.returnValue = "";
-    }
-    window.addEventListener("beforeunload", preventUnload);
-    return () => window.removeEventListener("beforeunload", preventUnload);
-  }, [dirty, props.saving]);
+	// Derived from the text, so the value raw mode opens with is checked too.
+	const rawError = rawText !== null && props.raw ? checkRaw(rawText, props.raw).error : null;
 
-  function trackButtonChange(event: ReactMouseEvent<HTMLElement>) {
-    const target = event.target as HTMLElement;
-    if (
-      target.closest(
-        '[role="option"], [role="radio"], .segmented-control button, .choice-pill',
-      )
-    )
-      setFormChanged(true);
-  }
+	function editRaw(text: string) {
+		setRawText(text);
+		setRawEdited(true);
+		if (!props.raw) return;
+		const checked = checkRaw(text, props.raw);
+		if (checked.error) return;
+		// The form may be able to show the new value; if not, it pins raw again.
+		setRawPinned(null);
+		props.raw.onChange(checked.value);
+	}
+	const drawerId = useRef(Symbol('drawer'));
+	const [formChanged, setFormChanged] = useState(false);
+	const [confirmClose, setConfirmClose] = useState(false);
+	const dirty = (props.dirty ?? formChanged) || rawEdited;
+	const closeStateRef = useRef({
+		dirty,
+		saving: props.saving,
+		confirmClose,
+		onClose: props.onClose
+	});
+	closeStateRef.current = {
+		dirty,
+		saving: props.saving,
+		confirmClose,
+		onClose: props.onClose
+	};
 
-  useEffect(() => {
-    const previousFocus =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-    drawerRef.current?.focus({ preventScroll: true });
-    return () => {
-      const scrollX = window.scrollX;
-      const scrollY = window.scrollY;
-      previousFocus?.focus({ preventScroll: true });
-      window.scrollTo(scrollX, scrollY);
-    };
-  }, []);
+	function requestClose() {
+		const state = closeStateRef.current;
+		if (state.dirty && !state.saving) setConfirmClose(true);
+		else state.onClose();
+	}
 
-  function trapFocus(event: ReactKeyboardEvent<HTMLElement>) {
-    if (event.key !== "Tab") return;
-    const drawer = drawerRef.current;
-    if (!drawer) return;
-    const focusable = Array.from(
-      drawer.querySelectorAll<HTMLElement>(
-        'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      ),
-    ).filter(
-      (element) =>
-        !element.hasAttribute("disabled") && element.offsetParent !== null,
-    );
-    if (!focusable.length) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
+	useEffect(() => {
+		const id = drawerId.current;
+		drawerStack.push(id);
+		function closeOnEscape(event: KeyboardEvent) {
+			if (event.key !== 'Escape') return;
+			if (drawerStack.at(-1) !== id) return;
+			const state = closeStateRef.current;
+			if (state.confirmClose) return;
+			event.preventDefault();
+			if (state.dirty && !state.saving) setConfirmClose(true);
+			else state.onClose();
+		}
+		document.addEventListener('keydown', closeOnEscape);
+		return () => {
+			document.removeEventListener('keydown', closeOnEscape);
+			const index = drawerStack.indexOf(id);
+			if (index >= 0) drawerStack.splice(index, 1);
+		};
+	}, []);
 
-  return (
-    <>
-      <div
-        className={
-          props.variant === "nested"
-            ? "drawer-backdrop nested"
-            : "drawer-backdrop"
-        }
-        role="presentation"
-        onMouseDown={requestClose}
-      >
-        <aside
-          className={props.variant === "nested" ? "drawer nested" : "drawer"}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="drawer-title"
-          tabIndex={-1}
-          ref={drawerRef}
-          onKeyDown={trapFocus}
-          onChangeCapture={() => setFormChanged(true)}
-          onClickCapture={trackButtonChange}
-          onMouseDown={(event) => event.stopPropagation()}
-        >
-          <div className="drawer-header">
-            <h3 id="drawer-title">{props.title}</h3>
-            <div className="drawer-header-actions">
-              {props.headerActions}
-              <Tooltip content="Close">
-                <button
-                  className="icon-button"
-                  type="button"
-                  aria-label="Close"
-                  onClick={requestClose}
-                >
-                  <X size={17} />
-                </button>
-              </Tooltip>
-            </div>
-          </div>
-          <div className="drawer-body">{props.children}</div>
-          {props.footer ? (
-            <div className="drawer-footer">
-              {typeof props.footer === "function"
-                ? props.footer(requestClose, dirty)
-                : props.footer}
-            </div>
-          ) : null}
-        </aside>
-      </div>
-      {confirmClose ? (
-        <ConfirmDialog
-          title="Discard unsaved changes?"
-          destructive
-          confirmLabel="Discard changes"
-          onCancel={() => setConfirmClose(false)}
-          onConfirm={() => {
-            setConfirmClose(false);
-            props.onClose();
-          }}
-        >
-          <p>Your changes have not been saved and will be lost.</p>
-        </ConfirmDialog>
-      ) : null}
-    </>
-  );
+	useEffect(() => {
+		if (!dirty || props.saving) return;
+		function preventUnload(event: BeforeUnloadEvent) {
+			event.preventDefault();
+			event.returnValue = '';
+		}
+		window.addEventListener('beforeunload', preventUnload);
+		return () => window.removeEventListener('beforeunload', preventUnload);
+	}, [dirty, props.saving]);
+
+	function trackButtonChange(event: ReactMouseEvent<HTMLElement>) {
+		const target = event.target as HTMLElement;
+		if (target.closest('[role="option"], .segmented-control button, .choice-pill'))
+			setFormChanged(true);
+	}
+
+	useEffect(() => {
+		const previousFocus =
+			document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		drawerRef.current?.focus({ preventScroll: true });
+		return () => {
+			const scrollX = window.scrollX;
+			const scrollY = window.scrollY;
+			previousFocus?.focus({ preventScroll: true });
+			window.scrollTo(scrollX, scrollY);
+		};
+	}, []);
+
+	function trapFocus(event: ReactKeyboardEvent<HTMLElement>) {
+		if (event.key !== 'Tab') return;
+		const drawer = drawerRef.current;
+		if (!drawer) return;
+		const focusable = Array.from(
+			drawer.querySelectorAll<HTMLElement>(
+				'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+			)
+		).filter(element => !element.hasAttribute('disabled') && element.offsetParent !== null);
+		if (!focusable.length) return;
+		const first = focusable[0];
+		const last = focusable[focusable.length - 1];
+		if (event.shiftKey && document.activeElement === first) {
+			event.preventDefault();
+			last.focus();
+		} else if (!event.shiftKey && document.activeElement === last) {
+			event.preventDefault();
+			first.focus();
+		}
+	}
+
+	return (
+		<>
+			<div
+				className={props.variant === 'nested' ? 'drawer-backdrop nested' : 'drawer-backdrop'}
+				role="presentation"
+			>
+				<div className="dismiss-overlay" aria-hidden="true" onMouseDown={requestClose} />
+				<aside
+					className={props.variant === 'nested' ? 'drawer nested' : 'drawer'}
+					role="dialog"
+					aria-modal="true"
+					aria-labelledby="drawer-title"
+					tabIndex={-1}
+					ref={drawerRef}
+					onKeyDown={trapFocus}
+					onChangeCapture={() => setFormChanged(true)}
+					onClickCapture={trackButtonChange}
+					onMouseDown={event => event.stopPropagation()}
+				>
+					<div className="drawer-header">
+						<h3 id="drawer-title">{props.title}</h3>
+						<div className="drawer-header-actions">
+							{props.headerActions}
+							{props.raw ? (
+								<Tooltip content={rawPinned ?? 'Raw'}>
+									<button
+										className={rawText === null ? 'icon-button' : 'icon-button active'}
+										type="button"
+										aria-label="Raw"
+										aria-pressed={rawText !== null}
+										disabled={Boolean(rawPinned)}
+										onClick={toggleRaw}
+									>
+										<Code size={17} />
+									</button>
+								</Tooltip>
+							) : null}
+							<Tooltip content="Close">
+								<button
+									className="icon-button"
+									type="button"
+									aria-label="Close"
+									onClick={requestClose}
+								>
+									<X size={17} />
+								</button>
+							</Tooltip>
+						</div>
+					</div>
+					<div className="drawer-body">
+						{props.raw && rawText !== null ? (
+							<div className="policy-yaml-fallback">
+								<SchemaHelpPanel
+									schema={configSchemaNode(props.raw.schemaPath)}
+									help={schemaHelp}
+								/>
+								{rawError ? (
+									<StatusBanner state="bad" title="Invalid configuration">
+										{rawError}
+									</StatusBanner>
+								) : null}
+								<SchemaYamlEditor
+									className="policy-yaml-editor"
+									invalid={Boolean(rawError)}
+									path="agentgateway-drawer-raw.yaml"
+									schema={configSchemaNode(props.raw.schemaPath) ?? {}}
+									showLineNumbers={false}
+									value={rawText}
+									onChange={editRaw}
+								/>
+							</div>
+						) : (
+							<PinRawContext.Provider value={props.raw ? pinRaw : null}>
+								<FieldErrorsContext.Provider value={fieldErrors}>
+									{props.children}
+								</FieldErrorsContext.Provider>
+							</PinRawContext.Provider>
+						)}
+						{rawBlocked && rawText === null ? (
+							<StatusBanner state="warn" title="Raw mode is unavailable">
+								Part of the form is not valid yet. Fix it to edit as raw YAML.
+							</StatusBanner>
+						) : null}
+						{unshownErrors.length ? (
+							<StatusBanner state="bad" title="Invalid configuration">
+								{unshownErrors.map(error => (
+									<div key={error.path}>
+										{error.path ? <code>{error.path}</code> : null}
+										{error.path ? ': ' : null}
+										{error.message}
+									</div>
+								))}
+							</StatusBanner>
+						) : null}
+						{props.error ? (
+							<div className="drawer-save-error">
+								<StatusBanner state="bad" title="Save failed">
+									{props.error}
+								</StatusBanner>
+							</div>
+						) : null}
+					</div>
+					{props.footer ? (
+						<div className="drawer-footer">
+							{/* Invalid raw text has not reached the form, so saving now would save stale values. */}
+							<fieldset className="drawer-footer-actions" disabled={Boolean(rawError)}>
+								<DrawerCheckContext.Provider value={props.raw ? check : null}>
+									{typeof props.footer === 'function'
+										? props.footer(requestClose, dirty)
+										: props.footer}
+								</DrawerCheckContext.Provider>
+							</fieldset>
+						</div>
+					) : null}
+				</aside>
+			</div>
+			{confirmClose ? (
+				<ConfirmDialog
+					title="Discard unsaved changes?"
+					destructive
+					confirmLabel="Discard changes"
+					onCancel={() => setConfirmClose(false)}
+					onConfirm={() => {
+						setConfirmClose(false);
+						props.onClose();
+					}}
+				>
+					<p>Your changes have not been saved and will be lost.</p>
+				</ConfirmDialog>
+			) : null}
+		</>
+	);
 }
 
 export function ConfirmDialog(props: {
-  title: string;
-  children?: ReactNode;
-  confirmLabel?: ReactNode;
-  cancelLabel?: ReactNode;
-  destructive?: boolean;
-  confirmDisabled?: boolean;
-  onCancel: () => void;
-  onConfirm: () => void;
+	title: string;
+	children?: ReactNode;
+	confirmLabel?: ReactNode;
+	cancelLabel?: ReactNode | null;
+	destructive?: boolean;
+	confirmDisabled?: boolean;
+	onCancel: () => void;
+	onConfirm: () => void;
 }) {
-  const dialogRef = useRef<HTMLDivElement>(null);
+	const dialogRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    const previousFocus =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-    dialogRef.current?.focus({ preventScroll: true });
-    return () => previousFocus?.focus({ preventScroll: true });
-  }, []);
+	useEffect(() => {
+		const previousFocus =
+			document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		dialogRef.current?.focus({ preventScroll: true });
+		return () => previousFocus?.focus({ preventScroll: true });
+	}, []);
 
-  useEffect(() => {
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      props.onCancel();
-    }
-    document.addEventListener("keydown", closeOnEscape);
-    return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [props]);
+	useEffect(() => {
+		function closeOnEscape(event: KeyboardEvent) {
+			if (event.key !== 'Escape') return;
+			event.preventDefault();
+			props.onCancel();
+		}
+		document.addEventListener('keydown', closeOnEscape);
+		return () => document.removeEventListener('keydown', closeOnEscape);
+	}, [props]);
 
-  function trapFocus(event: ReactKeyboardEvent<HTMLDivElement>) {
-    if (event.key !== "Tab") return;
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    const focusable = Array.from(
-      dialog.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      ),
-    ).filter((element) => element.offsetParent !== null);
-    if (!focusable.length) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
+	function trapFocus(event: ReactKeyboardEvent<HTMLDivElement>) {
+		if (event.key !== 'Tab') return;
+		const dialog = dialogRef.current;
+		if (!dialog) return;
+		const focusable = Array.from(
+			dialog.querySelectorAll<HTMLElement>(
+				'button:not([disabled]), [tabindex]:not([tabindex="-1"])'
+			)
+		).filter(element => element.offsetParent !== null);
+		if (!focusable.length) return;
+		const first = focusable[0];
+		const last = focusable[focusable.length - 1];
+		if (event.shiftKey && document.activeElement === first) {
+			event.preventDefault();
+			last.focus();
+		} else if (!event.shiftKey && document.activeElement === last) {
+			event.preventDefault();
+			first.focus();
+		}
+	}
 
-  return (
-    <div
-      className="confirm-backdrop"
-      role="presentation"
-      onMouseDown={props.onCancel}
-    >
-      <div
-        className="confirm-dialog"
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby="confirm-dialog-title"
-        tabIndex={-1}
-        ref={dialogRef}
-        onKeyDown={trapFocus}
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <div className="confirm-dialog-header">
-          <h3 id="confirm-dialog-title">{props.title}</h3>
-        </div>
-        {props.children ? (
-          <div className="confirm-dialog-body">{props.children}</div>
-        ) : null}
-        <div className="confirm-dialog-footer">
-          <button className="button" type="button" onClick={props.onCancel}>
-            {props.cancelLabel ?? "Cancel"}
-          </button>
-          <button
-            className={props.destructive ? "button danger" : "button primary"}
-            type="button"
-            disabled={props.confirmDisabled}
-            onClick={props.onConfirm}
-          >
-            {props.confirmLabel ?? "Confirm"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
+	return (
+		<div className="confirm-backdrop" role="presentation">
+			<div className="dismiss-overlay" aria-hidden="true" onMouseDown={props.onCancel} />
+			<div
+				className="confirm-dialog"
+				role="alertdialog"
+				aria-modal="true"
+				aria-labelledby="confirm-dialog-title"
+				tabIndex={-1}
+				ref={dialogRef}
+				onKeyDown={trapFocus}
+				onMouseDown={event => event.stopPropagation()}
+			>
+				<div className="confirm-dialog-header">
+					<h3 id="confirm-dialog-title">{props.title}</h3>
+				</div>
+				{props.children ? <div className="confirm-dialog-body">{props.children}</div> : null}
+				<div className="confirm-dialog-footer">
+					{props.cancelLabel === null ? null : (
+						<button className="button" type="button" onClick={props.onCancel}>
+							{props.cancelLabel ?? 'Cancel'}
+						</button>
+					)}
+					<button
+						className={props.destructive ? 'button danger' : 'button primary'}
+						type="button"
+						disabled={props.confirmDisabled}
+						onClick={props.onConfirm}
+					>
+						{props.confirmLabel ?? 'Confirm'}
+					</button>
+				</div>
+			</div>
+		</div>
+	);
 }
 
 export function StatusBanner(props: {
-  state: "ok" | "warn" | "bad" | "loading" | "info";
-  title: string;
-  children?: ReactNode;
-  action?: ReactNode;
+	state: 'ok' | 'warn' | 'bad' | 'loading' | 'info';
+	title: string;
+	children?: ReactNode;
+	action?: ReactNode;
 }) {
-  const Icon =
-    props.state === "loading"
-      ? Loader2
-      : props.state === "ok"
-        ? CheckCircle2
-        : props.state === "warn"
-          ? AlertTriangle
-          : props.state === "info"
-            ? Info
-            : XCircle;
-  return (
-    <div className={`status-banner ${props.state}`}>
-      <Icon
-        size={18}
-        className={props.state === "loading" ? "spin" : undefined}
-      />
-      <div>
-        <strong>{props.title}</strong>
-        {props.children ? <div>{props.children}</div> : null}
-      </div>
-      {props.action ? (
-        <div className="status-banner-action">{props.action}</div>
-      ) : null}
-    </div>
-  );
+	const Icon =
+		props.state === 'loading'
+			? Loader2
+			: props.state === 'ok'
+				? CheckCircle2
+				: props.state === 'warn'
+					? AlertTriangle
+					: props.state === 'info'
+						? Info
+						: XCircle;
+	return (
+		<div className={`status-banner ${props.state}`}>
+			<Icon size={18} className={props.state === 'loading' ? 'spin' : undefined} />
+			<div>
+				<strong>{props.title}</strong>
+				{props.children ? <div>{props.children}</div> : null}
+			</div>
+			{props.action ? <div className="status-banner-action">{props.action}</div> : null}
+		</div>
+	);
 }
 
-export function EmptyState(props: {
-  title: string;
-  description: string;
-  action?: ReactNode;
-}) {
-  return (
-    <div className="empty-state">
-      <h3>{props.title}</h3>
-      <p>{props.description}</p>
-      {props.action}
-    </div>
-  );
+export function EmptyState(props: { title: string; description: string; action?: ReactNode }) {
+	return (
+		<div className="empty-state">
+			<h3>{props.title}</h3>
+			<p>{props.description}</p>
+			{props.action}
+		</div>
+	);
 }
 
 export function Field(props: {
-  label: string;
-  children: ReactNode;
-  hint?: string;
-  className?: string;
-  tooltip?: string;
+	label: string;
+	children:
+		| ReactElement<{ id?: string; 'aria-describedby'?: string; 'aria-invalid'?: boolean }>
+		| ((id: string, hintId?: string, invalid?: boolean) => ReactNode);
+	hint?: string;
+	className?: string;
+	tooltip?: string;
+	// The dotted path this field edits within its drawer's value, such as
+	// `jwks.url`: it is marked when the schema requires it, and shows schema
+	// errors for it after a save attempt.
+	path?: string;
+	// Set on a field the form needs beyond the schema (e.g. a name identifying
+	// the item): whether it is empty. It is marked as required, and saving
+	// fails while it is empty.
+	missing?: boolean;
 }) {
-  return (
-    <label className={props.className ? `field ${props.className}` : "field"}>
-      <span className="field-label">
-        {props.label}
-        {props.tooltip ? (
-          <Tooltip content={props.tooltip} side="right">
-            <span className="help-icon" tabIndex={0} aria-label={props.tooltip}>
-              <HelpCircle size={13} aria-hidden="true" />
-            </span>
-          </Tooltip>
-        ) : null}
-      </span>
-      {props.children}
-      {props.hint ? <small>{props.hint}</small> : null}
-    </label>
-  );
+	const generatedId = useId();
+	const hintId = useId();
+	const field = useFieldError(props.path, props.missing);
+	const hint = field.error ?? props.hint;
+	const describedBy = hint ? hintId : undefined;
+	const id =
+		typeof props.children === 'function' ? generatedId : (props.children.props.id ?? generatedId);
+	const className = ['field', props.className, field.error ? 'invalid' : null]
+		.filter(Boolean)
+		.join(' ');
+	const control = (
+		<div className={props.tooltip ? 'field field-control' : className}>
+			<span className="field-label">
+				<label htmlFor={id} className={field.required ? 'field-required' : undefined}>
+					{props.label}
+				</label>
+			</span>
+			{typeof props.children === 'function'
+				? props.children(id, describedBy, Boolean(field.error))
+				: cloneElement(props.children, {
+						id,
+						'aria-describedby':
+							[props.children.props['aria-describedby'], describedBy].filter(Boolean).join(' ') ||
+							undefined,
+						'aria-invalid': field.error ? true : props.children.props['aria-invalid']
+					})}
+			{hint ? <small id={hintId}>{hint}</small> : null}
+		</div>
+	);
+	if (!props.tooltip) return control;
+	return (
+		<div className={`${className} field-with-help`}>
+			<Tooltip content={props.tooltip} side="right">
+				<button className="help-icon" type="button" aria-label={props.tooltip}>
+					<HelpCircle size={13} aria-hidden="true" />
+				</button>
+			</Tooltip>
+			{control}
+		</div>
+	);
 }
 
 export function FieldGroup(props: {
-  label: string;
-  children: ReactNode;
-  hint?: string;
-  className?: string;
-  tooltip?: string;
+	label: string;
+	children: ReactNode;
+	hint?: string;
+	className?: string;
+	tooltip?: string;
+	// As for Field.
+	path?: string;
+	missing?: boolean;
 }) {
-  return (
-    <div className={props.className ? `field ${props.className}` : "field"}>
-      <span className="field-label">
-        {props.label}
-        {props.tooltip ? (
-          <Tooltip content={props.tooltip} side="right">
-            <span className="help-icon" tabIndex={0} aria-label={props.tooltip}>
-              <HelpCircle size={13} aria-hidden="true" />
-            </span>
-          </Tooltip>
-        ) : null}
-      </span>
-      {props.children}
-      {props.hint ? <small>{props.hint}</small> : null}
-    </div>
-  );
+	const field = useFieldError(props.path, props.missing);
+	const hint = field.error ?? props.hint;
+	return (
+		<div
+			className={['field', props.className, field.error ? 'invalid' : null]
+				.filter(Boolean)
+				.join(' ')}
+		>
+			<span className="field-label">
+				{field.required ? <span className="field-required">{props.label}</span> : props.label}
+				{props.tooltip ? (
+					<Tooltip content={props.tooltip} side="right">
+						<button className="help-icon" type="button" aria-label={props.tooltip}>
+							<HelpCircle size={13} aria-hidden="true" />
+						</button>
+					</Tooltip>
+				) : null}
+			</span>
+			{props.children}
+			{hint ? <small>{hint}</small> : null}
+		</div>
+	);
 }
 
 export function JsonBlock(props: { value: unknown }) {
-  return (
-    <pre className="json-block">{JSON.stringify(props.value, null, 2)}</pre>
-  );
+	return <pre className="json-block">{JSON.stringify(props.value, null, 2)}</pre>;
 }
 
 export function YamlBlock(props: { value: unknown }) {
-  const text = yaml
-    .dump(props.value, { noRefs: true, lineWidth: 100 })
-    .replace(/\n$/, "");
-  return <YamlTextBlock value={text} />;
+	const text = dump(props.value, { noRefs: true, lineWidth: 100 }).replace(/\n$/, '');
+	return <YamlTextBlock value={text} />;
 }
 
 export function YamlTextBlock(props: { value: string; className?: string }) {
-  const text = props.value.replace(/\n$/, "");
-  const lines = text.split("\n");
-  return (
-    <pre
-      className={
-        props.className
-          ? `json-block yaml-block ${props.className}`
-          : "json-block yaml-block"
-      }
-    >
-      {lines.map((line, index) => (
-        <span className="yaml-line" key={`${index}-${line}`}>
-          {highlightYamlLine(line)}
-          {index < lines.length - 1 ? "\n" : null}
-        </span>
-      ))}
-    </pre>
-  );
+	const text = props.value.replace(/\n$/, '');
+	const lines = text.split('\n');
+	return (
+		<pre
+			className={
+				props.className ? `json-block yaml-block ${props.className}` : 'json-block yaml-block'
+			}
+		>
+			{lines.map((line, index) => (
+				<span
+					className="yaml-line"
+					key={`${
+						// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+						index
+					}-${line}`}
+				>
+					{highlightYamlLine(line)}
+					{index < lines.length - 1 ? '\n' : null}
+				</span>
+			))}
+		</pre>
+	);
 }
 
 function highlightYamlLine(line: string) {
-  const match = line.match(/^(\s*)([^:\n]+):(.*)$/);
-  if (!match) return line;
-  return (
-    <>
-      {match[1]}
-      <span className="yaml-key">{match[2]}</span>
-      <span className="yaml-punctuation">:</span>
-      <span className="yaml-value">{match[3]}</span>
-    </>
-  );
+	const match = line.match(/^(\s*)([^:\n]+):(.*)$/);
+	if (!match) return line;
+	return (
+		<>
+			{match[1]}
+			<span className="yaml-key">{match[2]}</span>
+			<span className="yaml-punctuation">:</span>
+			<span className="yaml-value">{match[3]}</span>
+		</>
+	);
 }
 
 export function formatNumber(value: number | null | undefined) {
-  return typeof value === "number"
-    ? new Intl.NumberFormat().format(value)
-    : "n/a";
+	return typeof value === 'number' ? new Intl.NumberFormat().format(value) : 'n/a';
 }
 
 export function formatDate(value: string | null | undefined) {
-  if (!value) return "n/a";
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    month: "short",
-    day: "numeric",
-  }).format(new Date(value));
+	if (!value) return 'n/a';
+	return new Intl.DateTimeFormat(undefined, {
+		hour: '2-digit',
+		minute: '2-digit',
+		second: '2-digit',
+		month: 'short',
+		day: 'numeric'
+	}).format(new Date(value));
 }
 
 export function formatRelativeTime(value: string | null | undefined) {
-  if (!value) return "n/a";
-  const deltaMs = new Date(value).getTime() - Date.now();
-  const abs = Math.abs(deltaMs);
-  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
-  if (abs < 60_000) return rtf.format(Math.round(deltaMs / 1_000), "second");
-  if (abs < 3_600_000)
-    return rtf.format(Math.round(deltaMs / 60_000), "minute");
-  if (abs < 86_400_000)
-    return rtf.format(Math.round(deltaMs / 3_600_000), "hour");
-  return rtf.format(Math.round(deltaMs / 86_400_000), "day");
+	if (!value) return 'n/a';
+	const deltaMs = new Date(value).getTime() - Date.now();
+	const abs = Math.abs(deltaMs);
+	const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+	if (abs < 60_000) return rtf.format(Math.round(deltaMs / 1_000), 'second');
+	if (abs < 3_600_000) return rtf.format(Math.round(deltaMs / 60_000), 'minute');
+	if (abs < 86_400_000) return rtf.format(Math.round(deltaMs / 3_600_000), 'hour');
+	return rtf.format(Math.round(deltaMs / 86_400_000), 'day');
 }

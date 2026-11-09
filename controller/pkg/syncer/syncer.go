@@ -10,9 +10,9 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/ambient"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/mesh"
-	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/maps"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/workloadapi"
 	corev1 "k8s.io/api/core/v1"
@@ -75,8 +75,12 @@ type Syncer struct {
 	gatewayCollectionOptions []translator.GatewayCollectionConfigOption
 
 	customResourceCollections   func(cfg CustomResourceCollectionsConfig)
+	finalStatusCollections      []func(FinalStatusCollectionsConfig)
 	buildAddressCollectionsFunc AgentgatewayAddressBuilderFunc
 	buildReferenceTypesFunc     func(agw *plugins.AgwCollections, base plugins.ReferenceTypes) plugins.ReferenceTypes
+	extraListenerSets           ExtraListenerSetsBuilderFunc
+	allowedListenersResolver    AllowedListenersResolver
+	modelCollections            ModelCollectionsBuilderFunc
 }
 
 func NewAgwSyncer(
@@ -102,8 +106,12 @@ func NewAgwSyncer(
 			translator.WithGatewayTransformationFunc(cfg.GatewayTransformationFunc),
 		},
 		customResourceCollections:   cfg.CustomResourceCollections,
+		finalStatusCollections:      cfg.FinalStatusCollections,
 		buildAddressCollectionsFunc: cfg.BuildAddressCollectionsFunc,
 		buildReferenceTypesFunc:     cfg.BuildReferenceTypesFunc,
+		extraListenerSets:           cfg.ExtraListenerSets,
+		allowedListenersResolver:    cfg.AllowedListenersResolver,
+		modelCollections:            cfg.ModelCollections,
 	}
 	logger.Debug("init agentgateway Syncer", "controllername", controllerName)
 
@@ -119,12 +127,14 @@ type OutputCollections struct {
 	Resources  krt.Collection[agwir.AgwResource]
 	Addresses  krt.Collection[Address]
 	References plugins.ReferenceIndex
+	// RejectedListenerSets is empty unless WithExtraListenerSets is set.
+	RejectedListenerSets krt.Collection[RejectedListenerSet]
 }
 
 type CustomResourceCollectionsConfig struct {
 	ControllerName    string
 	Gateways          krt.Collection[*gwv1.Gateway]
-	ListenerSets      krt.Collection[translator.ListenerSet]
+	ListenerSets      krt.Collection[*translator.ListenerSet]
 	GatewayClasses    krt.Collection[translator.GatewayClass]
 	Namespaces        krt.Collection[*corev1.Namespace]
 	Grants            translator.ReferenceGrants
@@ -132,6 +142,18 @@ type CustomResourceCollectionsConfig struct {
 	ConfigMaps        krt.Collection[*corev1.ConfigMap]
 	KrtOpts           krtutil.KrtOptions
 	StatusCollections *status.StatusCollections
+}
+
+type FinalStatusCollectionsConfig struct {
+	ControllerName string
+	// Includes arbitration losers.
+	GatewayListeners krt.Collection[*translator.GatewayListener]
+	// Admission rejections, not arbitration conflicts.
+	RejectedListenerSets krt.Collection[RejectedListenerSet]
+	// Logical attachments, not programmed routes.
+	RouteAttachments  krt.Collection[*plugins.RouteAttachment]
+	StatusCollections *status.StatusCollections
+	KrtOpts           krtutil.KrtOptions
 }
 
 func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
@@ -147,7 +169,8 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 		referenceTypes.KnownToReferences,
 		krtopts,
 	))
-	listenerSetInitialStatus, listenerSets := s.buildListenerSetCollection(gatewayClasses, refGrants, krtopts)
+	listenerSetInitialStatus, listenerSets := s.buildListenerSetCollection(gatewayClasses, refGrants, referenceTypes, krtopts)
+	listenerSets, rejectedListenerSets := s.joinExtraListenerSets(listenerSets, krtopts)
 	if s.customResourceCollections != nil {
 		s.customResourceCollections(CustomResourceCollectionsConfig{
 			ControllerName:    s.controllerName,
@@ -163,7 +186,7 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 		})
 	}
 
-	gatewayInitialStatus, gateways := s.buildGatewayCollection(gatewayClasses, listenerSets, refGrants, krtopts)
+	gatewayInitialStatus, gateways := s.buildGatewayCollection(gatewayClasses, listenerSets, refGrants, referenceTypes, krtopts)
 
 	// Build Agw resources for gateway
 	agwResources, routeAttachments, ancestorCollection := s.buildAgwResources(gateways, listenerSets, refGrants, referenceTypes, krtopts)
@@ -182,6 +205,16 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 
 	listenerSetFinalStatus := s.buildFinalListenerSetStatus(gateways, listenerSetInitialStatus, routeAttachments, krtopts)
 	status.RegisterStatus(s.statusCollections, listenerSetFinalStatus, translator.GetStatus)
+	for _, finalize := range s.finalStatusCollections {
+		finalize(FinalStatusCollectionsConfig{
+			ControllerName:       s.controllerName,
+			GatewayListeners:     gateways,
+			RejectedListenerSets: rejectedListenerSets,
+			RouteAttachments:     routeAttachments,
+			StatusCollections:    s.statusCollections,
+			KrtOpts:              krtopts,
+		})
+	}
 
 	// Build address collections
 	addressBuilder := s.buildAddressCollectionsFunc
@@ -199,6 +232,7 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 	s.Outputs.Resources = agwResources
 	s.Outputs.Addresses = addresses
 	s.Outputs.References = ancestorCollection
+	s.Outputs.RejectedListenerSets = rejectedListenerSets
 }
 
 func (s *Syncer) buildFinalGatewayStatus(
@@ -206,19 +240,18 @@ func (s *Syncer) buildFinalGatewayStatus(
 	routeAttachments krt.Collection[*plugins.RouteAttachment],
 	krtopts krtutil.KrtOptions,
 ) krt.StatusCollection[*gwv1.Gateway, gwv1.GatewayStatus] {
-	routeAttachmentsIndex := krt.NewIndex(routeAttachments, "to", func(o *plugins.RouteAttachment) []utils.TypedNamespacedName {
-		return []utils.TypedNamespacedName{o.To}
+	routeAttachmentsIndex := krt.NewIndex(routeAttachments, "gateway", func(o *plugins.RouteAttachment) []types.NamespacedName {
+		// ListenerSet attachments are counted on the ListenerSet, not the Gateway.
+		// Delegated routes have no attribution target and do not contribute counts.
+		if o.To.Kind == wellknown.ListenerSetGVK.Kind || o.To.Kind == "" {
+			return nil
+		}
+		return []types.NamespacedName{o.Gateway}
 	})
 	return krt.NewCollection(
 		gatewayStatuses,
 		func(ctx krt.HandlerContext, i krt.ObjectWithStatus[*gwv1.Gateway, gwv1.GatewayStatus]) *krt.ObjectWithStatus[*gwv1.Gateway, gwv1.GatewayStatus] {
-			routes := krt.Fetch(ctx, routeAttachments, krt.FilterIndex(routeAttachmentsIndex, utils.TypedNamespacedName{
-				Kind: wellknown.GatewayGVK.Kind,
-				NamespacedName: types.NamespacedName{
-					Namespace: i.Obj.Namespace,
-					Name:      i.Obj.Name,
-				},
-			}))
+			routes := krt.Fetch(ctx, routeAttachments, krt.FilterIndex(routeAttachmentsIndex, types.NamespacedName{Namespace: i.Obj.Namespace, Name: i.Obj.Name}))
 			counts := map[string]int32{}
 			for _, r := range routes {
 				counts[r.ListenerName]++
@@ -247,10 +280,8 @@ func (s *Syncer) buildFinalListenerSetStatus(
 
 	gatewayIndex := krt.NewIndex(gateways, "gateway-parent-section-name", func(gwl *translator.GatewayListener) []utils.SectionedNamespacedName {
 		return []utils.SectionedNamespacedName{{
-			NamespacedName: types.NamespacedName{
-				Namespace: gwl.ParentObject.Namespace,
-				Name:      gwl.ParentObject.Name,
-			},
+			Namespace:   gwl.ParentObject.Namespace,
+			Name:        gwl.ParentObject.Name,
 			SectionName: gwl.ParentInfo.SectionName,
 		}}
 	}).AsCollection(append(krtopts.ToOptions("translator/ListenerSetListenersByParentSection"), utils.SectionedNamespacedNameIndexCollectionFunc)...)
@@ -264,11 +295,9 @@ func (s *Syncer) buildFinalListenerSetStatus(
 			invalidListenerCount := 0
 			lsStatus := i.Status.DeepCopy()
 			routes := krt.Fetch(ctx, routeAttachments, krt.FilterIndex(routeAttachmentsIndex, utils.TypedNamespacedName{
-				Kind: wellknown.ListenerSetGVK.Kind,
-				NamespacedName: types.NamespacedName{
-					Namespace: i.Obj.Namespace,
-					Name:      i.Obj.Name,
-				},
+				Kind:      wellknown.ListenerSetGVK.Kind,
+				Namespace: i.Obj.Namespace,
+				Name:      i.Obj.Name,
 			}))
 			counts := map[string]int32{}
 			for _, r := range routes {
@@ -276,10 +305,8 @@ func (s *Syncer) buildFinalListenerSetStatus(
 			}
 			for idx, l := range i.Obj.Spec.Listeners {
 				gatewayListeners := krtutil.FetchIndexObjects(ctx, gatewayIndex, utils.SectionedNamespacedName{
-					NamespacedName: types.NamespacedName{
-						Namespace: i.Obj.Namespace,
-						Name:      i.Obj.Name,
-					},
+					Namespace:   i.Obj.Namespace,
+					Name:        i.Obj.Name,
 					SectionName: l.Name,
 				})
 				if len(gatewayListeners) == 0 {
@@ -298,6 +325,10 @@ func (s *Syncer) buildFinalListenerSetStatus(
 						invalidListenerCount++
 						ListenerMessageProtocolConflict := "Found conflicting protocols on listeners, a single port can only contain listeners with compatible protocols"
 						ReportListenerSetListenerConflicts(&lsStatus.Listeners[idx], i.Obj, string(gwv1.ListenerReasonProtocolConflict), ListenerMessageProtocolConflict)
+					} else if obj.Conflict == translator.ListenerConflictBindMode {
+						invalidListenerCount++
+						listenerMessageBindModeConflict := "Found conflicting bind modes on listeners; the higher-precedence listener determines whether the shared port is internal"
+						ReportListenerSetListenerConflicts(&lsStatus.Listeners[idx], i.Obj, "BindModeConflict", listenerMessageBindModeConflict)
 					}
 				}
 				lsStatus.Listeners[idx].AttachedRoutes = counts[string(l.Name)]
@@ -363,37 +394,42 @@ func ReportListenerSetListenerConflicts(status *gwv1.ListenerEntryStatus, obj *g
 
 func (s *Syncer) buildGatewayCollection(
 	gatewayClasses krt.Collection[translator.GatewayClass],
-	listenerSets krt.Collection[translator.ListenerSet],
+	listenerSets krt.Collection[*translator.ListenerSet],
 	refGrants translator.ReferenceGrants,
+	referenceTypes plugins.ReferenceTypes,
 	krtopts krtutil.KrtOptions,
 ) (
 	krt.StatusCollection[*gwv1.Gateway, gwv1.GatewayStatus],
 	krt.Collection[*translator.GatewayListener],
 ) {
 	return translator.GatewayCollection(translator.GatewayCollectionConfig{
-		ControllerName:           s.controllerName,
-		Gateways:                 s.agwCollections.Gateways,
-		ListenerSets:             listenerSets,
-		GatewayClasses:           gatewayClasses,
-		Namespaces:               s.agwCollections.Namespaces,
-		Grants:                   refGrants,
-		Secrets:                  s.agwCollections.Secrets,
-		ConfigMaps:               s.agwCollections.ConfigMaps,
-		KrtOpts:                  krtopts,
-		EnableAgentgatewayModels: s.agwCollections.Settings.EnableAgentgatewayModels,
+		ControllerName:      s.controllerName,
+		Gateways:            s.agwCollections.Gateways,
+		ListenerSets:        listenerSets,
+		GatewayClasses:      gatewayClasses,
+		Namespaces:          s.agwCollections.Namespaces,
+		Grants:              refGrants,
+		Secrets:             s.agwCollections.Secrets,
+		ConfigMaps:          s.agwCollections.ConfigMaps,
+		ClusterTrustBundles: s.agwCollections.ClusterTrustBundles,
+		References:          referenceTypes,
+		BackendRefGrantMode: s.agwCollections.Settings.BackendRefGrantMode,
+		KrtOpts:             krtopts,
+		ModelKinds:          s.agwCollections.ModelKinds(),
 	}, s.gatewayCollectionOptions...)
 }
 
 func (s *Syncer) buildListenerSetCollection(
 	gatewayClasses krt.Collection[translator.GatewayClass],
 	refGrants translator.ReferenceGrants,
+	referenceTypes plugins.ReferenceTypes,
 	krtopts krtutil.KrtOptions,
 ) (
 	krt.StatusCollection[*gwv1.ListenerSet, gwv1.ListenerSetStatus],
-	krt.Collection[translator.ListenerSet],
+	krt.Collection[*translator.ListenerSet],
 ) {
 	return krt.NewStatusManyCollection(s.agwCollections.ListenerSets,
-		func(ctx krt.HandlerContext, obj *gwv1.ListenerSet) (*gwv1.ListenerSetStatus, []translator.ListenerSet) {
+		func(ctx krt.HandlerContext, obj *gwv1.ListenerSet) (*gwv1.ListenerSetStatus, []*translator.ListenerSet) {
 			return translator.ListenerSetBuilder(
 				ctx, obj,
 				s.controllerName,
@@ -403,22 +439,182 @@ func (s *Syncer) buildListenerSetCollection(
 				refGrants,
 				s.agwCollections.Secrets,
 				s.agwCollections.ConfigMaps,
-				s.agwCollections.Settings.EnableAgentgatewayModels,
+				s.agwCollections.ClusterTrustBundles,
+				referenceTypes,
+				s.agwCollections.Settings.BackendRefGrantMode,
+				s.agwCollections.ModelKinds(),
 			)
 		}, krtopts.ToOptions("translator/ListenerSetListeners")...)
 }
 
+// RejectedListenerSet is a contributed listener set that failed admission. The syncer does not
+// write status for it: the contributor owns the resource it came from, so it owns the reporting.
+type RejectedListenerSet struct {
+	ListenerSet *translator.ListenerSet
+	Reason      gwv1.ListenerSetConditionReason
+	Message     string
+}
+
+func (r RejectedListenerSet) ResourceName() string {
+	return r.ListenerSet.ResourceName()
+}
+
+func (r RejectedListenerSet) Equals(other RejectedListenerSet) bool {
+	return r.Reason == other.Reason && r.Message == other.Message && r.ListenerSet.Equals(other.ListenerSet)
+}
+
+type reviewedListenerSet struct {
+	ListenerSet *translator.ListenerSet
+	Admitted    bool
+	// Nil for an admitted set, and for one dropped for a transient reason worth no report.
+	Rejection *RejectedListenerSet
+}
+
+func (r reviewedListenerSet) ResourceName() string {
+	return r.ListenerSet.ResourceName()
+}
+
+func (r reviewedListenerSet) Equals(other reviewedListenerSet) bool {
+	if (r.Rejection != nil) != (other.Rejection != nil) {
+		return false
+	}
+	if r.Rejection != nil && !r.Rejection.Equals(*other.Rejection) {
+		return false
+	}
+	return r.Admitted == other.Admitted && r.ListenerSet.Equals(other.ListenerSet)
+}
+
+// joinExtraListenerSets joins admissible contributed listener sets with those built from Gateway
+// API ListenerSets, returning the refused contributions alongside.
+func (s *Syncer) joinExtraListenerSets(
+	base krt.Collection[*translator.ListenerSet],
+	krtopts krtutil.KrtOptions,
+) (krt.Collection[*translator.ListenerSet], krt.Collection[RejectedListenerSet]) {
+	noRejections := func() krt.Collection[RejectedListenerSet] {
+		return krt.NewDisabledCollection[RejectedListenerSet](
+			krtopts.ToOptions("translator/RejectedExtraListenerSets")...)
+	}
+	if s.extraListenerSets == nil {
+		return base, noRejections()
+	}
+	extra := s.extraListenerSets(s.agwCollections, krtopts)
+	if extra == nil {
+		return base, noRejections()
+	}
+
+	reviewed := krt.NewCollection(extra, func(ctx krt.HandlerContext, ls *translator.ListenerSet) *reviewedListenerSet {
+		return s.reviewExtraListenerSet(ctx, base, ls)
+	}, krtopts.ToOptions("translator/ReviewedExtraListenerSets")...)
+
+	admitted := krt.NewCollection(reviewed, func(ctx krt.HandlerContext, r reviewedListenerSet) **translator.ListenerSet {
+		if !r.Admitted {
+			return nil
+		}
+		return &r.ListenerSet
+	}, krtopts.ToOptions("translator/AdmittedExtraListenerSets")...)
+
+	rejected := krt.NewCollection(reviewed, func(ctx krt.HandlerContext, r reviewedListenerSet) *RejectedListenerSet {
+		return r.Rejection
+	}, krtopts.ToOptions("translator/RejectedExtraListenerSets")...)
+
+	// JoinCollection would resolve a duplicate name in List and GetKey but not in its index, and
+	// the index is how GatewayTransformationFunc reads listener sets. Merging on first-wins keeps
+	// the CRD ListenerSet ahead of an already-admitted contribution it collides with.
+	return krt.JoinWithMergeCollection(
+		[]krt.Collection[*translator.ListenerSet]{base, admitted},
+		func(ts []*translator.ListenerSet) **translator.ListenerSet { return &ts[0] },
+		krtopts.ToOptions("translator/AllListenerSets")...,
+	), rejected
+}
+
+// reviewExtraListenerSet applies the allowedListeners gate a Gateway API ListenerSet gets, plus
+// the identity checks CRD schema validation would otherwise have covered.
+func (s *Syncer) reviewExtraListenerSet(
+	ctx krt.HandlerContext,
+	base krt.Collection[*translator.ListenerSet],
+	ls *translator.ListenerSet,
+) *reviewedListenerSet {
+	reject := func(reason gwv1.ListenerSetConditionReason, message string) *reviewedListenerSet {
+		return &reviewedListenerSet{
+			ListenerSet: ls,
+			Rejection:   &RejectedListenerSet{ListenerSet: ls, Reason: reason, Message: message},
+		}
+	}
+
+	if ls.ParentObject.Kind != wellknown.ListenerSetGVK.Kind || ls.Conflict != "" {
+		return reject(gwv1.ListenerSetReasonInvalid, "listener candidate must have ListenerSet parent kind and no conflict")
+	}
+
+	// ListenerKey is what routes attach to; ParentInfo.ParentGateway is what binds group by.
+	if ls.ParentInfo.SectionName == "" {
+		return reject(gwv1.ListenerSetReasonInvalid, "section name is empty")
+	}
+	if want := utils.InternalGatewayName(ls.ParentObject.Namespace, ls.ParentObject.Name, string(ls.ParentInfo.SectionName)); ls.Name != want {
+		return reject(gwv1.ListenerSetReasonInvalid,
+			fmt.Sprintf("name %q is not derived from parent %v and section name %q", ls.Name, ls.ParentObject.NamespacedName, ls.ParentInfo.SectionName))
+	}
+	if ls.ParentInfo.ListenerKey != ls.Name {
+		return reject(gwv1.ListenerSetReasonInvalid,
+			fmt.Sprintf("listener key %q does not match name %q", ls.ParentInfo.ListenerKey, ls.Name))
+	}
+	if ls.ParentInfo.ParentGateway != ls.ParentGateway {
+		return reject(gwv1.ListenerSetReasonInvalid,
+			fmt.Sprintf("parent gateway %v does not match %v", ls.ParentInfo.ParentGateway, ls.ParentGateway))
+	}
+
+	// Status, policy and listener keys are shared with Gateway API objects, and
+	// InternalGatewayName is not injective, so a contribution must not collide with one.
+	if krt.FetchOne(ctx, s.agwCollections.ListenerSets, krt.FilterObjectName(ls.ParentObject.NamespacedName)) != nil {
+		return reject(gwv1.ListenerSetReasonInvalid, fmt.Sprintf("parent %v is a ListenerSet", ls.ParentObject.NamespacedName))
+	}
+	if krt.FetchOne(ctx, s.agwCollections.Gateways, krt.FilterObjectName(ls.ParentObject.NamespacedName)) != nil {
+		return reject(gwv1.ListenerSetReasonInvalid, fmt.Sprintf("parent %v is a Gateway", ls.ParentObject.NamespacedName))
+	}
+	if krt.FetchOne(ctx, base, krt.FilterKey(ls.ResourceName())) != nil {
+		return reject(gwv1.ListenerSetReasonInvalid, fmt.Sprintf("name %q is already used by a ListenerSet listener", ls.Name))
+	}
+
+	parentGateway := ptr.Flatten(krt.FetchOne(ctx, s.agwCollections.Gateways, krt.FilterObjectName(ls.ParentGateway)))
+	if parentGateway == nil {
+		// Not admitted, and not reported: usually collection ordering, not a contributor error.
+		return &reviewedListenerSet{ListenerSet: ls}
+	}
+	allowed := parentGateway.Spec.AllowedListeners
+	if allowed == nil && s.allowedListenersResolver != nil {
+		allowed = s.allowedListenersResolver(parentGateway)
+	}
+	if !translator.AllowedListenersAcceptNamespace(
+		allowed,
+		ls.ParentObject.Namespace,
+		parentGateway.Namespace,
+		func(n string) *corev1.Namespace {
+			return ptr.Flatten(krt.FetchOne(ctx, s.agwCollections.Namespaces, krt.FilterKey(n)))
+		},
+	) {
+		return reject(gwv1.ListenerSetReasonNotAllowed, "Gateway does not allow listener set attachment")
+	}
+	return &reviewedListenerSet{ListenerSet: ls, Admitted: true}
+}
+
 func (s *Syncer) buildAgwResources(
 	gateways krt.Collection[*translator.GatewayListener],
-	listenerSets krt.Collection[translator.ListenerSet],
+	listenerSets krt.Collection[*translator.ListenerSet],
 	refGrants translator.ReferenceGrants,
 	referenceTypes plugins.ReferenceTypes,
 	krtopts krtutil.KrtOptions,
 ) (krt.Collection[agwir.AgwResource], krt.Collection[*plugins.RouteAttachment], plugins.ReferenceIndex) {
 	// filter gateway collections to only include gateways which use a built-in gateway class
 	// (resources for additional gateway classes should be created by the downstream providing them)
-	filteredGateways := krt.NewCollection(gateways, func(ctx krt.HandlerContext, gw *translator.GatewayListener) **translator.GatewayListener {
+	routeGateways := krt.NewCollection(gateways, func(ctx krt.HandlerContext, gw *translator.GatewayListener) **translator.GatewayListener {
 		if _, isAdditionalClass := s.additionalGatewayClasses[gw.ParentInfo.ParentGatewayClassName]; isAdditionalClass {
+			return nil
+		}
+		return &gw
+	}, krtopts.ToOptions("translator/RouteGateways")...)
+
+	// Keep conflicted parents for attachment status, but do not program them.
+	filteredGateways := krt.NewCollection(routeGateways, func(ctx krt.HandlerContext, gw *translator.GatewayListener) **translator.GatewayListener {
+		if gw.Conflict != "" {
 			return nil
 		}
 		return &gw
@@ -438,18 +634,8 @@ func (s *Syncer) buildAgwResources(
 	}
 	binds := krt.JoinCollection(bindCollections, krtopts.ToOptions("resources/Binds")...)
 
-	// Build listeners
-	baseListeners := krt.NewCollection(filteredGateways, func(ctx krt.HandlerContext, obj *translator.GatewayListener) *agwir.AgwResource {
-		return s.buildListenerFromGateway(obj)
-	}, krtopts.ToOptions("translator/Listeners")...)
-	listenerCollections := []krt.Collection[agwir.AgwResource]{baseListeners}
-	if s.agwPlugins.AddResourceExtension != nil && s.agwPlugins.AddResourceExtension.Listeners != nil {
-		listenerCollections = append(listenerCollections, s.agwPlugins.AddResourceExtension.Listeners)
-	}
-	listeners := krt.JoinCollection(listenerCollections, krtopts.ToOptions("resources/Listeners")...)
-
 	// Build routes
-	var routeParents translator.ParentResolver = translator.BuildRouteParents(filteredGateways)
+	var routeParents translator.ParentResolver = translator.BuildRouteParents(routeGateways, krtopts)
 
 	// Compose with plugin-provided parent resolvers.
 	if ext := s.agwPlugins.AddResourceExtension; ext != nil && len(ext.ParentResolvers) > 0 {
@@ -474,17 +660,40 @@ func (s *Syncer) buildAgwResources(
 		InferencePools:      s.agwCollections.InferencePools,
 		Backends:            s.agwCollections.Backends,
 		Models:              s.agwCollections.Models,
-		ModelsByNamespace:   s.agwCollections.ModelsByNamespace,
 		References:          referenceTypes,
 		BackendRefGrantMode: s.agwCollections.Settings.BackendRefGrantMode,
 	}
+	routeInputs.ParentRefs = translator.RouteParentRefsCollection(
+		routeInputs,
+		s.agwCollections.HTTPRoutes,
+		s.agwCollections.GRPCRoutes,
+		s.agwCollections.TCPRoutes,
+		s.agwCollections.TLSRoutes,
+		s.agwCollections.Models,
+		krtopts,
+	)
+
+	// Build listeners
+	baseListeners := krt.NewCollection(filteredGateways, func(ctx krt.HandlerContext, obj *translator.GatewayListener) *agwir.AgwResource {
+		return s.buildListenerFromGateway(obj)
+	}, krtopts.ToOptions("translator/Listeners")...)
+	listenerCollections := []krt.Collection[agwir.AgwResource]{baseListeners}
+	if s.agwPlugins.AddResourceExtension != nil && s.agwPlugins.AddResourceExtension.Listeners != nil {
+		listenerCollections = append(listenerCollections, s.agwPlugins.AddResourceExtension.Listeners)
+	}
+	listeners := krt.JoinCollection(listenerCollections, krtopts.ToOptions("resources/Listeners")...)
 
 	baseAgwRoutes, routeAttachments, ancestorBackends := translator.AgwRouteCollection(s.statusCollections, s.agwCollections.HTTPRoutes, s.agwCollections.GRPCRoutes, s.agwCollections.TCPRoutes, s.agwCollections.TLSRoutes, routeInputs, krtopts)
 	routeCollections := []krt.Collection[agwir.AgwResource]{baseAgwRoutes}
-	if s.agwCollections.Settings.EnableAgentgatewayModels {
-		modelResources, modelAttachments := translator.AgwModelCollection(s.statusCollections, s.agwCollections.Models, routeInputs, krtopts)
-		routeAttachments = krt.JoinCollection([]krt.Collection[*plugins.RouteAttachment]{routeAttachments, modelAttachments}, krtopts.ToOptions("translator/RouteAttachmentsWithModels")...)
-		routeCollections = append(routeCollections, modelResources)
+	modelResources, modelAttachments, modelAncestors := translator.AgwModelCollection(s.statusCollections, s.agwCollections.Models, routeInputs, krtopts)
+	routeAttachments = krt.JoinCollection([]krt.Collection[*plugins.RouteAttachment]{routeAttachments, modelAttachments}, krtopts.ToOptions("translator/RouteAttachmentsWithModels")...)
+	routeCollections = append(routeCollections, modelResources)
+	ancestorBackends = krt.JoinCollection([]krt.Collection[*utils.AncestorBackend]{ancestorBackends, modelAncestors}, krtopts.ToOptions("translator/AncestorBackendsWithModels")...)
+	if s.modelCollections != nil {
+		extra := s.modelCollections(ModelCollectionsConfig{Inputs: routeInputs, StatusCollections: s.statusCollections, KrtOpts: krtopts})
+		routeCollections = append(routeCollections, extra.Resources)
+		routeAttachments = krt.JoinCollection([]krt.Collection[*plugins.RouteAttachment]{routeAttachments, extra.Attachments}, krtopts.ToOptions("translator/RouteAttachmentsWithExtraModels")...)
+		ancestorBackends = krt.JoinCollection([]krt.Collection[*utils.AncestorBackend]{ancestorBackends, extra.Ancestors}, krtopts.ToOptions("translator/AncestorBackendsWithExtraModels")...)
 	}
 	if s.agwPlugins.AddResourceExtension != nil {
 		if s.agwPlugins.AddResourceExtension.Routes != nil {
@@ -499,6 +708,14 @@ func (s *Syncer) buildAgwResources(
 		return []utils.TypedNamespacedName{o.From}
 	}).AsCollection(append(krtopts.ToOptions("translator/RouteAttachmentsBySource"), utils.TypedNamespacedNameIndexCollectionFunc)...)
 
+	listenerFilterAncestors := krt.NewManyCollection(gatewayParents, func(krtctx krt.HandlerContext, object krt.IndexObject[string, *translator.GatewayListener]) []*utils.AncestorBackend {
+		if len(object.Objects) == 0 {
+			return nil
+		}
+		return translator.ListenerFilterAncestorBackends(routeInputs.WithCtx(krtctx), object.Objects[0].ParentGateway, object.Objects)
+	}, krtopts.ToOptions("translator/ListenerFilterAncestors")...)
+	ancestorBackends = krt.JoinCollection([]krt.Collection[*utils.AncestorBackend]{ancestorBackends, listenerFilterAncestors}, krtopts.ToOptions("translator/AncestorBackendsWithListenerFilters")...)
+
 	ancestorsIndex := krt.NewIndex(ancestorBackends, "ancestors", func(o *utils.AncestorBackend) []utils.TypedNamespacedName {
 		return []utils.TypedNamespacedName{o.Backend}
 	})
@@ -509,20 +726,21 @@ func (s *Syncer) buildAgwResources(
 	// LookupGatewaysForTarget can route ListenerSet-targeted policies to the
 	// correct xDS snapshot.
 	listenerSetAttachments := krt.NewManyCollection(listenerSets,
-		func(ctx krt.HandlerContext, ls translator.ListenerSet) []*plugins.RouteAttachment {
+		func(ctx krt.HandlerContext, ls *translator.ListenerSet) []*plugins.RouteAttachment {
 			if !ls.Valid {
 				return nil
 			}
 			lsKey := utils.TypedNamespacedName{
 				Kind:           wellknown.ListenerSetGVK.Kind,
-				NamespacedName: ls.Parent,
+				NamespacedName: ls.ParentObject.NamespacedName,
 			}
 			return []*plugins.RouteAttachment{{
 				From:    lsKey,
 				To:      lsKey,
-				Gateway: ls.GatewayParent,
-				// ListenerName omitted: this index only needs ListenerSet→Gateway;
-				// omitting it lets krt deduplicate the N per-listener entries to one.
+				Gateway: ls.ParentGateway,
+				// Each input listener must own a distinct attachment so removing one
+				// preserves the remaining listeners' ListenerSet-to-Gateway mapping.
+				ListenerName: string(ls.ParentInfo.SectionName),
 			}}
 		}, krtopts.ToOptions("translator/ListenerSetGatewayAttachments")...)
 	listenerSetAttachmentsIdx := krt.NewIndex(listenerSetAttachments, "ls-to-gateway",
@@ -547,14 +765,22 @@ func (s *Syncer) buildAgwResources(
 
 	// Phase 2: Build policies with the fully-populated reference index.
 	agwPolicies, policyStatuses := BuildPolicies(s.agwPlugins, referenceIndex, refGrants, krtopts)
-	for _, col := range policyStatuses {
-		status.RegisterStatus(s.statusCollections, col, translator.GetStatus)
+	for gk, col := range policyStatuses {
+		getStatus := s.agwPlugins.ContributesPolicies[gk].GetStatus
+		if getStatus == nil {
+			getStatus = translator.GetStatus
+		}
+		status.RegisterStatus(s.statusCollections, col, getStatus)
 	}
 
 	// Build the backend collection with backend+route references
 	agwBackends, agwBackendStatus := AgwBackendCollection(s.agwPlugins, referenceIndex, refGrants, krtopts)
-	for _, col := range agwBackendStatus {
-		status.RegisterStatus(s.statusCollections, col, translator.GetStatus)
+	for gk, col := range agwBackendStatus {
+		getStatus := s.agwPlugins.ContributesBackends[gk].GetStatus
+		if getStatus == nil {
+			getStatus = translator.GetStatus
+		}
+		status.RegisterStatus(s.statusCollections, col, getStatus)
 	}
 	// Join all Agw resources
 	allAgwResources := krt.JoinCollection([]krt.Collection[agwir.AgwResource]{binds, listeners, agwRoutes, agwPolicies, agwBackends}, krtopts.ToOptions("resources/AllResources")...)
@@ -573,7 +799,6 @@ func (s *Syncer) buildBindsFromGateway(listeners []*translator.GatewayListener) 
 		protocol       api.Bind_Protocol
 		tunnelProtocol api.Bind_TunnelProtocol
 		sawInternal    bool
-		sawStandard    bool
 	}
 	byPort := map[uint32]*bindInfo{}
 	for _, listener := range listeners {
@@ -589,17 +814,16 @@ func (s *Syncer) buildBindsFromGateway(listeners []*translator.GatewayListener) 
 		// non-overlapping. This case doesn't need to be handled here since the generated bind is independent of
 		// hostname
 		if listener.Conflict == "" {
-			bi.protocol = s.getBindProtocol(listener)
-			if tp := s.getTunnelProtocol(listener); tp != api.Bind_DIRECT {
+			bi.protocol = translator.BindProtocol(listener.ParentInfo.Protocol)
+			if tp := translator.TunnelProtocol(listener.ParentInfo.Protocol); tp != api.Bind_DIRECT {
 				bi.tunnelProtocol = tp
 			}
-			// A bind is internal only if every contributing listener agrees. Disagreement
-			// (sawInternal && sawStandard) is reported as Accepted=False in translation and
-			// leaves the bind standard here.
+			// A bind is internal if any contributing listener marks it internal. Translation
+			// reports disagreement as Accepted=False, but the bind must fail closed: a
+			// standard listener (including one from a delegated ListenerSet) must not make
+			// another listener's internal route externally reachable.
 			if listener.ParentInfo.Internal {
 				bi.sawInternal = true
-			} else {
-				bi.sawStandard = true
 			}
 		}
 	}
@@ -608,7 +832,7 @@ func (s *Syncer) buildBindsFromGateway(listeners []*translator.GatewayListener) 
 	for _, port := range slices.Sort(maps.Keys(byPort)) { // sorted for deterministic output
 		bi := byPort[port]
 		mode := api.Bind_STANDARD
-		if bi.sawInternal && !bi.sawStandard {
+		if bi.sawInternal {
 			mode = api.Bind_INTERNAL
 		}
 		bind := translator.AgwBind{
@@ -633,14 +857,18 @@ func (s *Syncer) buildListenerFromGateway(obj *translator.GatewayListener) *agwi
 	}
 	listenerName := utils.ListenerName(obj.ParentGateway.Namespace, obj.ParentGateway.Name, string(obj.ParentInfo.SectionName), ls)
 	l := &api.Listener{
-		Key:      obj.ResourceName(),
-		Name:     listenerName,
-		BindKey:  fmt.Sprint(obj.ParentInfo.Port) + "/" + obj.ParentGateway.Namespace + "/" + obj.ParentGateway.Name,
-		Hostname: obj.ParentInfo.OriginalHostname,
+		Key:             obj.ResourceName(),
+		Name:            listenerName,
+		BindKey:         fmt.Sprint(obj.ParentInfo.Port) + "/" + obj.ParentGateway.Namespace + "/" + obj.ParentGateway.Name,
+		Hostname:        obj.ParentInfo.OriginalHostname,
+		TrafficPolicies: obj.FilterResult.Policies,
+	}
+	if obj.FilterResult.Error != "" {
+		l.Error = &obj.FilterResult.Error
 	}
 
 	// Set protocol and TLS configuration
-	protocol, tlsConfig, ok := s.getProtocolAndTLSConfig(obj)
+	protocol, tlsConfig, ok := translator.ListenerProtocolAndTLSConfig(obj)
 	if !ok {
 		return nil // Unsupported protocol or missing TLS config
 	}
@@ -652,95 +880,6 @@ func (s *Syncer) buildListenerFromGateway(obj *translator.GatewayListener) *agwi
 		Namespace: obj.ParentGateway.Namespace,
 		Name:      obj.ParentGateway.Name,
 	}, translator.AgwListener{Listener: l}))
-}
-
-// getProtocolAndTLSConfig extracts protocol and TLS configuration from a gateway
-func (s *Syncer) getProtocolAndTLSConfig(obj *translator.GatewayListener) (api.Protocol, *api.TLSConfig, bool) {
-	var tlsConfig *api.TLSConfig
-
-	// Build TLS config if needed
-	if obj.TLSInfo != nil {
-		tlsConfig = &api.TLSConfig{
-			Cert:       obj.TLSInfo.Cert,
-			PrivateKey: obj.TLSInfo.Key,
-		}
-		if obj.TLSInfo.IstioWorkloadCert {
-			tlsConfig.CertificateSource = api.TLSConfig_ISTIO_WORKLOAD
-		} else if obj.TLSInfo.DynamicCA {
-			tlsConfig.CertificateSource = api.TLSConfig_DYNAMIC_CA
-		}
-		if len(obj.TLSInfo.CaCert) > 0 {
-			tlsConfig.Root = obj.TLSInfo.CaCert
-		}
-		if obj.TLSInfo.IstioMutual {
-			tlsConfig.Root = nil
-			tlsConfig.MtlsMode = api.TLSConfig_STRICT
-		} else if obj.TLSInfo.IstioWorkloadCert {
-			tlsConfig.MtlsMode = api.TLSConfig_DISABLE
-		} else if obj.TLSInfo.MtlsFallbackEnabled {
-			tlsConfig.MtlsMode = api.TLSConfig_ALLOW_INSECURE_FALLBACK
-		}
-	}
-
-	switch obj.ParentInfo.Protocol {
-	case gwv1.HTTPProtocolType:
-		return api.Protocol_HTTP, nil, true
-	case gwv1.HTTPSProtocolType:
-		if tlsConfig == nil {
-			return api.Protocol_HTTPS, nil, false // TLS required but not configured
-		}
-		return api.Protocol_HTTPS, tlsConfig, true
-	case gwv1.TLSProtocolType:
-		if tlsConfig == nil {
-			if obj.ParentInfo.TLSPassthrough {
-				// For passthrough, we don't want TLS config
-				return api.Protocol_TLS, nil, true
-			} else {
-				// TLS required but not configured
-				return api.Protocol_TLS, nil, false
-			}
-		}
-		return api.Protocol_TLS, tlsConfig, true
-	case gwv1.TCPProtocolType:
-		return api.Protocol_TCP, nil, true
-	case gwv1.ProtocolType(protocol.HBONE):
-		return api.Protocol_HBONE, nil, true
-	default:
-		return api.Protocol_HTTP, nil, false // Unsupported protocol
-	}
-}
-
-// getProtocolAndTLSConfig extracts protocol and TLS configuration from a gateway
-func (s *Syncer) getBindProtocol(obj *translator.GatewayListener) api.Bind_Protocol {
-	switch obj.ParentInfo.Protocol {
-	case gwv1.HTTPProtocolType:
-		return api.Bind_HTTP
-	case gwv1.HTTPSProtocolType:
-		return api.Bind_TLS
-	case gwv1.TLSProtocolType:
-		return api.Bind_TLS
-	case gwv1.TCPProtocolType:
-		return api.Bind_TCP
-	case gwv1.ProtocolType(protocol.HBONE):
-		// The bind protocol is not used for HBONE_GATEWAY in the data plane;
-		// the actual inner protocol is determined at runtime from the other
-		// listeners on the same port. Return HTTP as a placeholder.
-		return api.Bind_HTTP
-	default:
-		return api.Bind_HTTP
-	}
-}
-
-// getTunnelProtocol maps a Gateway listener protocol to its tunnel protocol.
-// HBONE listeners use HBONE_GATEWAY mode: the proxy terminates inbound HBONE
-// and routes CONNECT requests to local binds.
-func (s *Syncer) getTunnelProtocol(obj *translator.GatewayListener) api.Bind_TunnelProtocol {
-	switch obj.ParentInfo.Protocol {
-	case gwv1.ProtocolType(protocol.HBONE):
-		return api.Bind_HBONE_GATEWAY
-	default:
-		return api.Bind_DIRECT
-	}
 }
 
 // defaultBuildAddressCollections is the default implementation for building address collections
@@ -767,6 +906,7 @@ func defaultBuildAddressCollections(cols *plugins.AgwCollections, krtopts krtuti
 		defaultConfig := ambient.MeshConfig{MeshConfig: mesh.DefaultMeshConfig()}
 		meshConfig = krt.NewStatic(&defaultConfig, true, krtopts.ToOptions("addresses/DefaultMeshConfig")...)
 	}
+	serviceEntryVisibility := model.ServiceEntryVisibilityCollection(meshConfig.AsCollection(), opts)
 
 	waypoints := builder.WaypointsCollection(clusterId, cols.Gateways, cols.GatewayClasses, cols.Pods, opts)
 	services := builder.ServicesCollection(
@@ -776,13 +916,14 @@ func defaultBuildAddressCollections(cols *plugins.AgwCollections, krtopts krtuti
 		waypoints,
 		cols.Namespaces,
 		meshConfig,
+		serviceEntryVisibility,
 		opts,
 		true,
 	)
 	// Istio doesn't include InferencePools, but we need them; add our own after the Istio build
-	inferencePoolsInfo := krt.NewCollection(cols.InferencePools, InferencePoolBuilder(),
+	inferencePoolsInfo := krt.NewPointerCollection(cols.InferencePools, InferencePoolBuilder(),
 		krtopts.ToOptions("addresses/InferencePoolServices")...)
-	services = krt.JoinCollection([]krt.Collection[model.ServiceInfo]{services, inferencePoolsInfo}, append(krtopts.ToOptions("addresses/ServicesWithInferencePools"), krt.WithJoinUnchecked())...)
+	services = krt.JoinCollection([]krt.Collection[*model.ServiceInfo]{services, inferencePoolsInfo}, append(krtopts.ToOptions("addresses/ServicesWithInferencePools"), krt.WithJoinUnchecked())...)
 
 	nodeLocality := ambient.NodesCollection(cols.Nodes, opts.WithName("NodeLocality")...)
 	workloads := builder.WorkloadsCollection(
@@ -790,8 +931,14 @@ func defaultBuildAddressCollections(cols *plugins.AgwCollections, krtopts krtuti
 		nodeLocality,
 		meshConfig,
 		// Authz/Authn are not use for agentgateway, ignore
-		krt.NewStaticCollection[model.WorkloadAuthorization](nil, nil, krtopts.ToOptions("addresses/DisabledWorkloadAuthorization")...),
-		krt.NewStaticCollection[*securityclient.PeerAuthentication](nil, nil, krtopts.ToOptions("addresses/DisabledPeerAuthentication")...),
+		krt.NewIndex(
+			krt.NewDisabledCollection[model.WorkloadAuthorization](krtopts.ToOptions("addresses/DisabledWorkloadAuthorization")...),
+			"byNS",
+			func(model.WorkloadAuthorization) []string { return nil },
+		),
+		krt.NewNamespaceIndex(
+			krt.NewDisabledCollection[*securityclient.PeerAuthentication](krtopts.ToOptions("addresses/DisabledPeerAuthentication")...),
+		),
 		waypoints,
 		services,
 		cols.WorkloadEntries,
@@ -801,11 +948,11 @@ func defaultBuildAddressCollections(cols *plugins.AgwCollections, krtopts krtuti
 		opts,
 	)
 
-	workloadAddresses := krt.MapCollection(workloads, func(t model.WorkloadInfo) Address {
-		return Address{Workload: &t}
+	workloadAddresses := krt.MapCollection(workloads, func(t *model.WorkloadInfo) Address {
+		return Address{Workload: t}
 	}, krtopts.ToOptions("addresses/WorkloadAddresses")...)
-	svcAddresses := krt.MapCollection(services, func(t model.ServiceInfo) Address {
-		return Address{Service: &t}
+	svcAddresses := krt.MapCollection(services, func(t *model.ServiceInfo) Address {
+		return Address{Service: t}
 	}, krtopts.ToOptions("addresses/ServiceAddresses")...)
 
 	adpAddresses := krt.JoinCollection([]krt.Collection[Address]{svcAddresses, workloadAddresses}, krtopts.ToOptions("addresses/All")...)

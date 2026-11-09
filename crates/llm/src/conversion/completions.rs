@@ -1,13 +1,17 @@
 use std::time::Instant;
 
 use agent_core::strng;
-use axum_core::body::Body;
+use agent_http::Body;
 use bytes::Bytes;
 use http::Response;
 use itertools::Itertools;
 use tracing::debug;
 
 use crate::{StreamingUsageGuard, logged_response_parsing, parse, types};
+
+#[cfg(test)]
+#[path = "completions_tests.rs"]
+mod tests;
 
 /// Parse a Google error response, handling both single object and array-wrapped formats.
 /// Google's OpenAI-compatible endpoints consistently return `[{"error": {...}}]`
@@ -66,59 +70,15 @@ pub fn translate_google_error(bytes: &Bytes) -> Result<Bytes, crate::AIError> {
 pub(crate) fn parse_data_url(url: &str) -> Option<(&str, &str)> {
 	let raw = url.strip_prefix("data:")?;
 	let (meta, data) = raw.split_once(',')?;
-	let (media_type, encoding) = meta.split_once(';')?;
-	if !encoding.eq_ignore_ascii_case("base64") {
+	// RFC 2397 allows media-type parameters before the encoding marker:
+	// data:<mediatype>[;param=value]*;base64,<data>
+	let idx = meta.len().checked_sub(";base64".len())?;
+	if !meta.get(idx..)?.eq_ignore_ascii_case(";base64") {
 		return None;
 	}
+	// Parameters such as charset are not part of the media type.
+	let media_type = meta.get(..idx)?.split(';').next().unwrap_or_default();
 	Some((media_type, data))
-}
-
-pub(crate) fn extract_system_text(
-	msg: &types::completions::typed::RequestMessage,
-) -> Option<String> {
-	fn normalize_text(text: &str) -> Option<String> {
-		if text.trim().is_empty() {
-			None
-		} else {
-			Some(text.to_string())
-		}
-	}
-
-	match msg {
-		types::completions::typed::RequestMessage::System(system) => match &system.content {
-			types::completions::typed::RequestSystemMessageContent::Text(text) => normalize_text(text),
-			types::completions::typed::RequestSystemMessageContent::Array(parts) => {
-				let text = parts
-					.iter()
-					.map(|part| match part {
-						types::completions::typed::RequestSystemMessageContentPart::Text(text) => {
-							text.text.as_str()
-						},
-					})
-					.filter(|text| !text.trim().is_empty())
-					.collect::<Vec<_>>()
-					.join("\n");
-				normalize_text(&text)
-			},
-		},
-		types::completions::typed::RequestMessage::Developer(developer) => match &developer.content {
-			types::completions::typed::RequestDeveloperMessageContent::Text(text) => normalize_text(text),
-			types::completions::typed::RequestDeveloperMessageContent::Array(parts) => {
-				let text = parts
-					.iter()
-					.map(|part| match part {
-						types::completions::typed::RequestDeveloperMessageContentPart::Text(text) => {
-							text.text.as_str()
-						},
-					})
-					.filter(|text| !text.trim().is_empty())
-					.collect::<Vec<_>>()
-					.join("\n");
-				normalize_text(&text)
-			},
-		},
-		_ => None,
-	}
 }
 
 pub mod from_messages {
@@ -126,7 +86,7 @@ pub mod from_messages {
 	use std::time::Instant;
 
 	use agent_core::strng;
-	use axum_core::body::Body;
+	use agent_http::Body;
 	use bytes::Bytes;
 	use itertools::Itertools;
 	use messages::{ToolResultContent, ToolResultContentPart};
@@ -134,25 +94,67 @@ pub mod from_messages {
 	use types::completions::typed as completions;
 	use types::messages::typed as messages;
 
+	use crate::conversion::GeminiThoughtSignature;
 	use crate::parse::sse::SseJsonEvent;
 	use crate::types::ResponseType;
 	use crate::{AIError, StreamingUsageGuard, json, logged_response_parsing, types};
 
 	/// translate an Anthropic messages to an OpenAI completions request
 	pub fn translate(req: &types::messages::Request) -> Result<Vec<u8>, AIError> {
-		let typed = json::convert::<_, messages::Request>(req).map_err(AIError::RequestMarshal)?;
-		let xlated = translate_internal(typed);
+		let xlated = translate_request(req)?;
 		serde_json::to_vec(&xlated).map_err(AIError::RequestMarshal)
 	}
 
-	pub fn translate_response(bytes: &Bytes) -> Result<Box<dyn ResponseType>, AIError> {
-		let resp = serde_json::from_slice::<completions::Response>(bytes)
-			.map_err(logged_response_parsing(bytes))?;
-		let anthropic = translate_response_internal(resp)?;
-		Ok(Box::new(anthropic))
+	pub fn translate_request(
+		req: &types::messages::Request,
+	) -> Result<types::completions::typed::Request, AIError> {
+		let typed = json::convert::<_, messages::Request>(req)
+			.map_err(|err| AIError::RequestParsing(crate::InputFormat::Messages, err))?;
+		Ok(translate_internal(typed))
 	}
 
-	fn translate_response_internal(
+	pub fn translate_response(bytes: &Bytes, model: &str) -> Result<Box<dyn ResponseType>, AIError> {
+		let mut resp = serde_json::from_slice::<completions::Response>(bytes)
+			.map_err(logged_response_parsing(bytes))?;
+		if resp.model.is_empty() {
+			resp.model = model.to_string();
+		}
+		let provider_usage = resp.usage.as_ref().map(|u| super::super::ProviderUsage {
+			input_tokens: u.prompt_tokens as u64,
+			total_tokens: u.total_tokens as u64,
+			reasoning_tokens: u
+				.completion_tokens_details
+				.as_ref()
+				.and_then(|d| d.reasoning_tokens),
+			..Default::default()
+		});
+		let anthropic = translate_response_internal(resp)?;
+		Ok(Box::new(super::super::ResponseWithProviderUsage {
+			response: anthropic,
+			provider_usage,
+		}))
+	}
+
+	/// First string among the candidate extension values, in precedence order.
+	/// Integers (stop token ids) and empty strings are not stop sequences.
+	pub(crate) fn stop_sequence_from_fields<'a>(
+		candidates: impl IntoIterator<Item = Option<&'a Value>>,
+	) -> Option<String> {
+		candidates
+			.into_iter()
+			.flatten()
+			.filter_map(|v| v.as_str())
+			.find(|s| !s.is_empty())
+			.map(str::to_owned)
+	}
+
+	/// The stop sequence an engine reports on a buffered or streamed choice, if
+	/// any: vLLM uses `stop_reason`; SGLang uses `matched_stop`.
+	pub(crate) fn choice_stop_sequence(rest: &Value) -> Option<String> {
+		stop_sequence_from_fields([rest.get("stop_reason"), rest.get("matched_stop")])
+	}
+
+	pub(crate) fn translate_response_internal(
 		resp: completions::Response,
 	) -> Result<messages::MessagesResponse, AIError> {
 		let completions::Response {
@@ -170,39 +172,50 @@ pub mod from_messages {
 			.ok_or_else(|| AIError::InvalidResponse(strng::literal!("chat response missing choices")))?;
 
 		let mut content: Vec<messages::ContentBlock> = Vec::new();
+		// Engines report reasoning beside the text; the Messages contract puts it first. A turn whose
+		// reasoning text is withheld carries the signature alone, so the signature is enough to send
+		// the block: it is what the next turn has to replay.
+		let thinking = choice.message.reasoning().unwrap_or_default().to_string();
+		let signature = choice.message.reasoning_signature.unwrap_or_default();
+		if !thinking.is_empty() || !signature.is_empty() {
+			content.push(messages::ContentBlock::Thinking {
+				thinking,
+				signature,
+			});
+		}
 		if let Some(text) = choice.message.content {
-			content.push(messages::ContentBlock::Text(messages::ContentTextBlock {
-				text,
-				citations: None,
-				cache_control: None,
-			}));
+			content.push(messages::ContentBlock::text(text));
 		}
-		if let Some(tool_calls) = choice.message.tool_calls {
-			content.extend(tool_calls.into_iter().filter_map(|tc| match tc {
-				completions::MessageToolCalls::Function(f) => {
-					let input =
-						serde_json::from_str::<serde_json::Value>(&f.function.arguments).unwrap_or_default();
-					Some(messages::ContentBlock::ToolUse {
-						id: f.id,
-						name: f.function.name,
-						input,
-						cache_control: None,
-					})
-				},
-				completions::MessageToolCalls::Custom(_) => None,
-			}));
-		}
+		content.extend(
+			choice
+				.message
+				.tool_calls
+				.into_iter()
+				.flatten()
+				.filter_map(|tc| match tc {
+					completions::MessageToolCalls::Function(call) => Some(call),
+					completions::MessageToolCalls::Custom(_) => None,
+				})
+				.flat_map(tool_call_blocks),
+		);
 
-		let stop_reason = choice
-			.finish_reason
-			.map(|r| match r {
-				completions::FinishReason::Stop => messages::StopReason::EndTurn,
-				completions::FinishReason::Length => messages::StopReason::MaxTokens,
-				completions::FinishReason::ToolCalls => messages::StopReason::ToolUse,
-				completions::FinishReason::ContentFilter => messages::StopReason::EndTurn,
-				completions::FinishReason::FunctionCall => messages::StopReason::ToolUse,
-			})
-			.unwrap_or(messages::StopReason::EndTurn);
+		let (mut stop_reason, may_have_stop_sequence) = match choice.finish_reason {
+			Some(completions::FinishReason::Stop) => (messages::StopReason::EndTurn, true),
+			Some(completions::FinishReason::Length) => (messages::StopReason::MaxTokens, false),
+			Some(completions::FinishReason::ToolCalls) => (messages::StopReason::ToolUse, false),
+			Some(completions::FinishReason::ContentFilter) => (messages::StopReason::Refusal, false),
+			Some(completions::FinishReason::FunctionCall) => (messages::StopReason::ToolUse, false),
+			None => (messages::StopReason::EndTurn, false),
+		};
+		// When the engine names the stop sequence that ended generation, the
+		// Messages contract is `stop_reason: "stop_sequence"` plus the matched
+		// string — not `end_turn`, which clients read as "the model finished".
+		let stop_sequence = may_have_stop_sequence
+			.then(|| choice_stop_sequence(&choice.rest))
+			.flatten();
+		if stop_sequence.is_some() {
+			stop_reason = messages::StopReason::StopSequence;
+		}
 
 		let cache_creation_input_tokens = usage.as_ref().and_then(|u| {
 			u.prompt_tokens_details
@@ -219,12 +232,9 @@ pub mod from_messages {
 				.map(|tokens| tokens as usize)
 		});
 		Ok(messages::MessagesResponse {
-			id,
-			r#type: "message".to_string(),
-			role: messages::Role::Assistant,
-			model,
+			content,
 			stop_reason: Some(stop_reason),
-			stop_sequence: None,
+			stop_sequence,
 			usage: messages::Usage {
 				input_tokens: usage
 					.as_ref()
@@ -234,11 +244,12 @@ pub mod from_messages {
 					.saturating_sub(cache_read_input_tokens.unwrap_or(0)),
 				output_tokens: usage
 					.as_ref()
-					.map(|u| u.completion_tokens as usize)
+					.map(|u| u.output_tokens() as usize)
 					.unwrap_or(0),
 				cache_creation_input_tokens,
 				cache_read_input_tokens,
 				service_tier,
+				..Default::default()
 			},
 			input_audio_tokens: usage.as_ref().and_then(|u| {
 				u.prompt_tokens_details
@@ -252,8 +263,27 @@ pub mod from_messages {
 					.and_then(|d| d.audio_tokens)
 					.map(|t| t as usize)
 			}),
-			content,
+			..messages::MessagesResponse::start(id, model)
 		})
+	}
+
+	/// A Gemini thought signature rides in a `Thinking` block placed before the tool call it belongs to.
+	fn tool_call_blocks(
+		call: completions::MessageToolCall,
+	) -> impl Iterator<Item = messages::ContentBlock> {
+		let thinking = call
+			.thought_signature()
+			.map(|signature| messages::ContentBlock::Thinking {
+				thinking: String::new(),
+				signature: GeminiThoughtSignature::encode(&call.id, signature),
+			});
+		let tool_use = messages::ContentBlock::ToolUse {
+			input: crate::conversion::tool_arguments_to_input(&call.function.arguments),
+			id: call.id,
+			name: call.function.name,
+			cache_control: None,
+		};
+		thinking.into_iter().chain(std::iter::once(tool_use))
 	}
 
 	pub fn translate_stream(
@@ -275,12 +305,16 @@ pub mod from_messages {
 			sent_message_start: bool,
 			sent_message_stop: bool,
 			sent_first_token: bool,
+			last_token_at: Option<Instant>,
 			next_block_index: usize,
 			text_block_index: Option<usize>,
+			thinking_block_index: Option<usize>,
+			thinking_signature: Option<String>,
 			tool_block_indices: HashMap<u32, usize>,
 			open_tool_blocks: HashSet<u32>,
 			pending_tool_calls: HashMap<u32, PendingToolCall>,
 			pending_stop_reason: Option<messages::StopReason>,
+			pending_stop_sequence: Option<String>,
 			pending_usage: Option<completions::Usage>,
 		}
 
@@ -302,6 +336,52 @@ pub mod from_messages {
 					messages::MessagesStreamEvent::ContentBlockStop { index },
 				);
 			}
+		}
+
+		fn close_thinking_block(
+			state: &mut StreamState,
+			events: &mut Vec<(&'static str, messages::MessagesStreamEvent)>,
+		) {
+			if let Some(index) = state.thinking_block_index.take() {
+				if let Some(signature) = state.thinking_signature.take() {
+					push_event(
+						events,
+						messages::MessagesStreamEvent::ContentBlockDelta {
+							index,
+							delta: messages::ContentBlockDelta::SignatureDelta { signature },
+						},
+					);
+				}
+				push_event(
+					events,
+					messages::MessagesStreamEvent::ContentBlockStop { index },
+				);
+			}
+		}
+
+		fn open_thinking_block(
+			state: &mut StreamState,
+			events: &mut Vec<(&'static str, messages::MessagesStreamEvent)>,
+		) -> usize {
+			if let Some(index) = state.thinking_block_index {
+				return index;
+			}
+			close_text_block(state, events);
+			close_all_tool_blocks(state, events);
+			let index = state.next_block_index;
+			state.next_block_index += 1;
+			state.thinking_block_index = Some(index);
+			push_event(
+				events,
+				messages::MessagesStreamEvent::ContentBlockStart {
+					index,
+					content_block: messages::ContentBlock::Thinking {
+						thinking: String::new(),
+						signature: String::new(),
+					},
+				},
+			);
+			index
 		}
 
 		fn close_all_tool_blocks(
@@ -336,6 +416,7 @@ pub mod from_messages {
 				return index;
 			}
 			close_all_tool_blocks(state, events);
+			close_thinking_block(state, events);
 			let index = state.next_block_index;
 			state.next_block_index += 1;
 			state.text_block_index = Some(index);
@@ -343,11 +424,7 @@ pub mod from_messages {
 				events,
 				messages::MessagesStreamEvent::ContentBlockStart {
 					index,
-					content_block: messages::ContentBlock::Text(messages::ContentTextBlock {
-						text: "".to_string(),
-						citations: None,
-						cache_control: None,
-					}),
+					content_block: messages::ContentBlock::text("".to_string()),
 				},
 			);
 			index
@@ -361,6 +438,7 @@ pub mod from_messages {
 			name: String,
 		) -> usize {
 			close_text_block(state, events);
+			close_thinking_block(state, events);
 			let index = *state
 				.tool_block_indices
 				.entry(tool_index)
@@ -390,13 +468,19 @@ pub mod from_messages {
 		}
 
 		fn maybe_set_first_token(state: &mut StreamState, log: &StreamingUsageGuard) {
-			if state.sent_first_token {
+			let now = Instant::now();
+			if !state.sent_first_token {
+				state.sent_first_token = true;
+				state.last_token_at = Some(now);
+				log.update(|r| {
+					r.response.first_token = Some(now);
+				});
 				return;
 			}
-			state.sent_first_token = true;
-			log.update(|r| {
-				r.response.first_token = Some(Instant::now());
-			});
+			if let Some(prev) = state.last_token_at.replace(now) {
+				let gap = now.duration_since(prev);
+				log.update(|r| r.response.inter_chunk_latencies.record(gap));
+			}
 		}
 
 		fn flush_message_end(
@@ -424,6 +508,7 @@ pub mod from_messages {
 			};
 			let finish_reason = crate::types::serialize_str(&stop_reason);
 
+			close_thinking_block(state, events);
 			close_text_block(state, events);
 			close_all_tool_blocks(state, events);
 
@@ -448,7 +533,7 @@ pub mod from_messages {
 						(u.prompt_tokens as usize)
 							.saturating_sub(cache_creation_input_tokens.unwrap_or(0))
 							.saturating_sub(cache_read_input_tokens.unwrap_or(0)),
-						u.completion_tokens as usize,
+						u.output_tokens() as usize,
 					)
 				})
 				.unwrap_or((0, 0));
@@ -458,13 +543,14 @@ pub mod from_messages {
 				messages::MessagesStreamEvent::MessageDelta {
 					delta: messages::MessageDelta {
 						stop_reason: Some(stop_reason),
-						stop_sequence: None,
+						stop_sequence: state.pending_stop_sequence.take(),
 					},
 					usage: messages::MessageDeltaUsage {
 						input_tokens: Some(input_tokens),
 						output_tokens: Some(output_tokens),
 						cache_creation_input_tokens,
 						cache_read_input_tokens,
+						..Default::default()
 					},
 				},
 			);
@@ -474,8 +560,12 @@ pub mod from_messages {
 			if let Some(usage) = usage {
 				log.update(|r| {
 					r.response.input_tokens = Some(usage.prompt_tokens as u64);
-					r.response.output_tokens = Some(usage.completion_tokens as u64);
+					r.response.output_tokens = Some(usage.output_tokens() as u64);
 					r.response.total_tokens = Some(usage.total_tokens as u64);
+					r.response.reasoning_tokens = usage
+						.completion_tokens_details
+						.as_ref()
+						.and_then(|d| d.reasoning_tokens);
 					r.response.cache_creation_input_tokens =
 						cache_creation_input_tokens.map(|tokens| tokens as u64);
 					r.response.cached_input_tokens = cache_read_input_tokens.map(|tokens| tokens as u64);
@@ -506,12 +596,13 @@ pub mod from_messages {
 		>(b, buffer_limit, move |evt| {
 			let mut events: Vec<(&'static str, messages::MessagesStreamEvent)> = Vec::new();
 			match evt {
+				SseJsonEvent::Eof | SseJsonEvent::Error => return events,
 				SseJsonEvent::Done => {
 					flush_message_end(&mut state, &mut events, &log, true, log_content.tool_calls);
 					return events;
 				},
 				SseJsonEvent::Data(Err(e)) => {
-					tracing::warn!(
+					tracing::debug!(
 						"Failed to parse OpenAI stream response during translation: {}",
 						e
 					);
@@ -523,24 +614,7 @@ pub mod from_messages {
 						push_event(
 							&mut events,
 							messages::MessagesStreamEvent::MessageStart {
-								message: messages::MessagesResponse {
-									id: f.id.clone(),
-									r#type: "message".to_string(),
-									role: messages::Role::Assistant,
-									content: vec![],
-									model: f.model.clone(),
-									stop_reason: None,
-									stop_sequence: None,
-									usage: messages::Usage {
-										input_tokens: 0,
-										output_tokens: 0,
-										cache_creation_input_tokens: None,
-										cache_read_input_tokens: None,
-										service_tier: None,
-									},
-									input_audio_tokens: None,
-									output_audio_tokens: None,
-								},
+								message: messages::MessagesResponse::start(f.id.clone(), f.model.clone()),
 							},
 						);
 
@@ -552,6 +626,32 @@ pub mod from_messages {
 					}
 
 					if let Some(choice) = f.choices.first() {
+						if let Some(thinking) = choice.delta.reasoning() {
+							let index = open_thinking_block(&mut state, &mut events);
+							maybe_set_first_token(&mut state, &log);
+							push_event(
+								&mut events,
+								messages::MessagesStreamEvent::ContentBlockDelta {
+									index,
+									delta: messages::ContentBlockDelta::ThinkingDelta {
+										thinking: thinking.to_string(),
+									},
+								},
+							);
+						}
+						// The signature goes out when the block closes, as a Messages stream sends it.
+						// Reasoning that is withheld arrives as a signature with no text, before any block
+						// has been opened, and opens one of its own to carry it.
+						if let Some(signature) = choice
+							.delta
+							.reasoning_signature
+							.as_deref()
+							.filter(|s| !s.is_empty())
+							&& (state.thinking_block_index.is_some() || state.next_block_index == 0)
+						{
+							open_thinking_block(&mut state, &mut events);
+							state.thinking_signature = Some(signature.to_string());
+						}
 						if let Some(content) = choice.delta.content.as_deref().filter(|s| !s.is_empty()) {
 							let index = open_text_block(&mut state, &mut events);
 							maybe_set_first_token(&mut state, &log);
@@ -589,7 +689,9 @@ pub mod from_messages {
 										}
 										if let Some(args) = &function.arguments {
 											entry.pending_json.push_str(args);
-											entry.arguments.push_str(args);
+											if log_content.tool_calls {
+												entry.arguments.push_str(args);
+											}
 										}
 									}
 
@@ -624,13 +726,21 @@ pub mod from_messages {
 						}
 
 						if let Some(finish_reason) = &choice.finish_reason {
-							let stop_reason = match finish_reason {
+							let mut stop_reason = match finish_reason {
 								completions::FinishReason::Stop => messages::StopReason::EndTurn,
 								completions::FinishReason::Length => messages::StopReason::MaxTokens,
 								completions::FinishReason::ToolCalls => messages::StopReason::ToolUse,
 								completions::FinishReason::ContentFilter => messages::StopReason::Refusal,
 								completions::FinishReason::FunctionCall => messages::StopReason::ToolUse,
 							};
+							// Same contract as the buffered path: a named stop sequence is
+							// `stop_sequence`, not `end_turn`.
+							if stop_reason == messages::StopReason::EndTurn
+								&& let Some(seq) = choice_stop_sequence(&choice.rest)
+							{
+								stop_reason = messages::StopReason::StopSequence;
+								state.pending_stop_sequence = Some(seq);
+							}
 							state.pending_stop_reason = Some(stop_reason);
 						}
 					}
@@ -655,7 +765,36 @@ pub mod from_messages {
 	}
 
 	pub fn translate_error(bytes: &Bytes, status: ::http::StatusCode) -> Result<Bytes, AIError> {
-		let res = super::parse_chat_completion_error(bytes)?;
+		let mut res = super::parse_chat_completion_error(bytes)?;
+		// Claude Code uses this marker to compact and retry a rejected prompt.
+		// Do not override an existing capability marker or a different structured code.
+		let context_overflow = status == ::http::StatusCode::BAD_REQUEST
+			&& match res.error.code.as_ref().and_then(Value::as_str) {
+				Some(code) => code == "context_length_exceeded",
+				None => {
+					let message = res.error.message.to_ascii_lowercase();
+					[
+						"prompt is too long",
+						"input is too long for requested model",
+						"exceeds the context window",
+						"exceed context limit",
+						"maximum context length is",
+						"model's maximum context limit",
+						"is longer than the model's context length",
+						"input tokens exceed the configured limit",
+						"exceeds the available context size",
+					]
+					.iter()
+					.any(|pattern| message.contains(pattern))
+				},
+			};
+		if context_overflow {
+			res.error.r#type = Some("invalid_request_error".to_string());
+			if !res.error.message.contains("capability_rejected:") {
+				// Keep a whitespace boundary after the capability token.
+				res.error.message = format!("capability_rejected: prompt_too_long {}", res.error.message);
+			}
+		}
 		let m = messages::MessagesErrorResponse {
 			r#type: "error".to_string(),
 			error: messages::MessagesError {
@@ -703,38 +842,49 @@ pub mod from_messages {
 			metadata,
 			thinking,
 			output_config,
+			cache_control: _,
 		} = req;
 
 		// Explicit prompt-cache breakpoints are accepted only by GPT 5.6 and newer models.
-		let supports_prompt_cache_breakpoint = model
-			.strip_prefix("gpt-")
-			.and_then(|model| model.split('-').next())
-			.and_then(|version| version.split_once('.'))
-			.and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)))
-			.is_some_and(|version| version >= (5, 6));
+		let supports_prompt_cache_breakpoint =
+			crate::conversion::supports_prompt_cache_breakpoint(&model);
 		let cache_breakpoint = |cache_control: Option<messages::CacheControlEphemeral>| {
 			cache_control
 				.filter(|_| supports_prompt_cache_breakpoint)
 				.map(Into::into)
 		};
 
-		let adaptive_thinking_requested = thinking
+		let output_effort = output_config
 			.as_ref()
-			.is_some_and(|t| matches!(t, messages::ThinkingInput::Adaptive {}));
-		let output_effort = output_config.as_ref().and_then(|cfg| cfg.effort);
-		let reasoning_effort = if adaptive_thinking_requested {
-			Some(match output_effort {
-				Some(messages::ThinkingEffort::Low) => completions::ReasoningEffort::Low,
-				Some(messages::ThinkingEffort::Medium) => completions::ReasoningEffort::Medium,
-				Some(messages::ThinkingEffort::High) => completions::ReasoningEffort::High,
-				Some(messages::ThinkingEffort::Xhigh) => completions::ReasoningEffort::Xhigh,
-				Some(messages::ThinkingEffort::Max) => completions::ReasoningEffort::Max,
-				// Anthropic adaptive thinking defaults to high effort when omitted.
-				None => completions::ReasoningEffort::High,
-			})
-		} else {
-			None
+			.and_then(|cfg| cfg.effort)
+			.or_else(|| {
+				if let Some(messages::ThinkingInput::Enabled { budget_tokens, .. }) = &thinking {
+					Some(crate::types::anthropic_effort_for_thinking_budget(
+						*budget_tokens,
+					))
+				} else {
+					None
+				}
+			});
+		let reasoning_requested = match thinking {
+			Some(messages::ThinkingInput::Disabled {}) => false,
+			Some(messages::ThinkingInput::Adaptive { .. }) => true,
+			_ => output_effort.is_some(),
 		};
+		let reasoning_effort =
+			if reasoning_requested && crate::conversion::supports_reasoning_effort(&model) {
+				Some(match output_effort {
+					Some(messages::ThinkingEffort::Low) => completions::ReasoningEffort::Low,
+					Some(messages::ThinkingEffort::Medium) => completions::ReasoningEffort::Medium,
+					Some(messages::ThinkingEffort::High) => completions::ReasoningEffort::High,
+					Some(messages::ThinkingEffort::Xhigh) => completions::ReasoningEffort::Xhigh,
+					Some(messages::ThinkingEffort::Max) => completions::ReasoningEffort::Max,
+					// Anthropic adaptive thinking defaults to high effort when omitted.
+					None => completions::ReasoningEffort::High,
+				})
+			} else {
+				None
+			};
 		let response_format = output_config
 			.as_ref()
 			.and_then(|cfg| cfg.format.as_ref())
@@ -840,6 +990,10 @@ pub mod from_messages {
 													text,
 													cache_control,
 													..
+												}
+												| ToolResultContentPart::ToolReference {
+													tool_name: text,
+													cache_control,
 												} => tool_parts.push(completions::RequestToolMessageContentPart::Text(
 													completions::RequestMessageContentPartText {
 														text,
@@ -853,6 +1007,7 @@ pub mod from_messages {
 														trailing_cache_control = trailing_cache_control.or(cache_control);
 													}
 												},
+												ToolResultContentPart::Unknown => {},
 											}
 										}
 										if let Some(cache_control) = trailing_cache_control {
@@ -896,8 +1051,21 @@ pub mod from_messages {
 					}
 				},
 				messages::Role::Assistant => {
+					let mut gemini_signatures: HashMap<_, _> = msg
+						.content
+						.iter()
+						.filter_map(|block| match block {
+							messages::ContentBlock::Thinking { signature, .. } => {
+								crate::conversion::GeminiThoughtSignature::decode(signature)
+							},
+							_ => None,
+						})
+						.map(|value| (value.call_id, value.signature))
+						.collect();
 					let mut assistant_parts = Vec::new();
 					let mut tool_calls: Vec<completions::MessageToolCalls> = Vec::new();
+					let mut reasoning_content: Option<String> = None;
+					let mut reasoning_signatures = Vec::new();
 					for block in msg.content {
 						match block {
 							messages::ContentBlock::Text(messages::ContentTextBlock {
@@ -913,26 +1081,48 @@ pub mod from_messages {
 							messages::ContentBlock::ToolUse {
 								id, name, input, ..
 							} => {
-								tool_calls.push(completions::MessageToolCalls::Function(
-									completions::MessageToolCall {
-										id,
-										function: completions::FunctionCall {
-											name,
-											arguments: serde_json::to_string(&input).unwrap_or_default(),
-										},
+								let signature = gemini_signatures.remove(&id);
+								let mut call = completions::MessageToolCall {
+									id,
+									function: completions::FunctionCall {
+										name,
+										arguments: serde_json::to_string(&input).unwrap_or_default(),
 									},
-								));
+									extra_content: None,
+								};
+								if let Some(signature) = signature {
+									call.set_thought_signature(signature);
+								}
+								tool_calls.push(completions::MessageToolCalls::Function(call));
 							},
-							messages::ContentBlock::Thinking { .. } => {
-								// TODO
+							// Chat Completions carries one reasoning text per turn, so the blocks are joined.
+							messages::ContentBlock::Thinking {
+								thinking,
+								signature,
+							} => {
+								if GeminiThoughtSignature::decode(&signature).is_some() {
+									continue;
+								}
+								match reasoning_content.as_mut() {
+									Some(text) => {
+										text.push_str("\n\n");
+										text.push_str(&thinking);
+									},
+									None => reasoning_content = Some(thinking),
+								}
+								reasoning_signatures.push(signature);
 							},
-							messages::ContentBlock::RedactedThinking { .. } => {
-								// TODO
-							},
+							// A redacted block holds nothing an OpenAI-compatible engine could replay.
+							messages::ContentBlock::RedactedThinking { .. } => {},
 							_ => {},
 						}
 					}
-					if !assistant_parts.is_empty() || !tool_calls.is_empty() {
+					// A signature attests to one block, so it only survives a turn with exactly one.
+					let reasoning_signature = match reasoning_signatures.as_slice() {
+						[signature] if !signature.is_empty() => Some(signature.clone()),
+						_ => None,
+					};
+					if !assistant_parts.is_empty() || !tool_calls.is_empty() || reasoning_content.is_some() {
 						msgs.push(completions::RequestMessage::Assistant(
 							completions::RequestAssistantMessage {
 								content: if assistant_parts.is_empty() {
@@ -951,8 +1141,8 @@ pub mod from_messages {
 								refusal: None,
 								audio: None,
 								function_call: None,
-								reasoning_content: None,
-								reasoning_signature: None,
+								reasoning_content,
+								reasoning_signature,
 							},
 						));
 					}
@@ -990,22 +1180,34 @@ pub mod from_messages {
 		let tools: Vec<completions::Tool> = tools
 			.into_iter()
 			.flat_map(|tools| tools.into_iter())
-			.map(|tool| {
-				completions::Tool::Function(completions::FunctionTool {
-					function: completions::FunctionObject {
-						name: tool.name,
-						description: tool.description,
-						parameters: Some(tool.input_schema),
-						strict: None,
-					},
-				})
+			.filter_map(|tool| match tool {
+				messages::Tool::Custom(tool) => {
+					Some(completions::Tool::Function(completions::FunctionTool {
+						function: completions::FunctionObject {
+							name: tool.name,
+							description: tool.description,
+							parameters: Some(tool.input_schema),
+							strict: tool.strict,
+						},
+					}))
+				},
+				// OpenAI completions has no equivalent of an Anthropic server-executed tool
+				// (e.g. web_search_20250305); drop it rather than fail the whole request.
+				messages::Tool::Server(tool) => {
+					tracing::warn!(
+						"Unsupported server tool in completions conversion: {:?}",
+						tool
+					);
+					None
+				},
 			})
 			.collect_vec();
 
 		// OpenAI rejects reasoning+tools+modern models+chat completions API combination.
 		// TODO: Move Messages requests with reasoning and function tools to the Responses API.
-		// Allow anything that is not a gpt model, unless its a known-allowed one.
-		let supports_reasoning_with_tools = !model.starts_with("gpt-")
+		// Disable reasoning for GPT-5 tool requests except the allowed GPT-5/5.1/5.2 models.
+		// Leave other models unchanged; gpt-4o rejects reasoning_effort.
+		let supports_reasoning_with_tools = !model.starts_with("gpt-5")
 			|| model == "gpt-5"
 			|| model.starts_with("gpt-5-")
 			|| model.starts_with("gpt-5.1")
@@ -1060,6 +1262,7 @@ pub mod from_messages {
 
 		completions::Request {
 			model: Some(model),
+			moderation: None,
 			messages: msgs,
 			stream: Some(stream),
 			temperature,
@@ -1110,15 +1313,18 @@ pub mod from_messages {
 /// Build the observability tool-call content parts from accumulated streaming deltas,
 /// keyed by tool-call index. Synthesizes an id when the provider omitted one,
 /// and returns `None` when there are no tool calls.
-fn finalize_streaming_tool_calls(
+pub(crate) fn finalize_streaming_tool_calls(
 	entries: impl IntoIterator<Item = (u32, Option<String>, Option<String>, String)>,
 ) -> Option<Vec<crate::OutputMessagePart>> {
 	let parts: Vec<crate::OutputMessagePart> = entries
 		.into_iter()
 		.sorted_by_key(|(idx, ..)| *idx)
 		.map(|(idx, id, name, arguments)| {
-			let arguments =
-				serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Object(Default::default()));
+			let arguments = match serde_json::from_str(&arguments) {
+				Ok(arguments) => arguments,
+				Err(_) if arguments.trim().is_empty() => serde_json::Value::Object(Default::default()),
+				Err(_) => serde_json::Value::String(arguments),
+			};
 			crate::OutputMessagePart::ToolCall {
 				id: id.unwrap_or_else(|| format!("tool_call_{idx}")).into(),
 				name: name.unwrap_or_default().into(),
@@ -1174,6 +1380,7 @@ pub fn passthrough_stream(
 	resp.map(|b| {
 		let mut seen_provider = false;
 		let mut saw_token = false;
+		let mut last_token_at: Option<Instant> = None;
 		parse::sse::json_passthrough::<types::completions::typed::StreamResponse>(
 			b,
 			buffer_limit,
@@ -1210,11 +1417,16 @@ pub fn passthrough_stream(
 								}
 							}
 						}
+						let now = Instant::now();
 						if !saw_token {
 							saw_token = true;
+							last_token_at = Some(now);
 							log.update(|r| {
-								r.response.first_token = Some(Instant::now());
+								r.response.first_token = Some(now);
 							});
+						} else if let Some(prev) = last_token_at.replace(now) {
+							let gap = now.duration_since(prev);
+							log.update(|r| r.response.inter_chunk_latencies.record(gap));
 						}
 						if !seen_provider {
 							seen_provider = true;
@@ -1230,7 +1442,7 @@ pub fn passthrough_stream(
 									.prompt_tokens_details
 									.as_ref()
 									.and_then(|d| d.audio_tokens);
-								r.response.output_tokens = Some(u.completion_tokens as u64);
+								r.response.output_tokens = Some(u.output_tokens() as u64);
 								r.response.output_audio_tokens = u
 									.completion_tokens_details
 									.as_ref()

@@ -7,17 +7,14 @@ import (
 
 	"istio.io/istio/pkg/kube/krt"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
 )
 
 func TestResolveCredentialRef(t *testing.T) {
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "creds",
-		},
+		Namespace: "default",
+		Name:      "creds",
 		Data: map[string][]byte{
 			"token": []byte("value"),
 		},
@@ -253,10 +250,30 @@ func TestGetSecretDataAuth(t *testing.T) {
 		wantFound bool
 	}{
 		{
-			name:      "strips bearer prefix",
-			data:      map[string][]byte{"Authorization": []byte("Bearer token")},
+			name:      "bearer alone",
+			data:      map[string][]byte{"Authorization": []byte("Bearer")},
+			wantFound: false,
+		},
+		{
+			name:      "bearer followed by spaces",
+			data:      map[string][]byte{"Authorization": []byte("Bearer   ")},
+			wantFound: false,
+		},
+		{
+			name:      "bearer followed by tab and newline",
+			data:      map[string][]byte{"Authorization": []byte("Bearer \t\n")},
+			wantFound: false,
+		},
+		{
+			name:      "bearer with extra whitespace before token",
+			data:      map[string][]byte{"Authorization": []byte("Bearer \t token \n")},
 			wantValue: "token",
 			wantFound: true,
+		},
+		{
+			name:      "missing",
+			data:      map[string][]byte{},
+			wantFound: false,
 		},
 		{
 			name:      "plain value",
@@ -265,15 +282,10 @@ func TestGetSecretDataAuth(t *testing.T) {
 			wantFound: true,
 		},
 		{
-			name:      "bare bearer value",
-			data:      map[string][]byte{"Authorization": []byte("Bearer   ")},
-			wantValue: "Bearer",
+			name:      "strips bearer prefix",
+			data:      map[string][]byte{"Authorization": []byte("Bearer token")},
+			wantValue: "token",
 			wantFound: true,
-		},
-		{
-			name:      "missing",
-			data:      map[string][]byte{},
-			wantFound: false,
 		},
 	}
 

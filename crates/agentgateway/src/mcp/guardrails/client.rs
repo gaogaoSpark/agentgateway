@@ -18,10 +18,11 @@ use crate::mcp::guardrails::wire::{
 	self, AuthorizationError, McpRequest, McpResponse, mcp_request_result, mcp_response_result,
 };
 use crate::mcp::guardrails::{
-	FailureMode, HeaderFilter, McpGuardrailsDynamicMetadata, Outcome, Remote,
+	FailureMode, HeaderFilter, MCPBody, McpGuardrailsDynamicMetadata, Outcome, Remote,
 };
 use crate::mcp::upstream::IncomingRequestContext;
 use crate::proxy::httpproxy::PolicyClient;
+use crate::telemetry::metrics::{OutboundCallKind, OutboundCallSubtype};
 
 fn with_default_timeout<T>(msg: T) -> tonic::Request<T> {
 	let mut req = tonic::Request::new(msg);
@@ -31,18 +32,24 @@ fn with_default_timeout<T>(msg: T) -> tonic::Request<T> {
 	req
 }
 
-pub(crate) async fn check_request<P: serde::de::DeserializeOwned>(
+pub(crate) async fn check_request<P: serde::Serialize + serde::de::DeserializeOwned>(
 	remote: &Remote,
 	method: &str,
 	backends: &[String],
-	body: Option<&mut Bytes>,
+	body: &mut MCPBody<'_, P>,
 	req_ctx: &mut IncomingRequestContext,
 	client: &PolicyClient,
 ) -> Outcome<P> {
+	let body = match body.wire() {
+		Ok(body) => body,
+		Err(e) => {
+			warn!(error = %e, "mcpGuardrails: failed to serialize params");
+			return Outcome::Reject(ErrorData::internal_error("guardrail check failed", None));
+		},
+	};
 	let mcp_request = body.as_deref().cloned();
-	let http_req = req_ctx.as_request();
-	let metadata_context = build_metadata(&remote.metadata, &http_req);
-	let headers = collect_headers(&remote.request_headers, &http_req);
+	let metadata_context = build_metadata(&remote.metadata, req_ctx);
+	let headers = collect_headers(&remote.request_headers, &req_ctx.request);
 	let req = McpRequest {
 		service_names: backends.to_vec(),
 		method: method.to_string(),
@@ -50,9 +57,29 @@ pub(crate) async fn check_request<P: serde::de::DeserializeOwned>(
 		mcp_request,
 		headers,
 	};
-	let mut grpc = build_client(remote, client.clone());
-	let tonic_req = with_default_timeout(req);
-	let resp = match grpc.check_request(tonic_req).await {
+	let policy_client =
+		client.with_outbound(OutboundCallKind::Policy, OutboundCallSubtype::Guardrail);
+	let mut grpc = build_client(remote, policy_client.clone());
+	let mut tonic_req = with_default_timeout(req);
+	let mut span = policy_client.start_grpc_span(
+		&mut tonic_req,
+		remote.target.target.as_ref(),
+		"/agentgateway.dev.ext_mcp.ExtMcp/CheckRequest",
+	);
+	if let Some(span) = span.as_deref_mut() {
+		span.add_attribute(opentelemetry::KeyValue::new(
+			"mcp.method.name",
+			method.to_owned(),
+		));
+		if let [target] = backends {
+			span.add_attribute(opentelemetry::KeyValue::new("mcp.target", target.clone()));
+		}
+	}
+	let grpc_result = grpc.check_request(tonic_req).await;
+	if let Some(span) = span.as_deref_mut() {
+		span.record_grpc_result(&grpc_result);
+	}
+	let resp = match grpc_result {
 		Ok(resp) => resp.into_inner(),
 		Err(status) => return on_grpc_error(remote, method, backends, "checkRequest", status),
 	};
@@ -178,6 +205,10 @@ fn merge_metadata_into_extensions(
 		}
 	}
 	if !acc.0.is_empty() {
+		// The access-log snapshot is taken before this hook runs, so also record it in the log.
+		if let Some(log) = ext.get::<crate::telemetry::log::McpGuardrailsLog>() {
+			log.store(Some(acc.clone()));
+		}
 		ext.insert(acc);
 	}
 }
@@ -186,13 +217,21 @@ pub(crate) async fn check_response(
 	remote: &Remote,
 	method: &str,
 	backends: &[String],
-	body: &mut Bytes,
+	body: &mut MCPBody<'_, ServerResult>,
 	req_ctx: &IncomingRequestContext,
 	client: &PolicyClient,
 ) -> Outcome<ServerResult> {
+	let body = match body.wire() {
+		Ok(Some(body)) => body,
+		Ok(None) => unreachable!("response guardrails always have a result"),
+		Err(e) => {
+			warn!(error = %e, "mcpGuardrails: failed to serialize result");
+			return Outcome::Reject(ErrorData::internal_error("guardrail check failed", None));
+		},
+	};
 	let mcp_response = body.clone();
 	let metadata_context = (!remote.metadata.is_empty())
-		.then(|| build_metadata(&remote.metadata, &req_ctx.as_request()))
+		.then(|| build_metadata(&remote.metadata, req_ctx))
 		.flatten();
 	let req = McpResponse {
 		service_names: backends.to_vec(),
@@ -200,9 +239,29 @@ pub(crate) async fn check_response(
 		metadata_context,
 		mcp_response,
 	};
-	let mut grpc = build_client(remote, client.clone());
-	let tonic_req = with_default_timeout(req);
-	let result = match grpc.check_response(tonic_req).await {
+	let policy_client =
+		client.with_outbound(OutboundCallKind::Policy, OutboundCallSubtype::Guardrail);
+	let mut grpc = build_client(remote, policy_client.clone());
+	let mut tonic_req = with_default_timeout(req);
+	let mut span = policy_client.start_grpc_span(
+		&mut tonic_req,
+		remote.target.target.as_ref(),
+		"/agentgateway.dev.ext_mcp.ExtMcp/CheckResponse",
+	);
+	if let Some(span) = span.as_deref_mut() {
+		span.add_attribute(opentelemetry::KeyValue::new(
+			"mcp.method.name",
+			method.to_owned(),
+		));
+		if let [target] = backends {
+			span.add_attribute(opentelemetry::KeyValue::new("mcp.target", target.clone()));
+		}
+	}
+	let grpc_result = grpc.check_response(tonic_req).await;
+	if let Some(span) = span.as_deref_mut() {
+		span.record_grpc_result(&grpc_result);
+	}
+	let result = match grpc_result {
 		Ok(resp) => resp.into_inner().result,
 		Err(status) => return on_grpc_error(remote, method, backends, "checkResponse", status),
 	};
@@ -226,12 +285,12 @@ pub(crate) async fn check_response(
 
 fn build_metadata(
 	cfg: &HashMap<String, Arc<cel::Expression>>,
-	req: &crate::http::Request,
+	req: &IncomingRequestContext,
 ) -> Option<Struct> {
 	if cfg.is_empty() {
 		return None;
 	}
-	let exec = cel::Executor::new_request(req);
+	let exec = req.executor();
 	let fields = cfg
 		.iter()
 		.filter_map(|(k, expr)| match eval_to_value(&exec, expr) {
@@ -262,7 +321,10 @@ fn build_client(remote: &Remote, client: PolicyClient) -> ExtMcpClient<GrpcRefer
 // Snapshot the incoming request headers for the policy server, applying the
 // configured allow/deny filter. Like ext_authz, pseudo-headers are forwarded
 // too. Values are raw bytes: header values are not guaranteed to be UTF-8.
-fn collect_headers(filter: &HeaderFilter, req: &crate::http::Request) -> Vec<wire::McpHeader> {
+fn collect_headers(
+	filter: &HeaderFilter,
+	req: &::http::Request<Option<Bytes>>,
+) -> Vec<wire::McpHeader> {
 	let mut out = Vec::new();
 	// Pseudo-headers are single-valued.
 	for (pseudo, value) in crate::http::get_request_pseudo_headers(req) {
@@ -288,14 +350,13 @@ fn collect_headers(filter: &HeaderFilter, req: &crate::http::Request) -> Vec<wir
 // mcpGuardrails authorization outcomes that have no standard JSON-RPC/MCP code map to
 // application-defined codes in the server-error range (-32000..=-32099).
 // -32002 is intentionally skipped: rmcp assigns it to RESOURCE_NOT_FOUND.
-const PERMISSION_DENIED: ErrorCode = ErrorCode(-32001);
-const RESOURCE_EXHAUSTED: ErrorCode = ErrorCode(-32003);
+pub(super) const PERMISSION_DENIED: ErrorCode = ErrorCode(-32001);
 
 fn translate_error(method: &str, backends: &[String], e: AuthorizationError) -> ErrorData {
 	use wire::authorization_error::Code as C;
 	let code = match C::try_from(e.code).unwrap_or(C::Unknown) {
 		C::PermissionDenied => PERMISSION_DENIED,
-		C::ResourceExhausted => RESOURCE_EXHAUSTED,
+		C::ResourceExhausted => crate::mcp::RESOURCE_EXHAUSTED,
 		C::Invalid => ErrorCode::INVALID_REQUEST,
 		C::Unknown => ErrorCode::INTERNAL_ERROR,
 	};
@@ -321,7 +382,7 @@ fn on_grpc_error<T>(
 		FailureMode::FailOpen => Outcome::Pass,
 		FailureMode::FailClosed => Outcome::Reject(ErrorData::new(
 			ErrorCode::INTERNAL_ERROR,
-			format!("mcpGuardrails {rpc} failed: {}", status.message()),
+			"guardrail check failed",
 			None,
 		)),
 	}
@@ -343,7 +404,7 @@ fn on_protocol_violation<T>(
 		FailureMode::FailOpen => Outcome::Pass,
 		FailureMode::FailClosed => Outcome::Reject(ErrorData::new(
 			ErrorCode::INTERNAL_ERROR,
-			format!("mcpGuardrails protocol violation: {reason}"),
+			"guardrail check failed",
 			None,
 		)),
 	}
@@ -434,7 +495,7 @@ mod tests {
 			allowed: vec![],
 			disallowed: vec![pseudo("authorization")],
 		};
-		let out = collect_headers(&filter, &ctx_with_headers(headers.clone()).as_request());
+		let out = collect_headers(&filter, &ctx_with_headers(headers.clone()).request);
 		assert!(!out.iter().any(|h| h.key == "authorization"));
 		let multi: Vec<_> = out
 			.iter()
@@ -466,7 +527,7 @@ mod tests {
 			],
 			disallowed: vec![pseudo("authorization")],
 		};
-		let out = collect_headers(&filter, &ctx_with_headers(headers).as_request());
+		let out = collect_headers(&filter, &ctx_with_headers(headers).request);
 		let keys: HashSet<_> = out.iter().map(|h| h.key.clone()).collect();
 		assert_eq!(
 			keys,

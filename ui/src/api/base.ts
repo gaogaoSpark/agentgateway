@@ -1,38 +1,85 @@
-export const apiBase = import.meta.env.VITE_AGENTGATEWAY_API ?? "";
+import { defaultApiBase } from '@/basePath';
+import { withBasePath } from '@/uiBase';
 
-export async function requestJson<T>(
-  path: string,
-  init?: RequestInit,
-): Promise<T> {
-  const response = await fetch(`${apiBase}${path}`, {
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
-    ...init,
-  });
-  if (!response.ok) {
-    let message = `${response.status} ${response.statusText}`;
-    try {
-      const text = await response.text();
-      if (text) {
-        try {
-          const body = JSON.parse(text);
-          message = typeof body === "string" ? body : JSON.stringify(body);
-        } catch {
-          message = text;
-        }
-      }
-    } catch {
-      // Keep the status text fallback when the body cannot be read.
-    }
-    throw new Error(message || "request failed");
-  }
-  return response.json() as Promise<T>;
+export const apiBase = import.meta.env.VITE_AGENTGATEWAY_API ?? defaultApiBase();
+
+let redirecting = false;
+let hasSuccessfulRequest = false;
+
+export async function requestApi(path: string, init?: RequestInit): Promise<Response> {
+	// Authentication must use document navigation; fetch cannot follow cross-origin login redirects.
+	const response = await fetch(`${apiBase}${path}`, {
+		...init,
+		credentials: 'include',
+		redirect: 'manual'
+	});
+	if (response.status === 401 || response.type === 'opaqueredirect') {
+		const location = response.headers.get('location');
+		const uiLogin =
+			location?.startsWith('/') && !location.startsWith('//') && !location.includes('\\');
+		if (!uiLogin && !hasSuccessfulRequest) {
+			throw new Error('Authentication required. Please sign in and reload the page.');
+		}
+		if (!redirecting) {
+			redirecting = true;
+			if (!uiLogin) {
+				window.location.reload();
+				return new Promise<Response>(() => {});
+			}
+			const returnTo = window.location.pathname + window.location.search + window.location.hash;
+			// The server's login redirect already has the base path; only add it if missing.
+			const target = apiBase.startsWith('/')
+				? withBasePath(location ?? '', apiBase)
+				: `${apiBase}${location}`;
+			const destination = new URL(target, window.location.href);
+			destination.searchParams.set('returnTo', returnTo);
+			window.location.replace(destination.href);
+		}
+		return new Promise<Response>(() => {});
+	}
+	if (response.ok) hasSuccessfulRequest = true;
+	return response;
+}
+
+export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+	const response = await requestOk(path, init);
+	return response.json() as Promise<T>;
+}
+
+export async function requestText(path: string, init?: RequestInit): Promise<string> {
+	const response = await requestOk(path, init);
+	return response.text();
+}
+
+async function requestOk(path: string, init?: RequestInit): Promise<Response> {
+	const response = await requestApi(path, {
+		headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+		...init
+	});
+	if (!response.ok) {
+		let message = `${response.status} ${response.statusText}`;
+		try {
+			const text = await response.text();
+			if (text) {
+				try {
+					const body = JSON.parse(text);
+					message = typeof body === 'string' ? body : JSON.stringify(body);
+				} catch {
+					message = text;
+				}
+			}
+		} catch {
+			// Keep the status text fallback when the body cannot be read.
+		}
+		throw new Error(message || 'request failed');
+	}
+	return response;
 }
 
 export function parseJsonOrText(text: string) {
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return text;
-  }
+	try {
+		return JSON.parse(text) as unknown;
+	} catch {
+		return text;
+	}
 }

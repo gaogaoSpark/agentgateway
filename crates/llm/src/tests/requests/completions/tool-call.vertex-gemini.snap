@@ -1,8 +1,9 @@
 ---
-source: crates/agentgateway/src/llm/tests.rs
-description: src/llm/tests/requests/completions/tool-call.json
+source: crates/llm/src/golden_tests.rs
+description: src/tests/requests/completions/tool-call.json
 info:
   model: gpt-3.5-turbo
+  tools: []
   messages:
     - role: user
       content: How is the current weather in Columbus?
@@ -14,50 +15,98 @@ info:
           function:
             name: get_weather
             arguments: "{\"format\":\"celsius\",\"location\":\"Columbus, OH\"}"
+        - id: call_5rQmXtLpZ9wKvNbJhGyDsFcE
+          type: function
+          function:
+            name: get_time
+            arguments: ""
     - role: tool
       tool_call_id: call_iMGPsr4Xx1u0G5sOzFsTCbQU
       name: get_weather
       content: "{ \"temperature\": 15, \"condition\": \"Cloudy\" }"
+    - role: tool
+      tool_call_id: call_5rQmXtLpZ9wKvNbJhGyDsFcE
+      name: get_time
+      content: "{ \"time\": \"2026-08-12T12:00:00Z\" }"
 ---
 {
-  "contents": [
-    {
-      "role": "user",
-      "parts": [
-        {
-          "text": "How is the current weather in Columbus?"
-        }
-      ]
-    },
-    {
-      "role": "model",
-      "parts": [
-        {
-          "functionCall": {
-            "name": "get_weather",
-            "args": {
-              "format": "celsius",
-              "location": "Columbus, OH"
+  "request": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "How is the current weather in Columbus?"
+          }
+        ]
+      },
+      {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {
+              "name": "get_weather",
+              "args": {
+                "format": "celsius",
+                "location": "Columbus, OH"
+              }
+            }
+          },
+          {
+            "functionCall": {
+              "name": "get_time",
+              "args": {}
             }
           }
-        }
-      ]
-    },
-    {
-      "role": "user",
-      "parts": [
-        {
-          "functionResponse": {
-            "name": "get_weather",
-            "response": {
-              "content": "{ \"temperature\": 15, \"condition\": \"Cloudy\" }"
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "get_weather",
+              "response": {
+                "content": "{ \"temperature\": 15, \"condition\": \"Cloudy\" }"
+              }
+            }
+          },
+          {
+            "functionResponse": {
+              "name": "get_time",
+              "response": {
+                "content": "{ \"time\": \"2026-08-12T12:00:00Z\" }"
+              }
             }
           }
-        },
-        {
-          "text": " "
-        }
-      ]
-    }
-  ]
+        ]
+      }
+    ]
+  },
+  "parsed": {
+    "input_format": "Completions",
+    "cache_convention": "InputIncludesCache",
+    "request_model": "gpt-3.5-turbo",
+    "provider": "vertex",
+    "streaming": false,
+    "params": {},
+    "prompt": [
+      {
+        "role": "user",
+        "content": "How is the current weather in Columbus?"
+      },
+      {
+        "role": "assistant",
+        "content": ""
+      },
+      {
+        "role": "tool",
+        "content": "{ \"temperature\": 15, \"condition\": \"Cloudy\" }"
+      },
+      {
+        "role": "tool",
+        "content": "{ \"time\": \"2026-08-12T12:00:00Z\" }"
+      }
+    ]
+  }
 }

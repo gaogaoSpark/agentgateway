@@ -136,8 +136,13 @@ backends:
         name: "llm:router"
         namespace: ""
         target:
+          discovery: catalog
           models:
-            - name: openai/gpt-5-mini
+            - discovery:
+                provider: openai
+                transformation: identity
+                model: gpt-5-mini
+              name: openai/gpt-5-mini
               created: 0
               visibility: internal
               headerMatches: []
@@ -145,24 +150,14 @@ backends:
                 backend: "/llm:model:openai/gpt-5-mini:0"
                 weight: 1
               policies:
-                llm:
-                  routes:
-                    "*": passthrough
-                    /v1/chat/completions: completions
-                    /v1/embeddings: embeddings
-                    /v1/images/edits: detect
-                    /v1/images/generations: detect
-                    /v1/images/variations: detect
-                    /v1/messages: messages
-                    /v1/rerank: rerank
-                    /v1/responses: responses
-                    /v1/responses/compact: detect
-                    /v2/rerank: rerank
-                    ":rawPredict": messages
-                    ":streamRawPredict": messages
+                llm: {}
                 authorization: ~
               backendPolicies: []
-            - name: anthropic/*
+            - discovery:
+                provider: anthropic
+                transformation:
+                  prefix: anthropic/
+              name: anthropic/*
               created: 0
               visibility: internal
               headerMatches: []
@@ -170,24 +165,13 @@ backends:
                 backend: "/llm:model:anthropic/*:1"
                 weight: 1
               policies:
-                llm:
-                  routes:
-                    "*": passthrough
-                    /v1/chat/completions: completions
-                    /v1/embeddings: embeddings
-                    /v1/images/edits: detect
-                    /v1/images/generations: detect
-                    /v1/images/variations: detect
-                    /v1/messages: messages
-                    /v1/rerank: rerank
-                    /v1/responses: responses
-                    /v1/responses/compact: detect
-                    /v2/rerank: rerank
-                    ":rawPredict": messages
-                    ":streamRawPredict": messages
+                llm: {}
                 authorization: ~
               backendPolicies: []
-            - name: "*"
+            - discovery:
+                provider: openai
+                transformation: identity
+              name: "*"
               created: 0
               visibility: internal
               headerMatches: []
@@ -195,41 +179,13 @@ backends:
                 backend: "/llm:model:*:2"
                 weight: 1
               policies:
-                llm:
-                  routes:
-                    "*": passthrough
-                    /v1/chat/completions: completions
-                    /v1/embeddings: embeddings
-                    /v1/images/edits: detect
-                    /v1/images/generations: detect
-                    /v1/images/variations: detect
-                    /v1/messages: messages
-                    /v1/rerank: rerank
-                    /v1/responses: responses
-                    /v1/responses/compact: detect
-                    /v2/rerank: rerank
-                    ":rawPredict": messages
-                    ":streamRawPredict": messages
+                llm: {}
                 authorization: ~
               backendPolicies: []
           virtualModels:
             - name: fast
               created: 0
-              llmPolicy:
-                routes:
-                  "*": passthrough
-                  /v1/chat/completions: completions
-                  /v1/embeddings: embeddings
-                  /v1/images/edits: detect
-                  /v1/images/generations: detect
-                  /v1/images/variations: detect
-                  /v1/messages: messages
-                  /v1/rerank: rerank
-                  /v1/responses: responses
-                  /v1/responses/compact: detect
-                  /v2/rerank: rerank
-                  ":rawPredict": messages
-                  ":streamRawPredict": messages
+              llmPolicy: {}
               routing:
                 weighted:
                   - model: anthropic/haiku

@@ -8,10 +8,11 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use tracing::{debug, trace, warn};
 
-use super::AuthorizationLocation;
-use crate::http::Request;
+use super::{AuthorizationLocation, BackendAuthError};
 use crate::http::jwt::Claims;
 use crate::http::oauth::{TOKEN_TYPE_ACCESS, TOKEN_TYPE_ID, TOKEN_TYPE_ID_JAG, TOKEN_TYPE_JWT};
+use crate::http::{Request, jwt};
+use crate::mcp::auth::McpResourceChallenge;
 use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::serdes::schema;
@@ -24,13 +25,13 @@ use crate::types::proto::{ProtoError, agent as proto};
 use crate::{apply, cel, schema_enum};
 
 mod cache;
-mod client_auth;
+pub(crate) mod client_auth;
 mod cross_app_access;
 mod transport;
 
-use cache::{InMemoryTokenCache, TokenCacheResult};
+use cache::InMemoryTokenCache;
 use client_auth::sign_client_assertion;
-pub use client_auth::{OAuthClientAuth, OAuthClientAuthMethod, PrivateKeyJwt, SigningAlg};
+pub use client_auth::{OAuthClientAuth, OAuthClientAuthMethod, PrivateKeyJwt};
 pub use cross_app_access::CrossAppAccessAuth;
 pub(super) use transport::FetchError;
 
@@ -66,8 +67,9 @@ pub struct OAuthTokenExchangeAuth {
 	/// `resource` parameters with the target service URIs.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	resources: Vec<String>,
-	/// `requested_token_type` parameter. Under token exchange, unset defaults to
-	/// access_token because this policy forwards bearer access tokens.
+	/// `requested_token_type` parameter. When unset it is omitted from the request
+	/// (RFC 8693 makes it optional). Some providers (e.g. Auth0 custom token exchange)
+	/// reject an explicit access_token value paired with a custom `subject_token_type`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
 	requested_token_type: Option<OAuthTokenType>,
@@ -218,11 +220,6 @@ impl OAuthTokenExchangeAuth {
 			if self.audiences.is_empty() {
 				return Err("requested_token_type id-jag requires at least one audience".into());
 			}
-			if self.subject_token.token_type == OAuthTokenType::AccessToken {
-				warn!(
-					"oauth token exchange requested_token_type id-jag is configured with an access_token subject; the ID-JAG draft expects an ID token subject"
-				);
-			}
 		}
 
 		if matches!(
@@ -249,6 +246,8 @@ impl OAuthTokenExchangeAuth {
 		use proto::o_auth_token_exchange::GrantType;
 
 		let target = resolve_simple_reference(t.token_endpoint.as_ref());
+		let policies =
+			crate::types::agent_xds::backend_policies_from_proto(&t.inline_policies, diagnostics)?;
 		let path = t.token_endpoint_path.unwrap_or_default();
 
 		let grant_type = match GrantType::try_from(t.grant_type) {
@@ -304,9 +303,7 @@ impl OAuthTokenExchangeAuth {
 		let auth = Self {
 			target: SimpleBackendReferenceWithPolicies {
 				target: Arc::new(target),
-				// Inline connection policies are not supported from xDS;
-				// the backend resource carries its own policies there.
-				policies: Vec::new(),
+				policies,
 			},
 			path,
 			grant_type,
@@ -328,7 +325,7 @@ impl OAuthTokenExchangeAuth {
 
 	fn requested_token_type_param(&self) -> Option<OAuthTokenType> {
 		match self.grant_type {
-			OAuthGrantType::TokenExchange => Some(self.requested_token_type.clone().unwrap_or_default()),
+			OAuthGrantType::TokenExchange => self.requested_token_type.clone(),
 			OAuthGrantType::JwtBearer => None,
 		}
 	}
@@ -349,9 +346,25 @@ impl OAuthTokenExchangeAuth {
 		// Extract everything up front so a bad request fails before we touch it.
 		let subject_token =
 			extract_subject_token(&self.subject_token.source, req).ok_or_else(|| {
-				debug!("oauth token exchange subject token missing");
+				debug!(source=?self.subject_token.source, "oauth token exchange subject token missing");
 				ProxyError::InvalidRequest
 			})?;
+		// The subject token need not pass through a JWT policy. Decode JWT-shaped tokens directly so
+		// an expired credential still produces the 401 clients use to refresh. This is only a local
+		// expiry check, not a trust decision; the authorization server still validates the token.
+		#[derive(serde::Deserialize)]
+		struct ExpClaim {
+			exp: Option<f64>,
+		}
+		let expired = decode_unverified_jwt_claims::<ExpClaim>(&subject_token)
+			.and_then(|claims| claims.exp)
+			.is_some_and(|exp| exp <= jsonwebtoken::get_current_timestamp() as f64);
+		if expired {
+			let err = ProxyError::JwtAuthenticationFailure(jwt::TokenError::Invalid(
+				jsonwebtoken::errors::ErrorKind::ExpiredSignature.into(),
+			));
+			return Err(McpResourceChallenge::wrap(req, err));
+		}
 		let actor = self
 			.actor_token
 			.as_ref()
@@ -386,14 +399,20 @@ impl OAuthTokenExchangeAuth {
 		req: &mut Request,
 		access_token: &str,
 	) -> Result<bool, ProxyError> {
+		::http::HeaderValue::try_from(access_token).map_err(BackendAuthError::credential_provider)?;
+
 		// Replace the original credentials with the backend's.
-		self.subject_token.source.remove(req)?;
+		self
+			.subject_token
+			.source
+			.remove(req)
+			.map_err(BackendAuthError::local)?;
 
 		if let Some(actor) = &self.actor_token {
-			actor.source.remove(req)?;
+			actor.source.remove(req).map_err(BackendAuthError::local)?;
 		}
 
-		self.authorization_location.insert(req, access_token)?;
+		super::insert_local_auth(&self.authorization_location, req, access_token)?;
 
 		Ok(true)
 	}
@@ -730,7 +749,7 @@ pub(super) async fn apply_token_exchange(
 	auth: &OAuthTokenExchangeAuth,
 	req: &mut Request,
 ) -> Result<bool, ProxyError> {
-	let client = PolicyClient::new(inputs.clone());
+	let client = PolicyClient::new(inputs.clone()).with_parent(req);
 
 	let access_token = fetch_token(&client, auth, auth.build_exchange_request(req)?)
 		.await
@@ -747,7 +766,7 @@ pub(super) async fn apply_identity_assertion(
 	req: &mut Request,
 ) -> Result<bool, ProxyError> {
 	let oauth = auth.oauth_token_exchange();
-	let client = PolicyClient::new(inputs.clone());
+	let client = PolicyClient::new(inputs.clone()).with_parent(req);
 
 	trace!(audience = %auth.audience(), "performing ID-JAG identity assertion exchange");
 	let access_token = fetch_token(&client, oauth, oauth.build_exchange_request(req)?)
@@ -865,25 +884,18 @@ async fn fetch_token(
 	auth: &OAuthTokenExchangeAuth,
 	req: ExchangeRequest,
 ) -> Result<SecretString, FetchError> {
-	let result = match auth.cache.as_ref() {
+	// TODO: export metrics
+	match auth.cache.as_ref() {
 		Some(cache) => {
 			cache
-				.get_or_insert_with(&req, || fetch_token_uncached(client, auth, &req))
-				.await?
+				.get_or_insert_with(&req, || {
+					trace!("token exchange cache miss");
+					fetch_token_uncached(client, auth, &req)
+				})
+				.await
 		},
-		None => {
-			let transport::TokenEndpointResponse { access_token, .. } =
-				fetch_token_uncached(client, auth, &req).await?;
-			TokenCacheResult::Miss(access_token)
-		},
-	};
-
-	// TODO: export metrics
-	match &result {
-		TokenCacheResult::Hit(_) => trace!("token exchange cache hit"),
-		TokenCacheResult::Miss(_) => trace!("token exchange succeeded"),
+		None => Ok(fetch_token_uncached(client, auth, &req).await?.access_token),
 	}
-	Ok(result.into_token())
 }
 
 async fn fetch_token_uncached(

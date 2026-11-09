@@ -6,7 +6,6 @@ pub mod shared_ca;
 pub mod prelude {
 	pub type MemoryClient = hyper_util::client::legacy::Client<MemoryConnector, Body>;
 	pub type StdMutex<T> = std::sync::Mutex<T>;
-	pub use std::assert_matches;
 	pub use std::convert::Infallible;
 	pub use std::sync::Arc;
 	pub use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,11 +19,12 @@ pub mod prelude {
 	pub use agentgateway::read_body;
 	pub use agentgateway::test_helpers::proxymock::*;
 	pub use agentgateway::types::agent::{
-		Backend, BackendTrafficPolicy, BackendWithPolicies, Bind, BindProtocol, Listener,
+		Backend, BackendTrafficPolicy, BackendWithPolicies, Bind, BindProtocol, BindSnapshot, Listener,
 		ListenerProtocol, ListenerSet, PathMatch, ResourceName, Route, RouteMatch,
 		SimpleBackendReference, Target,
 	};
 	pub use agentgateway::types::backend;
+	pub use assert_matches::assert_matches;
 	pub use http::{HeaderMap, Method, StatusCode, Version, header};
 	pub use http_body::Frame;
 	pub use http_body_util::{BodyExt, StreamBody};

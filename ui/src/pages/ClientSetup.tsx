@@ -1,489 +1,558 @@
-import { useMemo, useState } from "react";
-import type { ReactNode } from "react";
+import { Check, Clipboard, Code2, GitBranch, KeyRound, Terminal } from 'lucide-react';
+import type { ReactNode } from 'react';
+import { useMemo, useState } from 'react';
+
+import claudeIcon from '@/assets/claude-color.svg';
+import codexIcon from '@/assets/codex-color.svg';
+import continueIcon from '@/assets/continue.svg';
+import curlIcon from '@/assets/curl.svg';
+import cursorIcon from '@/assets/cursor.svg';
+import gooseIcon from '@/assets/goose.svg';
+import opencodeIcon from '@/assets/opencode.svg';
+import piIcon from '@/assets/pi.svg';
+import githubCopilotIcon from '@/assets/providers/copilot.svg';
+import windsurfIcon from '@/assets/windsurf.svg';
+import { claudeSubscriptionWarning } from '@/claudeSubscription';
+import { FreeformCombobox } from '@/components/FreeformCombobox';
 import {
-  Check,
-  Clipboard,
-  Code2,
-  GitBranch,
-  KeyRound,
-  Terminal,
-} from "lucide-react";
+	Dropdown,
+	Field,
+	FieldGroup,
+	PageHeader,
+	Panel,
+	StatusBanner
+} from '@/components/Primitives';
+import { ProviderIcon } from '@/components/ProviderIcon';
+import { WildcardModelSelector } from '@/components/WildcardModelSelector';
+import { providerLabel } from '@/config';
+import { hasKeyValue, keyLabel, maskKey } from '@/credentialDisplay';
+import { llmGatewayOrigin } from '@/gatewayUrls';
+import { useConfigDumpMode, useLlmConfigData } from '@/hooks';
+import { modelLabel, modelMatchHeaders, modelOptionValue, modelSubtitle } from '@/modelLabel';
 import {
-  Dropdown,
-  Field,
-  FieldGroup,
-  PageHeader,
-  Panel,
-  StatusBanner,
-} from "../components/Primitives";
-import { CatalogModelSelector } from "../components/CatalogModelSelector";
-import { claudeSubscriptionWarning } from "../claudeSubscription";
-import { providerLabel } from "../config";
-import { hasKeyValue, keyLabel, maskKey } from "../credentialDisplay";
-import { llmGatewayOrigin } from "../gatewayUrls";
-import { useLlmConfigData } from "../hooks";
-import {
-  isWildcardModelName,
-  modelProviderLabel,
-  resolveModelName,
-  wildcardModelPrefix,
-  wildcardResolvedSuffix,
-} from "../modelResolution";
-import { ProviderIcon } from "../components/ProviderIcon";
-import type { LlmModel, LlmProvider, ProviderName } from "../types";
-import claudeIcon from "../assets/claude-color.svg";
-import codexIcon from "../assets/codex-color.svg";
-import curlIcon from "../assets/curl.svg";
-import cursorIcon from "../assets/cursor.svg";
-import githubCopilotIcon from "../assets/providers/copilot.svg";
-import gooseIcon from "../assets/goose.svg";
-import opencodeIcon from "../assets/opencode.svg";
-import windsurfIcon from "../assets/windsurf.svg";
+	isWildcardModelName,
+	modelProviderLabel,
+	resolveModelName,
+	wildcardMatchesModel,
+	wildcardModelPrefix
+} from '@/modelResolution';
+import { requestableDumpModelNames } from '@/pages/models/dumpModels';
+import type { LlmModel, LlmProvider, ProviderName } from '@/types';
 
 type ClientRecipe = {
-  id: string;
-  title: string;
-  description: string;
-  icon:
-    | "claude"
-    | "codex"
-    | "curl"
-    | "cursor"
-    | "copilot"
-    | "goose"
-    | "opencode"
-    | "windsurf";
-  provider?: ProviderName;
-  steps?: ReactNode[];
-  language: string;
-  code: string;
+	id: string;
+	title: string;
+	description: string;
+	icon:
+		| 'claude'
+		| 'codex'
+		| 'continue'
+		| 'curl'
+		| 'cursor'
+		| 'copilot'
+		| 'goose'
+		| 'opencode'
+		| 'pi'
+		| 'windsurf';
+	provider?: ProviderName;
+	steps?: ReactNode[];
+	language: string;
+	code: string;
 };
 
 type RequestModelOption =
-  | {
-      kind: "model";
-      name: string;
-      config: LlmModel;
-      icon: ReactNode;
-      searchText: string;
-    }
-  | { kind: "virtual"; name: string; icon: ReactNode; searchText: string };
+	| {
+			kind: 'model';
+			name: string;
+			config: LlmModel;
+			icon: ReactNode;
+			searchText: string;
+	  }
+	| { kind: 'virtual'; name: string; icon: ReactNode; searchText: string };
 
 export function ClientSetupPage() {
-  const {
-    config,
-    models,
-    virtualModels,
-    providers,
-    apiKeys,
-    isLoading: modelsLoading,
-    error: configDataError,
-  } = useLlmConfigData();
-  const modelOptions = useMemo(
-    () => [
-      ...models.map((item) => ({
-        kind: "model" as const,
-        name: item.name,
-        icon: (
-          <ProviderIcon
-            provider={modelProviderLabel(item, providers) as ProviderName}
-          />
-        ),
-        searchText: `${item.name} ${modelProviderLabel(item, providers)} ${providerLabel(item.provider)}`,
-        config: item,
-      })),
-      ...virtualModels.map((item) => ({
-        kind: "virtual" as const,
-        name: item.name,
-        icon: <GitBranch size={16} />,
-        searchText: `${item.name} virtual`,
-      })),
-    ],
-    [models, providers, virtualModels],
-  );
-  const rawVirtualKeys = useMemo(() => apiKeys.filter(hasKeyValue), [apiKeys]);
-  const derivedBaseUrl = llmGatewayOrigin(config.data);
-  const [baseUrl, setBaseUrl] = useState(derivedBaseUrl);
-  const [baseUrlTouched, setBaseUrlTouched] = useState(false);
-  const [model, setModel] = useState("");
-  const [specificModel, setSpecificModel] = useState("");
-  const [apiKeyMode, setApiKeyMode] = useState<"saved" | "raw">("saved");
-  const [selectedKey, setSelectedKey] = useState("");
-  const [rawKey, setRawKey] = useState("");
-  const [selectedIntegration, setSelectedIntegration] = useState("curl");
+	const mode = useConfigDumpMode();
+	// XDS mode has no local LLM config: models come from the config dump instead.
+	const dumpMode = mode.data?.mode === 'dump';
+	const {
+		config,
+		models,
+		virtualModels,
+		providers,
+		apiKeys,
+		isLoading: modelsLoading,
+		error: configDataError
+	} = useLlmConfigData({ enabled: !dumpMode });
+	const dumpModelNames = useMemo(
+		() => (dumpMode ? requestableDumpModelNames(mode.data?.dump?.models ?? []) : []),
+		[dumpMode, mode.data]
+	);
+	const modelOptions = useMemo(
+		() => [
+			...models.map((item, index) => ({
+				kind: 'model' as const,
+				name: item.name,
+				value: modelOptionValue(models, index),
+				description: modelSubtitle(item) || undefined,
+				icon: <ProviderIcon provider={modelProviderLabel(item, providers) as ProviderName} />,
+				searchText: `${item.name} ${modelProviderLabel(item, providers)} ${providerLabel(item.provider)}`,
+				config: item
+			})),
+			...virtualModels.map(item => ({
+				kind: 'virtual' as const,
+				name: item.name,
+				value: item.name,
+				description: 'Virtual model',
+				icon: <GitBranch size={16} />,
+				searchText: `${item.name} virtual`
+			}))
+		],
+		[models, providers, virtualModels]
+	);
+	const rawVirtualKeys = useMemo(() => apiKeys.filter(hasKeyValue), [apiKeys]);
+	// The proxy does not know its externally reachable URL in XDS mode, so there is nothing to derive.
+	const derivedBaseUrl = dumpMode ? '' : llmGatewayOrigin(config.data);
+	const [baseUrl, setBaseUrl] = useState(derivedBaseUrl);
+	const [baseUrlTouched, setBaseUrlTouched] = useState(false);
+	const [model, setModel] = useState('');
+	const [modelTouched, setModelTouched] = useState(false);
+	const [specificModel, setSpecificModel] = useState('');
+	const [apiKeyMode, setApiKeyMode] = useState<'saved' | 'raw'>('saved');
+	const [selectedKey, setSelectedKey] = useState('');
+	const [rawKey, setRawKey] = useState('');
+	const [selectedIntegration, setSelectedIntegration] = useState('curl');
 
-  const selectedModel = modelOptions.some((item) => item.name === model)
-    ? model
-    : (modelOptions[0]?.name ?? "");
-  const selectedModelOption = modelOptions.find(
-    (item) => item.name === selectedModel,
-  );
-  const selectedModelConfig =
-    selectedModelOption?.kind === "model"
-      ? selectedModelOption.config
-      : undefined;
-  const wildcardPrefix =
-    selectedModelConfig && isWildcardModelName(selectedModelConfig.name)
-      ? wildcardModelPrefix(selectedModelConfig.name)
-      : "";
-  const specificModelSuffix = selectedModelConfig
-    ? wildcardResolvedSuffix(
-        specificModel,
-        selectedModelConfig.name,
-        wildcardPrefix,
-      )
-    : "";
-  const selectedCatalogProvider = selectedModelConfig
-    ? modelProviderLabel(selectedModelConfig, providers)
-    : null;
-  const selectedVirtualKey =
-    apiKeyMode === "saved"
-      ? (rawVirtualKeys.find((item) => item.key === selectedKey) ??
-        rawVirtualKeys[0])
-      : undefined;
-  const apiKey = selectedVirtualKey?.key ?? rawKey;
-  const effectiveBaseUrl = baseUrlTouched ? baseUrl : derivedBaseUrl;
-  const requestModel = clientSetupRequestModel(
-    selectedModelOption,
-    selectedModel,
-    specificModel,
-    providers,
-  );
-  const recipes = clientRecipes({
-    baseUrl: effectiveBaseUrl,
-    model: requestModel || "model",
-    apiKey,
-  });
-  const activeRecipe =
-    recipes.find((recipe) => recipe.id === selectedIntegration) ?? recipes[0];
+	const selectedModel = dumpMode
+		? // An edited field keeps what was typed, including an empty value.
+			modelTouched
+			? model
+			: (dumpModelNames[0] ?? '')
+		: modelOptions.some(item => item.value === model)
+			? model
+			: (modelOptions[0]?.value ?? '');
+	const selectedModelOption = modelOptions.find(item => item.value === selectedModel);
+	const selectedModelConfig =
+		selectedModelOption?.kind === 'model' ? selectedModelOption.config : undefined;
+	const selectedCatalogProvider = selectedModelConfig
+		? modelProviderLabel(selectedModelConfig, providers)
+		: null;
+	const selectedVirtualKey =
+		apiKeyMode === 'saved'
+			? (rawVirtualKeys.find(item => item.key === selectedKey) ?? rawVirtualKeys[0])
+			: undefined;
+	const apiKey = selectedVirtualKey?.key ?? rawKey;
+	const effectiveBaseUrl = baseUrlTouched ? baseUrl : derivedBaseUrl;
+	// In XDS mode the name is typed or picked directly, so there is no model config to resolve.
+	const requestModel = dumpMode
+		? dumpRequestModel(selectedModel, specificModel)
+		: clientSetupRequestModel(selectedModelOption, selectedModel, specificModel, providers);
+	const matchHeaders = selectedModelConfig ? modelMatchHeaders(selectedModelConfig) : {};
+	const matchHeadersText = Object.entries(matchHeaders)
+		.map(([name, value]) => `${name}: ${value}`)
+		.join(', ');
+	const recipes = clientRecipes({
+		baseUrl: effectiveBaseUrl,
+		model: requestModel || 'model',
+		apiKey,
+		headers: matchHeaders
+	});
+	const activeRecipe = recipes.find(recipe => recipe.id === selectedIntegration) ?? recipes[0];
 
-  return (
-    <div className="page-stack">
-      <PageHeader
-        title="Client Setup"
-        description="Generate connection settings and snippets for OpenAI-compatible LLM clients."
-      />
-      {configDataError ? (
-        <StatusBanner state="bad" title="Configuration API unavailable">
-          {configDataError.message}
-        </StatusBanner>
-      ) : null}
-      {modelOptions.length === 0 && !modelsLoading ? (
-        <StatusBanner state="warn" title="No models configured">
-          Create an LLM model before wiring clients to the gateway.
-        </StatusBanner>
-      ) : null}
-      {claudeSubscriptionWarning(selectedModelConfig, providers) ? (
-        <StatusBanner state="warn" title="Claude subscription key detected">
-          {claudeSubscriptionWarning(selectedModelConfig, providers)}
-        </StatusBanner>
-      ) : null}
+	return (
+		<div className="page-stack">
+			<PageHeader
+				title="Client Setup"
+				description="Generate connection settings and snippets for LLM clients."
+			/>
+			{configDataError ? (
+				<StatusBanner state="bad" title="Configuration API unavailable">
+					{configDataError.message}
+				</StatusBanner>
+			) : null}
+			{dumpMode ? (
+				<StatusBanner state="info" title="This page configures the client only">
+					Nothing here is written to the gateway. It does not create or change Gateway, HTTPRoute,
+					AgentgatewayBackend, AgentgatewayPolicy or Secret resources.
+				</StatusBanner>
+			) : null}
+			{dumpMode && !dumpModelNames.length && !mode.isLoading ? (
+				<StatusBanner state="warn" title="No models in the gateway dump">
+					No public model is present in the active dump. Type the model name the client should
+					request.
+				</StatusBanner>
+			) : null}
+			{!dumpMode && modelOptions.length === 0 && !modelsLoading ? (
+				<StatusBanner state="warn" title="No models configured">
+					Create an LLM model before wiring clients to the gateway.
+				</StatusBanner>
+			) : null}
+			{claudeSubscriptionWarning(selectedModelConfig, providers) ? (
+				<StatusBanner state="warn" title="Claude subscription key detected">
+					{claudeSubscriptionWarning(selectedModelConfig, providers)}
+				</StatusBanner>
+			) : null}
 
-      <section className="client-setup-layout">
-        <Panel className="client-setup-controls">
-          <div className="section-heading">
-            <h3>Connection</h3>
-          </div>
-          <Field
-            label="Gateway base URL"
-            hint="SDK snippets use this URL with /v1 appended."
-          >
-            <input
-              value={effectiveBaseUrl}
-              onChange={(event) => {
-                setBaseUrlTouched(true);
-                setBaseUrl(event.target.value);
-              }}
-              placeholder={derivedBaseUrl}
-            />
-          </Field>
-          <FieldGroup label="Model">
-            <Dropdown
-              ariaLabel="Model"
-              value={selectedModel}
-              placeholder="No models"
-              searchable
-              options={modelOptions.map((item) => ({
-                value: item.name,
-                label: item.name,
-                description:
-                  item.kind === "virtual" ? "Virtual model" : undefined,
-                icon: item.icon,
-                searchText: item.searchText,
-              }))}
-              onChange={setModel}
-            />
-          </FieldGroup>
-          {selectedModelConfig &&
-          isWildcardModelName(selectedModelConfig.name) ? (
-            <Field
-              label="Specific model"
-              hint="Model uses a wildcard; specify the specific model."
-            >
-              <div className="target-resolved-composite">
-                {wildcardPrefix ? (
-                  <span className="target-prefix">{wildcardPrefix}</span>
-                ) : null}
-                <CatalogModelSelector
-                  ariaLabel="Specific model"
-                  value={specificModelSuffix}
-                  provider={selectedCatalogProvider}
-                  onChange={(value) =>
-                    setSpecificModel(`${wildcardPrefix}${value}`)
-                  }
-                  placeholder="Select or type a model"
-                />
-              </div>
-            </Field>
-          ) : null}
-          <FieldGroup label="Virtual API key">
-            <Dropdown
-              ariaLabel="Virtual API key"
-              value={
-                apiKeyMode === "saved" && selectedVirtualKey
-                  ? selectedVirtualKey.key
-                  : "__raw__"
-              }
-              options={[
-                ...rawVirtualKeys.map((item) => ({
-                  value: item.key,
-                  label: keyLabel(item),
-                  icon: <KeyRound size={16} />,
-                })),
-                {
-                  value: "__raw__",
-                  label: "Raw value",
-                  icon: <Code2 size={16} />,
-                },
-              ]}
-              onChange={(value) => {
-                if (value === "__raw__") {
-                  setApiKeyMode("raw");
-                  return;
-                }
-                setApiKeyMode("saved");
-                setSelectedKey(value);
-              }}
-            />
-          </FieldGroup>
-          {apiKeyMode === "raw" || rawVirtualKeys.length === 0 ? (
-            <Field label="Raw API key">
-              <input
-                value={rawKey}
-                onChange={(event) => setRawKey(event.target.value)}
-                placeholder="agw_sk_..."
-              />
-            </Field>
-          ) : null}
-          <div className="client-setup-summary">
-            <div>
-              <span>Base URL</span>
-              <code>{effectiveBaseUrl.replace(/\/$/, "")}/v1</code>
-            </div>
-            <div>
-              <span>Model</span>
-              <code>{requestModel || "No model selected"}</code>
-            </div>
-            <div>
-              <span>Auth</span>
-              <code>{apiKey ? `Bearer ${maskKey(apiKey)}` : "None"}</code>
-            </div>
-          </div>
-        </Panel>
+			<section className="client-setup-layout">
+				<Panel className="client-setup-controls">
+					<div className="section-heading">
+						<h3>Connection</h3>
+					</div>
+					<Field
+						label="Gateway base URL"
+						hint={
+							dumpMode
+								? 'The gateway cannot know its external URL. Enter the one clients use, including any route prefix.'
+								: 'SDK snippets use this URL with /v1 appended.'
+						}
+					>
+						<input
+							value={effectiveBaseUrl}
+							onChange={event => {
+								setBaseUrlTouched(true);
+								setBaseUrl(event.target.value);
+							}}
+							placeholder={dumpMode ? 'https://gateway.example.com' : derivedBaseUrl}
+						/>
+					</Field>
+					<FieldGroup
+						label="Model"
+						hint={
+							matchHeadersText
+								? `Clients must send ${matchHeadersText} to reach this model.`
+								: undefined
+						}
+					>
+						{dumpMode ? (
+							<FreeformCombobox
+								ariaLabel="Model"
+								value={selectedModel}
+								options={dumpModelNames}
+								onChange={value => {
+									setModelTouched(true);
+									setModel(value);
+								}}
+								placeholder="Select or type a model"
+								emptyText="No models in the dump"
+							/>
+						) : (
+							<Dropdown
+								ariaLabel="Model"
+								value={selectedModel}
+								placeholder="No models"
+								searchable
+								options={modelOptions.map(item => ({
+									value: item.value,
+									label: item.kind === 'model' ? modelLabel(item.config) : item.name,
+									description: item.description,
+									icon: item.icon,
+									searchText: item.searchText
+								}))}
+								onChange={value => {
+									setModel(value);
+									setSpecificModel('');
+								}}
+							/>
+						)}
+					</FieldGroup>
+					{dumpMode && isWildcardModelName(selectedModel) ? (
+						<Field
+							label="Specific model"
+							hint="The dump lists a pattern; clients have to request a concrete model."
+						>
+							{(id, hintId) => (
+								<div className="target-resolved-composite">
+									{wildcardModelPrefix(selectedModel) ? (
+										<span className="target-prefix">{wildcardModelPrefix(selectedModel)}</span>
+									) : null}
+									<input
+										id={id}
+										aria-label="Specific model"
+										aria-describedby={hintId}
+										value={specificModel}
+										onChange={event => setSpecificModel(event.target.value)}
+										placeholder="Model name"
+									/>
+								</div>
+							)}
+						</Field>
+					) : null}
+					{selectedModelConfig && isWildcardModelName(selectedModelConfig.name) ? (
+						<Field label="Specific model" hint="Model uses a wildcard; specify the specific model.">
+							{(id, hintId) => (
+								<WildcardModelSelector
+									id={id}
+									ariaLabel="Specific model"
+									aria-describedby={hintId}
+									model={selectedModelConfig}
+									value={specificModel}
+									provider={selectedCatalogProvider}
+									onChange={setSpecificModel}
+									placeholder="Select or type a model"
+								/>
+							)}
+						</Field>
+					) : null}
+					<FieldGroup label="Virtual API key">
+						<Dropdown
+							ariaLabel="Virtual API key"
+							value={
+								apiKeyMode === 'saved' && selectedVirtualKey ? selectedVirtualKey.key : '__raw__'
+							}
+							options={[
+								...rawVirtualKeys.map(item => ({
+									value: item.key,
+									label: keyLabel(item),
+									icon: <KeyRound size={16} />
+								})),
+								{
+									value: '__raw__',
+									label: 'Raw value',
+									icon: <Code2 size={16} />
+								}
+							]}
+							onChange={value => {
+								if (value === '__raw__') {
+									setApiKeyMode('raw');
+									return;
+								}
+								setApiKeyMode('saved');
+								setSelectedKey(value);
+							}}
+						/>
+					</FieldGroup>
+					{apiKeyMode === 'raw' || rawVirtualKeys.length === 0 ? (
+						<Field label="Raw API key">
+							<input
+								value={rawKey}
+								onChange={event => setRawKey(event.target.value)}
+								placeholder="agw_sk_..."
+							/>
+						</Field>
+					) : null}
+					<div className="client-setup-summary">
+						<div>
+							<span>Base URL</span>
+							<code>
+								{effectiveBaseUrl.trim() ? `${effectiveBaseUrl.replace(/\/$/, '')}/v1` : 'Not set'}
+							</code>
+						</div>
+						<div>
+							<span>Model</span>
+							<code>{requestModel || 'No model selected'}</code>
+						</div>
+						<div>
+							<span>Auth</span>
+							<code>{apiKey ? `Bearer ${maskKey(apiKey)}` : 'None'}</code>
+						</div>
+					</div>
+				</Panel>
 
-        <ClientRecipeCard
-          recipe={activeRecipe}
-          recipes={recipes}
-          selectedIntegration={activeRecipe.id}
-          onSelectIntegration={setSelectedIntegration}
-        />
-      </section>
-    </div>
-  );
+				{effectiveBaseUrl.trim() ? (
+					<ClientRecipeCard
+						recipe={activeRecipe}
+						recipes={recipes}
+						selectedIntegration={activeRecipe.id}
+						onSelectIntegration={setSelectedIntegration}
+					/>
+				) : (
+					<Panel>
+						<StatusBanner state="info" title="Enter the gateway base URL">
+							Client snippets appear once the URL is set, so they never carry a placeholder host.
+						</StatusBanner>
+					</Panel>
+				)}
+			</section>
+		</div>
+	);
+}
+
+/**
+ * XDS mode has no model config to resolve against. A dump name can be a pattern
+ * (`gpt-*`, `*-latest` or `*`), and a client cannot request a pattern, so the
+ * concrete part is typed in and appended to the prefix, as in standalone mode.
+ */
+function dumpRequestModel(selectedModel: string, specificModel: string) {
+	if (!isWildcardModelName(selectedModel)) return selectedModel.trim();
+	const prefix = wildcardModelPrefix(selectedModel);
+	const suffix = specificModel.trim();
+	return suffix ? `${prefix}${suffix}` : `${prefix}<model>`;
 }
 
 function clientSetupRequestModel(
-  option: RequestModelOption | undefined,
-  selectedModel: string,
-  specificModel: string,
-  providers: LlmProvider[],
+	option: RequestModelOption | undefined,
+	selectedModel: string,
+	specificModel: string,
+	providers: LlmProvider[]
 ) {
-  if (!option) return "";
-  if (option.kind === "virtual") return selectedModel;
-  if (!isWildcardModelName(option.config.name))
-    return resolveModelName(option.config, specificModel, providers);
-  const normalized = normalizedClientSpecificModel(
-    option.config,
-    specificModel,
-  );
-  if (normalized) return resolveModelName(option.config, normalized, providers);
-  const prefix = wildcardModelPrefix(option.config.name);
-  return prefix ? `${prefix}<model>` : "<model>";
+	if (!option) return '';
+	if (option.kind === 'virtual') return selectedModel;
+	if (!isWildcardModelName(option.config.name))
+		return resolveModelName(option.config, specificModel, providers);
+	const normalized = normalizedClientSpecificModel(option.config, specificModel);
+	if (normalized) return resolveModelName(option.config, normalized, providers);
+	return option.config.name.replace('*', '<model>');
 }
 
 function normalizedClientSpecificModel(model: LlmModel, specificModel: string) {
-  const trimmed = specificModel.trim();
-  const prefix = wildcardModelPrefix(model.name);
-  if (!trimmed || trimmed === prefix) return "";
-  if (prefix && !trimmed.startsWith(prefix)) return "";
-  return trimmed;
+	const trimmed = specificModel.trim();
+	return wildcardMatchesModel(model.name, trimmed) ? trimmed : '';
 }
 
 function ClientRecipeCard(props: {
-  recipe: ClientRecipe;
-  recipes: ClientRecipe[];
-  selectedIntegration: string;
-  onSelectIntegration: (value: string) => void;
+	recipe: ClientRecipe;
+	recipes: ClientRecipe[];
+	selectedIntegration: string;
+	onSelectIntegration: (value: string) => void;
 }) {
-  return (
-    <Panel className="client-recipe-card">
-      <div className="client-recipe-toolbar">
-        <FieldGroup label="Integration">
-          <Dropdown
-            ariaLabel="Integration"
-            className="client-recipe-select"
-            value={props.selectedIntegration}
-            options={props.recipes.map((recipe) => ({
-              value: recipe.id,
-              label: recipe.title,
-              icon: <ClientSetupIcon recipe={recipe} compact />,
-              searchText: `${recipe.title} ${recipe.description}`,
-            }))}
-            onChange={props.onSelectIntegration}
-            searchable
-          />
-        </FieldGroup>
-        <CopyButton value={props.recipe.code} />
-      </div>
-      <div className="client-recipe-header">
-        <ClientSetupIcon recipe={props.recipe} />
-        <div>
-          <h3>{props.recipe.title}</h3>
-          <p>{props.recipe.description}</p>
-        </div>
-      </div>
-      {props.recipe.steps?.length ? (
-        <ol className="client-recipe-steps">
-          {props.recipe.steps.map((step, index) => (
-            <li key={index}>{step}</li>
-          ))}
-        </ol>
-      ) : null}
-      <HighlightedCode
-        code={props.recipe.code}
-        language={props.recipe.language}
-      />
-    </Panel>
-  );
+	return (
+		<Panel className="client-recipe-card">
+			<div className="client-recipe-toolbar">
+				<FieldGroup label="Integration">
+					<Dropdown
+						ariaLabel="Integration"
+						className="client-recipe-select"
+						value={props.selectedIntegration}
+						options={props.recipes.map(recipe => ({
+							value: recipe.id,
+							label: recipe.title,
+							icon: <ClientSetupIcon recipe={recipe} compact />,
+							searchText: `${recipe.title} ${recipe.description}`
+						}))}
+						onChange={props.onSelectIntegration}
+						searchable
+					/>
+				</FieldGroup>
+				<CopyButton value={props.recipe.code} />
+			</div>
+			<div className="client-recipe-header">
+				<ClientSetupIcon recipe={props.recipe} />
+				<div>
+					<h3>{props.recipe.title}</h3>
+					<p>{props.recipe.description}</p>
+				</div>
+			</div>
+			{props.recipe.steps?.length ? (
+				<ol className="client-recipe-steps">
+					{props.recipe.steps.map((step, index) => (
+						// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+						<li key={index}>{step}</li>
+					))}
+				</ol>
+			) : null}
+			<HighlightedCode code={props.recipe.code} language={props.recipe.language} />
+		</Panel>
+	);
 }
 
 function CopyButton(props: { value: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <button
-      className="button"
-      type="button"
-      onClick={async () => {
-        await navigator.clipboard.writeText(props.value);
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 1200);
-      }}
-    >
-      {copied ? <Check size={16} /> : <Clipboard size={16} />}
-      {copied ? "Copied" : "Copy"}
-    </button>
-  );
+	const [copied, setCopied] = useState(false);
+	return (
+		<button
+			className="button"
+			type="button"
+			onClick={async () => {
+				await navigator.clipboard.writeText(props.value);
+				setCopied(true);
+				window.setTimeout(() => setCopied(false), 1200);
+			}}
+		>
+			{copied ? <Check size={16} /> : <Clipboard size={16} />}
+			{copied ? 'Copied' : 'Copy'}
+		</button>
+	);
 }
 
 function clientRecipes(args: {
-  baseUrl: string;
-  model: string;
-  apiKey: string;
+	baseUrl: string;
+	model: string;
+	apiKey: string;
+	headers?: Record<string, string>;
 }): ClientRecipe[] {
-  const base = args.baseUrl.replace(/\/$/, "");
-  const v1 = `${base}/v1`;
-  const completions = `${v1}/chat/completions`;
-  const requiredApiKey = args.apiKey || "dummy_key";
-  const continuation = "\\";
-  const curlAuthorization = args.apiKey
-    ? `  -H ${JSON.stringify(`Authorization: Bearer ${args.apiKey}`)} ${continuation}\n`
-    : "";
-  const openCodeApiKey = args.apiKey
-    ? `,
+	const base = args.baseUrl.replace(/\/$/, '');
+	const v1 = `${base}/v1`;
+	const completions = `${v1}/chat/completions`;
+	const requiredApiKey = args.apiKey || 'dummy_key';
+	const continuation = '\\';
+	const curlAuthorization = args.apiKey
+		? `  -H ${JSON.stringify(`Authorization: Bearer ${args.apiKey}`)} ${continuation}\n`
+		: '';
+	// Single quotes keep the shell from expanding `$` or backticks in header values.
+	const curlMatchHeaders = Object.entries(args.headers ?? {})
+		.map(
+			([name, value]) => `  -H '${`${name}: ${value}`.replaceAll("'", `'\\''`)}' ${continuation}\n`
+		)
+		.join('');
+	const openCodeApiKey = args.apiKey
+		? `,
         "apiKey": "{env:AGENTGATEWAY_API_KEY}"`
-    : "";
-  const openCodeApiKeyExport = args.apiKey
-    ? `
+		: '';
+	const continueApiKey = args.apiKey
+		? `
+    apiKey: ${JSON.stringify(args.apiKey)}`
+		: '';
+	const openCodeApiKeyExport = args.apiKey
+		? `
 
 export AGENTGATEWAY_API_KEY=${JSON.stringify(args.apiKey)}  # Alternatively, type /connect to enter your API key.`
-    : "";
-  return [
-    {
-      id: "curl",
-      title: "curl",
-      description:
-        "Minimal raw HTTP request for debugging client connectivity.",
-      icon: "curl",
-      language: "bash",
-      code: `curl ${JSON.stringify(completions)} ${continuation}
-${curlAuthorization}  -H "Content-Type: application/json" ${continuation}
+		: '';
+	return [
+		{
+			id: 'curl',
+			title: 'curl',
+			description: 'Send a chat completion request to agentgateway with curl.',
+			icon: 'curl',
+			language: 'bash',
+			code: `curl ${JSON.stringify(completions)} ${continuation}
+${curlAuthorization}${curlMatchHeaders}  -H "Content-Type: application/json" ${continuation}
   -d '{
     "model": "${args.model}",
     "messages": [
       { "role": "user", "content": "Hello from agentgateway" }
     ]
-  }'`,
-    },
-    {
-      id: "claude-code",
-      title: "Claude Code",
-      description:
-        "Use the gateway URL and key with Claude-compatible model routes when configured.",
-      icon: "claude",
-      language: "bash",
-      code: `export ANTHROPIC_AUTH_TOKEN=${JSON.stringify(requiredApiKey)}
+  }'`
+		},
+		{
+			id: 'claude-code',
+			title: 'Claude Code',
+			description: 'Connect Claude Code to agentgateway using the Anthropic Messages API.',
+			icon: 'claude',
+			language: 'bash',
+			code: `export ANTHROPIC_AUTH_TOKEN=${JSON.stringify(requiredApiKey)}
 export ANTHROPIC_BASE_URL=${JSON.stringify(base)}
 
-claude --model ${JSON.stringify(args.model)}`,
-    },
-    {
-      id: "claude-desktop",
-      title: "Claude Desktop",
-      description:
-        "Route Claude Desktop third-party inference through the gateway.",
-      icon: "claude",
-      steps: [
-        <>
-          Open Claude Desktop and enable developer mode: <strong>Help</strong>{" "}
-          &gt; <strong>Troubleshooting</strong> &gt;{" "}
-          <strong>Enable Developer Mode</strong>.
-        </>,
-        <>
-          Fully quit and relaunch Claude Desktop. A new{" "}
-          <strong>Developer</strong> menu appears in the menu bar.
-        </>,
-        <>
-          Open <strong>Developer</strong> &gt;{" "}
-          <strong>Configure Third-Party Inference</strong> &gt;{" "}
-          <strong>Gateway</strong>.
-        </>,
-        <>
-          Enter the gateway URL and virtual API key, save, then restart Claude
-          Desktop.
-        </>,
-      ],
-      language: "text",
-      code: `Gateway URL: ${base}
-API Key: ${requiredApiKey}`,
-    },
-    {
-      id: "codex",
-      title: "Codex CLI",
-      description:
-        "Use OpenAI-compatible environment variables when running Codex against the gateway.",
-      icon: "codex",
-      language: "bash",
-      code: `export OPENAI_API_KEY=${JSON.stringify(requiredApiKey)}
+claude --model ${JSON.stringify(args.model)}`
+		},
+		{
+			id: 'claude-desktop',
+			title: 'Claude Desktop',
+			description: 'Connect Claude Desktop to agentgateway using third-party inference settings.',
+			icon: 'claude',
+			steps: [
+				<>
+					Open Claude Desktop and enable developer mode: <strong>Help</strong> &gt;{' '}
+					<strong>Troubleshooting</strong> &gt; <strong>Enable Developer Mode</strong>.
+				</>,
+				<>
+					Fully quit and relaunch Claude Desktop. A new <strong>Developer</strong> menu appears in
+					the menu bar.
+				</>,
+				<>
+					Open <strong>Developer</strong> &gt; <strong>Configure Third-Party Inference</strong> &gt;{' '}
+					<strong>Gateway</strong>.
+				</>,
+				<>Enter the gateway URL and virtual API key, save, then restart Claude Desktop.</>
+			],
+			language: 'text',
+			code: `Gateway URL: ${base}
+API Key: ${requiredApiKey}`
+		},
+		{
+			id: 'codex',
+			title: 'Codex CLI',
+			description: 'Connect Codex CLI to agentgateway with a custom model provider.',
+			icon: 'codex',
+			language: 'bash',
+			code: `export OPENAI_API_KEY=${JSON.stringify(requiredApiKey)}
 # If Codex has an existing login it can impact functionality. Better if it's logged out.
 # If you don't want to override your Codex configuration, you can set up a new dedicated configuration file.
 export CODEX_HOME=/tmp/codex-gateway-home && mkdir -p $CODEX_HOME # optional
@@ -492,24 +561,23 @@ codex login --with-api-key <<<"$OPENAI_API_KEY"
 codex --model "${args.model}" \\
   -c 'model_provider="gateway"' \\
   -c 'model_providers.gateway.name="Local gateway"' \\
-  -c 'model_providers.gateway.base_url="${v1}"'`,
-    },
-    {
-      id: "opencode",
-      title: "OpenCode",
-      description:
-        "Configure OpenCode with an OpenAI-compatible gateway provider.",
-      icon: "opencode",
-      steps: [
-        <>
-          Create this <code>opencode.json</code> in your project root.
-        </>,
-        <>
-          Run <code>opencode</code> from the same directory.
-        </>,
-      ],
-      language: "bash",
-      code: `
+  -c 'model_providers.gateway.base_url="${v1}"'`
+		},
+		{
+			id: 'opencode',
+			title: 'OpenCode',
+			description: 'Connect OpenCode to agentgateway.',
+			icon: 'opencode',
+			steps: [
+				<>
+					Create this <code>opencode.json</code> in your project root.
+				</>,
+				<>
+					Run <code>opencode</code> from the same directory.
+				</>
+			],
+			language: 'bash',
+			code: `
 cat > opencode.json <<'EOF'
 {
   "$schema": "https://opencode.ai/config.json",
@@ -531,116 +599,161 @@ cat > opencode.json <<'EOF'
 }
 EOF
 ${openCodeApiKeyExport}
-opencode`,
-    },
-    {
-      id: "goose",
-      title: "Goose",
-      description:
-        "Point Goose's OpenAI provider at the gateway host and chat completions path.",
-      icon: "goose",
-      steps: [
-        <>
-          Run <code>goose configure</code> &gt;{" "}
-          <strong>Configure Providers</strong> &gt; <strong>OpenAI</strong>, or
-          export the variables below before starting a session.
-        </>,
-        <>
-          To persist the settings, add them to{" "}
-          <code>~/.config/goose/config.yaml</code>.
-        </>,
-        <>
-          <code>goose configure</code> cannot enter custom model names; set{" "}
-          <code>GOOSE_MODEL</code> in <code>config.yaml</code> for models
-          missing from the provider list.
-        </>,
-      ],
-      language: "bash",
-      code: `export GOOSE_PROVIDER=openai
+opencode`
+		},
+		{
+			id: 'pi',
+			title: 'Pi',
+			description: 'Connect Pi to agentgateway using the Responses API.',
+			icon: 'pi',
+			steps: [
+				<>
+					Add this configuration to <code>~/.pi/agent/models.json</code>. If the file exists, merge
+					the <code>agentgateway</code> entry into its <code>providers</code> object.
+				</>,
+				<>
+					Start <code>pi</code>, then use <code>/model</code> to select <code>{args.model}</code>{' '}
+					under <code>agentgateway</code>.
+				</>
+			],
+			language: 'json',
+			code: JSON.stringify(
+				{
+					providers: {
+						agentgateway: {
+							baseUrl: v1,
+							api: 'openai-responses',
+							apiKey: requiredApiKey,
+							models: [{ id: args.model }]
+						}
+					}
+				},
+				null,
+				2
+			)
+		},
+		{
+			id: 'goose',
+			title: 'Goose',
+			description: 'Connect Goose to agentgateway using its OpenAI provider.',
+			icon: 'goose',
+			steps: [
+				<>
+					Run <code>goose configure</code> &gt; <strong>Configure Providers</strong> &gt;{' '}
+					<strong>OpenAI</strong>, or export the variables below before starting a session.
+				</>,
+				<>
+					To persist the settings, add them to <code>~/.config/goose/config.yaml</code>.
+				</>,
+				<>
+					<code>goose configure</code> cannot enter custom model names; set <code>GOOSE_MODEL</code>{' '}
+					in <code>config.yaml</code> for models missing from the provider list.
+				</>
+			],
+			language: 'bash',
+			code: `export GOOSE_PROVIDER=openai
 export GOOSE_MODEL=${JSON.stringify(args.model)}
 export OPENAI_HOST=${JSON.stringify(base)}
 export OPENAI_BASE_PATH=v1/chat/completions
 # Goose requires a non-empty key; the gateway holds the real provider credentials.
 export OPENAI_API_KEY=${JSON.stringify(requiredApiKey)}
 
-goose session`,
-    },
-    {
-      id: "cursor",
-      title: "Cursor",
-      description:
-        "Use Cursor's OpenAI base URL override with a gateway model.",
-      icon: "cursor",
-      steps: [
-        <>
-          Open <strong>Cursor Settings</strong> &gt; <strong>Models</strong>.
-        </>,
-        <>
-          Enable <strong>Override OpenAI Base URL</strong> and set it to{" "}
-          <code>{base}</code>.
-        </>,
-        <>
-          Add <code>{args.model}</code> as a custom model, then test from{" "}
-          <strong>Ask</strong> or <strong>Plan</strong> mode.
-        </>,
-      ],
-      language: "text",
-      code: `Override OpenAI Base URL: ${base}
+goose session`
+		},
+		{
+			id: 'cursor',
+			title: 'Cursor',
+			description: 'Connect Cursor to agentgateway using the OpenAI base URL override.',
+			icon: 'cursor',
+			steps: [
+				<>
+					Open <strong>Cursor Settings</strong> &gt; <strong>Models</strong>.
+				</>,
+				<>
+					Enable <strong>Override OpenAI Base URL</strong> and set it to <code>{base}</code>.
+				</>,
+				<>
+					Add <code>{args.model}</code> as a custom model, then test from <strong>Ask</strong> or{' '}
+					<strong>Plan</strong> mode.
+				</>
+			],
+			language: 'text',
+			code: `Override OpenAI Base URL: ${base}
 OpenAI API Key: ${requiredApiKey}
-Custom model: ${args.model}`,
-    },
-    {
-      id: "github-copilot",
-      title: "GitHub Copilot",
-      description:
-        "Configure VS Code Copilot Business or Enterprise to use the gateway proxy.",
-      icon: "copilot",
-      steps: [
-        <>
-          Open <strong>VS Code Settings</strong> and search for{" "}
-          <code>github.copilot</code>.
-        </>,
-        <>
-          Edit <code>settings.json</code> and set the advanced proxy URL.
-        </>,
-        <>Reload VS Code and test Copilot suggestions or chat.</>,
-      ],
-      language: "json",
-      code: `{
+Custom model: ${args.model}`
+		},
+		{
+			id: 'github-copilot',
+			title: 'GitHub Copilot',
+			description: 'Connect VS Code Copilot Business or Enterprise to agentgateway.',
+			icon: 'copilot',
+			steps: [
+				<>
+					Open <strong>VS Code Settings</strong> and search for <code>github.copilot</code>.
+				</>,
+				<>
+					Edit <code>settings.json</code> and set the advanced proxy URL.
+				</>,
+				<>Reload VS Code and test Copilot suggestions or chat.</>
+			],
+			language: 'json',
+			code: `{
   "github.copilot.advanced": {
     "debug.overrideProxyUrl": "${v1}"
   }
-}`,
-    },
-    {
-      id: "windsurf",
-      title: "Windsurf",
-      description:
-        "Route Windsurf traffic through the gateway HTTP proxy setting.",
-      icon: "windsurf",
-      steps: [
-        <>
-          Open <strong>Windsurf Settings</strong>.
-        </>,
-        <>
-          Search for <strong>Http: Proxy</strong>.
-        </>,
-        <>
-          Set the proxy URL to <code>{base}</code> and save.
-        </>,
-      ],
-      language: "text",
-      code: `Http: Proxy: ${base}`,
-    },
-    {
-      id: "openai-js",
-      title: "OpenAI JavaScript SDK",
-      description:
-        "Use the gateway as an OpenAI-compatible chat completions endpoint.",
-      icon: "codex",
-      provider: "openai",
-      language: "ts",
-      code: `import OpenAI from "openai";
+}`
+		},
+		{
+			id: 'continue',
+			title: 'Continue',
+			description: 'Connect Continue to agentgateway using an OpenAI-compatible model.',
+			icon: 'continue',
+			steps: [
+				<>
+					Add this configuration to <code>~/.continue/config.yaml</code>. If the file exists, add
+					the model to its <code>models</code> list.
+				</>,
+				<>
+					Save the file, then select <strong>agentgateway</strong> in the Continue model selector.
+				</>
+			],
+			language: 'text',
+			code: `name: agentgateway
+version: 0.0.1
+schema: v1
+models:
+  - name: agentgateway
+    provider: openai
+    model: ${JSON.stringify(args.model)}
+    apiBase: ${JSON.stringify(v1)}${continueApiKey}`
+		},
+		{
+			id: 'windsurf',
+			title: 'Windsurf',
+			description: 'Connect Windsurf to agentgateway using its HTTP proxy setting.',
+			icon: 'windsurf',
+			steps: [
+				<>
+					Open <strong>Windsurf Settings</strong>.
+				</>,
+				<>
+					Search for <strong>Http: Proxy</strong>.
+				</>,
+				<>
+					Set the proxy URL to <code>{base}</code> and save.
+				</>
+			],
+			language: 'text',
+			code: `Http: Proxy: ${base}`
+		},
+		{
+			id: 'openai-js',
+			title: 'OpenAI JavaScript SDK',
+			description: 'Call agentgateway using the OpenAI JavaScript SDK.',
+			icon: 'codex',
+			provider: 'openai',
+			language: 'ts',
+			code: `import OpenAI from "openai";
 
 const client = new OpenAI({
   apiKey: "${requiredApiKey}",
@@ -652,16 +765,16 @@ const response = await client.chat.completions.create({
   messages: [{ role: "user", content: "Hello from agentgateway" }],
 });
 
-console.log(response.choices[0]?.message?.content);`,
-    },
-    {
-      id: "openai-python",
-      title: "OpenAI Python SDK",
-      description: "Point the Python SDK at the gateway listener.",
-      icon: "codex",
-      provider: "openai",
-      language: "python",
-      code: `from openai import OpenAI
+console.log(response.choices[0]?.message?.content);`
+		},
+		{
+			id: 'openai-python',
+			title: 'OpenAI Python SDK',
+			description: 'Call agentgateway using the OpenAI Python SDK.',
+			icon: 'codex',
+			provider: 'openai',
+			language: 'python',
+			code: `from openai import OpenAI
 
 client = OpenAI(
     api_key="${requiredApiKey}",
@@ -673,211 +786,216 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello from agentgateway"}],
 )
 
-print(response.choices[0].message.content)`,
-    },
-  ];
+print(response.choices[0].message.content)`
+		}
+	];
 }
 
 function ClientSetupIcon(props: { recipe: ClientRecipe; compact?: boolean }) {
-  const className = props.compact
-    ? "client-svg-icon compact"
-    : "client-svg-icon";
-  if (props.recipe.provider) {
-    return (
-      <span className={className}>
-        <ProviderIcon provider={props.recipe.provider} />
-      </span>
-    );
-  }
-  if (props.recipe.icon === "codex") {
-    return (
-      <span className={className}>
-        <img src={codexIcon} alt="" aria-hidden="true" />
-      </span>
-    );
-  }
-  if (props.recipe.icon === "claude") {
-    return (
-      <span className={className}>
-        <img src={claudeIcon} alt="" aria-hidden="true" />
-      </span>
-    );
-  }
-  if (props.recipe.icon === "curl") {
-    return (
-      <span className={className}>
-        <img src={curlIcon} alt="" aria-hidden="true" />
-      </span>
-    );
-  }
-  if (props.recipe.icon === "cursor") {
-    return (
-      <span className={className}>
-        <img src={cursorIcon} alt="" aria-hidden="true" />
-      </span>
-    );
-  }
-  if (props.recipe.icon === "copilot") {
-    return (
-      <span className={className}>
-        <img src={githubCopilotIcon} alt="" aria-hidden="true" />
-      </span>
-    );
-  }
-  if (props.recipe.icon === "goose") {
-    return (
-      <span className={className}>
-        <img src={gooseIcon} alt="" aria-hidden="true" />
-      </span>
-    );
-  }
-  if (props.recipe.icon === "opencode") {
-    return (
-      <span className={className}>
-        <img src={opencodeIcon} alt="" aria-hidden="true" />
-      </span>
-    );
-  }
-  if (props.recipe.icon === "windsurf") {
-    return (
-      <span className={className}>
-        <img src={windsurfIcon} alt="" aria-hidden="true" />
-      </span>
-    );
-  }
-  return (
-    <span className={className}>
-      <Terminal size={20} />
-    </span>
-  );
+	const className = props.compact ? 'client-svg-icon compact' : 'client-svg-icon';
+	if (props.recipe.provider) {
+		return (
+			<span className={className}>
+				<ProviderIcon provider={props.recipe.provider} />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'codex') {
+		return (
+			<span className={className}>
+				<img src={codexIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'claude') {
+		return (
+			<span className={className}>
+				<img src={claudeIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'curl') {
+		return (
+			<span className={className}>
+				<img src={curlIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'cursor') {
+		return (
+			<span className={className}>
+				<img src={cursorIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'copilot') {
+		return (
+			<span className={className}>
+				<img src={githubCopilotIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'continue') {
+		return (
+			<span className={className}>
+				<img src={continueIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'goose') {
+		return (
+			<span className={className}>
+				<img src={gooseIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'opencode') {
+		return (
+			<span className={className}>
+				<img src={opencodeIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'pi') {
+		return (
+			<span className={className}>
+				<img src={piIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'windsurf') {
+		return (
+			<span className={className}>
+				<img src={windsurfIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	return (
+		<span className={className}>
+			<Terminal size={20} />
+		</span>
+	);
 }
 
 function HighlightedCode(props: { code: string; language: string }) {
-  return (
-    <pre className={`client-code-block code-lang-${props.language}`}>
-      <code>{highlightCode(props.code, props.language)}</code>
-    </pre>
-  );
+	return (
+		<pre className={`client-code-block code-lang-${props.language}`}>
+			<code>{highlightCode(props.code, props.language)}</code>
+		</pre>
+	);
 }
 
 function highlightCode(code: string, language: string) {
-  return code.split("\n").flatMap((line, lineIndex, lines) => [
-    <span className="code-line" key={`line-${lineIndex}`}>
-      {highlightLine(line, language, lineIndex)}
-    </span>,
-    lineIndex < lines.length - 1 ? "\n" : null,
-  ]);
+	return code.split('\n').flatMap((line, lineIndex, lines) => [
+		<span
+			className="code-line"
+			key={`line-${
+				// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+				lineIndex
+			}`}
+		>
+			{highlightLine(line, language, lineIndex)}
+		</span>,
+		lineIndex < lines.length - 1 ? '\n' : null
+	]);
 }
 
-function highlightLine(
-  line: string,
-  language: string,
-  lineIndex: number,
-): ReactNode {
-  if (language === "bash")
-    return highlightWithRules(line, lineIndex, bashRules);
-  if (language === "json")
-    return highlightWithRules(line, lineIndex, jsonRules);
-  if (language === "python")
-    return highlightWithRules(line, lineIndex, pythonRules);
-  if (language === "text")
-    return highlightWithRules(line, lineIndex, textRules);
-  return highlightWithRules(line, lineIndex, tsRules);
+function highlightLine(line: string, language: string, lineIndex: number): ReactNode {
+	if (language === 'bash') return highlightWithRules(line, lineIndex, bashRules);
+	if (language === 'json') return highlightWithRules(line, lineIndex, jsonRules);
+	if (language === 'python') return highlightWithRules(line, lineIndex, pythonRules);
+	if (language === 'text') return highlightWithRules(line, lineIndex, textRules);
+	return highlightWithRules(line, lineIndex, tsRules);
 }
 
 type CodeRule = {
-  className: string;
-  pattern: RegExp;
+	className: string;
+	pattern: RegExp;
 };
 
 const tsRules: CodeRule[] = [
-  { className: "code-comment", pattern: /\/\/.*/y },
-  {
-    className: "code-string",
-    pattern: /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/y,
-  },
-  {
-    className: "code-keyword",
-    pattern: /\b(?:await|const|from|import|new)\b/y,
-  },
-  { className: "code-number", pattern: /\b\d+(?:\.\d+)?\b/y },
-  {
-    className: "code-property",
-    pattern:
-      /\b(?:apiKey|baseURL|client|content|messages|model|response|role)\b(?=\s*:|\.)/y,
-  },
-  { className: "code-function", pattern: /\b[A-Za-z_][\w]*(?=\()/y },
+	{ className: 'code-comment', pattern: /\/\/.*/y },
+	{
+		className: 'code-string',
+		pattern: /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/y
+	},
+	{
+		className: 'code-keyword',
+		pattern: /\b(?:await|const|from|import|new)\b/y
+	},
+	{ className: 'code-number', pattern: /\b\d+(?:\.\d+)?\b/y },
+	{
+		className: 'code-property',
+		pattern: /\b(?:apiKey|baseURL|client|content|messages|model|response|role)\b(?=\s*:|\.)/y
+	},
+	{ className: 'code-function', pattern: /\b[A-Za-z_][\w]*(?=\()/y }
 ];
 
 const pythonRules: CodeRule[] = [
-  { className: "code-comment", pattern: /#.*/y },
-  { className: "code-string", pattern: /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/y },
-  {
-    className: "code-keyword",
-    pattern: /\b(?:from|import|client|response)\b/y,
-  },
-  { className: "code-number", pattern: /\b\d+(?:\.\d+)?\b/y },
-  {
-    className: "code-property",
-    pattern: /\b(?:api_key|base_url|messages|model)\b(?=\s*=)/y,
-  },
-  { className: "code-function", pattern: /\b[A-Za-z_][\w]*(?=\()/y },
+	{ className: 'code-comment', pattern: /#.*/y },
+	{ className: 'code-string', pattern: /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/y },
+	{
+		className: 'code-keyword',
+		pattern: /\b(?:from|import|client|response)\b/y
+	},
+	{ className: 'code-number', pattern: /\b\d+(?:\.\d+)?\b/y },
+	{
+		className: 'code-property',
+		pattern: /\b(?:api_key|base_url|messages|model)\b(?=\s*=)/y
+	},
+	{ className: 'code-function', pattern: /\b[A-Za-z_][\w]*(?=\()/y }
 ];
 
 const bashRules: CodeRule[] = [
-  { className: "code-comment", pattern: /#.*/y },
-  { className: "code-string", pattern: /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/y },
-  {
-    className: "code-keyword",
-    pattern: /\b(?:curl|export|claude|codex|goose)\b/y,
-  },
-  { className: "code-flag", pattern: /--?[A-Za-z][\w-]*/y },
-  { className: "code-number", pattern: /\b\d+(?:\.\d+)?\b/y },
+	{ className: 'code-comment', pattern: /#.*/y },
+	{ className: 'code-string', pattern: /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/y },
+	{
+		className: 'code-keyword',
+		pattern: /\b(?:curl|export|claude|codex|goose)\b/y
+	},
+	{ className: 'code-flag', pattern: /--?[A-Za-z][\w-]*/y },
+	{ className: 'code-number', pattern: /\b\d+(?:\.\d+)?\b/y }
 ];
 
 const jsonRules: CodeRule[] = [
-  { className: "code-string", pattern: /"(?:\\.|[^"\\])*"/y },
-  { className: "code-keyword", pattern: /\b(?:true|false|null)\b/y },
-  { className: "code-number", pattern: /-?\b\d+(?:\.\d+)?\b/y },
+	{ className: 'code-string', pattern: /"(?:\\.|[^"\\])*"/y },
+	{ className: 'code-keyword', pattern: /\b(?:true|false|null)\b/y },
+	{ className: 'code-number', pattern: /-?\b\d+(?:\.\d+)?\b/y }
 ];
 
 const textRules: CodeRule[] = [
-  { className: "code-property", pattern: /^[^:]+(?=:)/y },
-  { className: "code-string", pattern: /https?:\/\/\S+/y },
-  { className: "code-string", pattern: /\bagw_sk_[A-Za-z0-9_.-]*/y },
+	{ className: 'code-property', pattern: /^[^:]+(?=:)/y },
+	{ className: 'code-string', pattern: /https?:\/\/\S+/y },
+	{ className: 'code-string', pattern: /\bagw_sk_[A-Za-z0-9_.-]*/y }
 ];
 
-function highlightWithRules(
-  line: string,
-  lineIndex: number,
-  rules: CodeRule[],
-) {
-  const nodes: ReactNode[] = [];
-  let position = 0;
-  while (position < line.length) {
-    const match = matchRule(line, position, rules);
-    if (!match) {
-      nodes.push(line[position]);
-      position += 1;
-      continue;
-    }
-    nodes.push(
-      <span className={match.rule.className} key={`${lineIndex}-${position}`}>
-        {match.text}
-      </span>,
-    );
-    position += match.text.length;
-  }
-  return nodes;
+function highlightWithRules(line: string, lineIndex: number, rules: CodeRule[]) {
+	const nodes: ReactNode[] = [];
+	let position = 0;
+	while (position < line.length) {
+		const match = matchRule(line, position, rules);
+		if (!match) {
+			nodes.push(line[position]);
+			position += 1;
+			continue;
+		}
+		nodes.push(
+			<span className={match.rule.className} key={`${lineIndex}-${position}`}>
+				{match.text}
+			</span>
+		);
+		position += match.text.length;
+	}
+	return nodes;
 }
 
 function matchRule(line: string, position: number, rules: CodeRule[]) {
-  for (const rule of rules) {
-    rule.pattern.lastIndex = position;
-    const match = rule.pattern.exec(line);
-    if (match?.index === position && match[0]) {
-      return { rule, text: match[0] };
-    }
-  }
-  return null;
+	for (const rule of rules) {
+		rule.pattern.lastIndex = position;
+		const match = rule.pattern.exec(line);
+		if (match?.index === position && match[0]) {
+			return { rule, text: match[0] };
+		}
+	}
+	return null;
 }

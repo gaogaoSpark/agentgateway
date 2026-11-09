@@ -12,6 +12,7 @@ import (
 	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
+	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -39,11 +40,9 @@ func NewBackendTLSPluginWithTargetBuilders(agw *AgwCollections, targetBuilders m
 	backendTLSTargetIndex := krt.NewIndex(agw.BackendTLSPolicies, "ancestors", func(o *gwv1.BackendTLSPolicy) []utils.TypedNamespacedName {
 		return slices.Map(o.Spec.TargetRefs, func(e gwv1.LocalPolicyTargetReferenceWithSectionName) utils.TypedNamespacedName {
 			return utils.TypedNamespacedName{
-				NamespacedName: types.NamespacedName{
-					Name:      string(e.Name),
-					Namespace: o.Namespace,
-				},
-				Kind: string(e.Kind),
+				Name:      string(e.Name),
+				Namespace: o.Namespace,
+				Kind:      string(e.Kind),
 			}
 		})
 	})
@@ -53,7 +52,7 @@ func NewBackendTLSPluginWithTargetBuilders(agw *AgwCollections, targetBuilders m
 			wellknown.BackendTLSPolicyGVK.GroupKind(): {
 				Build: func(input PolicyPluginInput) (krt.StatusCollection[controllers.Object, any], krt.Collection[AgwPolicy]) {
 					st, o := krt.NewStatusManyCollection(agw.BackendTLSPolicies, func(krtctx krt.HandlerContext, btls *gwv1.BackendTLSPolicy) (*gwv1.PolicyStatus, []AgwPolicy) {
-						return translatePoliciesForBackendTLS(krtctx, agw.ControllerName, input.References, agw.ConfigMaps, agw.Secrets, agw.Services, targetBuilders, backendTLSTarget, agw.Gateways, btls)
+						return translatePoliciesForBackendTLS(krtctx, agw.ControllerName, input.References, agw.ConfigMaps, agw.ClusterTrustBundles, agw.Secrets, agw.Services, targetBuilders, backendTLSTarget, agw.Gateways, btls)
 					}, agw.KrtOpts.ToOptions("policies/BackendTLS")...)
 					return ConvertStatusCollection(st, agw.KrtOpts.ToOptions, "policies/BackendTLS"), o
 				},
@@ -68,6 +67,7 @@ func translatePoliciesForBackendTLS(
 	controllerName string,
 	references ReferenceIndex,
 	cfgmaps krt.Collection[*corev1.ConfigMap],
+	clusterTrustBundles krt.Collection[*certificatesv1.ClusterTrustBundle],
 	secrets krt.Collection[*corev1.Secret],
 	svcs krt.Collection[*corev1.Service],
 	targetBuilders map[schema.GroupKind]BackendTLSTargetBuilder,
@@ -93,7 +93,7 @@ func translatePoliciesForBackendTLS(
 		},
 	}
 
-	caCert, err := getBackendTLSCACert(krtctx, cfgmaps, btls, conds)
+	caCert, err := getBackendTLSCACert(krtctx, cfgmaps, clusterTrustBundles, btls, conds)
 	if err != nil {
 		conds[string(gwv1.PolicyConditionAccepted)].Error = &ConfigError{
 			Reason:  string(gwv1.BackendTLSPolicyReasonNoValidCACertificate),
@@ -120,11 +120,9 @@ func translatePoliciesForBackendTLS(
 		var policyTarget *api.PolicyTarget
 
 		tgtRef := utils.TypedNamespacedName{
-			NamespacedName: types.NamespacedName{
-				Name:      string(target.Name),
-				Namespace: btls.Namespace,
-			},
-			Kind: string(target.Kind),
+			Name:      string(target.Name),
+			Namespace: btls.Namespace,
+			Kind:      string(target.Kind),
 		}
 
 		gatewayTargets := references.LookupGatewaysForBackend(krtctx, tgtRef).UnsortedList()
@@ -202,9 +200,10 @@ func translatePoliciesForBackendTLS(
 			}
 
 			policy := &api.Policy{
-				Key:    btls.Namespace + "/" + btls.Name + backendTlsPolicySuffix + attachmentName(policyTarget),
-				Name:   TypedResourceName(wellknown.BackendTLSPolicyKind, btls),
-				Target: policyTarget,
+				Key:               btls.Namespace + "/" + btls.Name + backendTlsPolicySuffix + attachmentName(policyTarget),
+				Name:              TypedResourceName(wellknown.BackendTLSPolicyKind, btls),
+				Target:            policyTarget,
+				CreationTimestamp: max(btls.CreationTimestamp.Unix(), 0),
 				Kind: &api.Policy_Backend{
 					Backend: &api.BackendPolicySpec{
 						Kind: &api.BackendPolicySpec_BackendTls{
@@ -245,6 +244,7 @@ func checkConflicted(
 	target gwv1.LocalPolicyTargetReferenceWithSectionName,
 	allMatches []*gwv1.BackendTLSPolicy,
 ) error {
+	var winner *gwv1.BackendTLSPolicy
 	for _, m := range allMatches {
 		if m.UID == btls.UID {
 			// This is ourself, skip it
@@ -256,10 +256,13 @@ func checkConflicted(
 		if conflict == nil {
 			continue
 		}
-		// If the one we match with is higher priority, we are conflicted
-		if policyselection.HasHigherPriority(m, btls) {
-			return fmt.Errorf("policy %v matches the same target but with higher priority", m.Name)
+		// If the one we match with is higher priority, we are conflicted. Report the highest priority one.
+		if policyselection.HasHigherPriority(m, btls) && (winner == nil || policyselection.HasHigherPriority(m, winner)) {
+			winner = m
 		}
+	}
+	if winner != nil {
+		return fmt.Errorf("policy %v matches the same target but with higher priority", winner.Name)
 	}
 	return nil
 }
@@ -351,6 +354,7 @@ func applyGatewayBackendClientCert(
 func getBackendTLSCACert(
 	krtctx krt.HandlerContext,
 	cfgmaps krt.Collection[*corev1.ConfigMap],
+	clusterTrustBundles krt.Collection[*certificatesv1.ClusterTrustBundle],
 	btls *gwv1.BackendTLSPolicy,
 	conds map[string]*Condition,
 ) ([]byte, error) {
@@ -377,32 +381,53 @@ func getBackendTLSCACert(
 
 	var sb strings.Builder
 	for _, ref := range validation.CACertificateRefs {
-		if ref.Group != gwv1.Group(wellknown.ConfigMapGVK.Group) || ref.Kind != gwv1.Kind(wellknown.ConfigMapGVK.Kind) {
+		var caCert string
+		switch (schema.GroupKind{Group: string(ref.Group), Kind: string(ref.Kind)}) {
+		case wellknown.ConfigMapGVK.GroupKind():
+			nn := types.NamespacedName{
+				Name:      string(ref.Name),
+				Namespace: btls.Namespace,
+			}
+			cfgmap := krt.FetchOne(krtctx, cfgmaps, krt.FilterObjectName(nn))
+			if cfgmap == nil {
+				conds[string(gwv1.BackendTLSPolicyReasonResolvedRefs)].Error = &ConfigError{
+					Reason:  string(gwv1.BackendTLSPolicyReasonInvalidCACertificateRef),
+					Message: "Certificate reference not found",
+				}
+				return nil, fmt.Errorf("certificate reference not found: %v", ref)
+			}
+			var err error
+			caCert, err = GetCACertFromConfigMap(ptr.Flatten(cfgmap))
+			if err != nil {
+				conds[string(gwv1.BackendTLSPolicyReasonResolvedRefs)].Error = &ConfigError{
+					Reason:  string(gwv1.BackendTLSPolicyReasonInvalidCACertificateRef),
+					Message: "Certificate invalid: " + err.Error(),
+				}
+				return nil, fmt.Errorf("certificate invalid: %v", err)
+			}
+		case wellknown.ClusterTrustBundleGVK.GroupKind():
+			if clusterTrustBundles == nil {
+				conds[string(gwv1.BackendTLSPolicyReasonResolvedRefs)].Error = &ConfigError{
+					Reason:  string(gwv1.BackendTLSPolicyReasonInvalidKind),
+					Message: "the cluster does not serve the ClusterTrustBundle API",
+				}
+				return nil, fmt.Errorf("invalid certificate reference: %v", ref)
+			}
+			bundle := ptr.Flatten(krt.FetchOne(krtctx, clusterTrustBundles, krt.FilterKey(string(ref.Name))))
+			if bundle == nil {
+				conds[string(gwv1.BackendTLSPolicyReasonResolvedRefs)].Error = &ConfigError{
+					Reason:  string(gwv1.BackendTLSPolicyReasonInvalidCACertificateRef),
+					Message: "Certificate reference not found",
+				}
+				return nil, fmt.Errorf("certificate reference not found: %v", ref)
+			}
+			caCert = bundle.Spec.TrustBundle
+		default:
 			conds[string(gwv1.BackendTLSPolicyReasonResolvedRefs)].Error = &ConfigError{
 				Reason:  string(gwv1.BackendTLSPolicyReasonInvalidKind),
 				Message: "Certificate reference invalid: " + string(ref.Kind),
 			}
 			return nil, fmt.Errorf("invalid certificate reference: %v", ref)
-		}
-		nn := types.NamespacedName{
-			Name:      string(ref.Name),
-			Namespace: btls.Namespace,
-		}
-		cfgmap := krt.FetchOne(krtctx, cfgmaps, krt.FilterObjectName(nn))
-		if cfgmap == nil {
-			conds[string(gwv1.BackendTLSPolicyReasonResolvedRefs)].Error = &ConfigError{
-				Reason:  string(gwv1.BackendTLSPolicyReasonInvalidCACertificateRef),
-				Message: "Certificate reference not found",
-			}
-			return nil, fmt.Errorf("certificate reference not found: %v", ref)
-		}
-		caCert, err := GetCACertFromConfigMap(ptr.Flatten(cfgmap))
-		if err != nil {
-			conds[string(gwv1.BackendTLSPolicyReasonResolvedRefs)].Error = &ConfigError{
-				Reason:  string(gwv1.BackendTLSPolicyReasonInvalidCACertificateRef),
-				Message: "Certificate invalid: " + err.Error(),
-			}
-			return nil, fmt.Errorf("certificate invalid: %v", err)
 		}
 		if sb.Len() > 0 {
 			sb.WriteString("\n")

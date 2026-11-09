@@ -1,13 +1,20 @@
 // Originally derived from https://github.com/istio/ztunnel (Apache 2.0 licensed)
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use agentgateway::ConfigSource;
 use clap::{Args as ClapArgs, Parser, Subcommand};
+use include_dir::Dir;
 use pprof_alloc::Allocator;
 
 mod commands;
+
+// Keep embedded asset changes scoped to relinking the binary crate.
+#[cfg(ui_assets)]
+static UI_ASSETS: Dir<'static> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist");
+#[cfg(not(ui_assets))]
+static UI_ASSETS: Dir<'static> = Dir::new("", &[]);
 
 cfg_select! {
 	all(target_os = "linux", target_env = "musl", target_arch = "aarch64") => {
@@ -132,6 +139,12 @@ struct Cli {
 }
 
 pub fn run() -> anyhow::Result<()> {
+	// Disable transparent huge pages process-wide. Allocator settings only cover their own mappings;
+	// other mappings (such as thread stacks) can otherwise be backed by 2MB pages and inflate RSS.
+	#[cfg(target_os = "linux")]
+	unsafe {
+		libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
+	}
 	cfg_select! {
 		all(target_os = "linux", target_env = "musl", target_arch = "aarch64") => {
 			pprof_alloc::configure_with_default(Allocator::Mimalloc)?;
@@ -143,6 +156,9 @@ pub fn run() -> anyhow::Result<()> {
 			pprof_alloc::configure_with_default(Allocator::System)?;
 		}
 	}
+	// Install the process-global crypto providers for the compiled-in backend
+	// (currently the JWT provider) before any cryptographic work.
+	agentgateway::crypto::init();
 	let args = Cli::parse();
 	match args.command {
 		#[cfg(target_os = "linux")]
@@ -217,10 +233,45 @@ fn default_config_dir() -> anyhow::Result<PathBuf> {
 			config_dir.display()
 		);
 	}
-	let home = std::env::var_os("HOME")
+	let config_home = std::env::var_os("XDG_CONFIG_HOME")
+		.filter(|path| !path.is_empty())
 		.map(PathBuf::from)
-		.ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --config or --file"))?;
-	Ok(home.join(".config").join("agentgateway"))
+		.or_else(|| home_dir().map(|home| home.join(".config")))
+		.ok_or_else(|| {
+			anyhow::anyhow!(
+				"could not determine the user's home directory ({} is not set); pass --config or --file",
+				home_var_name()
+			)
+		})?;
+	Ok(config_home.join("agentgateway"))
+}
+
+/// Name of the environment variable holding the user's home directory on this platform.
+fn home_var_name() -> &'static str {
+	if cfg!(windows) { "USERPROFILE" } else { "HOME" }
+}
+
+/// The user's home directory, without its `.config` suffix.
+///
+/// Windows sets `USERPROFILE` rather than `HOME`, which is what left Windows users unable to
+/// find their config file (#4219).
+fn home_dir() -> Option<PathBuf> {
+	home_dir_in(|name| std::env::var_os(name))
+}
+
+/// The platform decision table behind [`home_dir`], split out so tests can drive the variable
+/// selection without touching the process environment. The platform branch comes from
+/// `cfg!`, so each build exercises its own platform.
+fn home_dir_in(lookup: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+	let var = |name: &str| {
+		lookup(name)
+			.filter(|value| !value.is_empty())
+			.map(PathBuf::from)
+	};
+	if cfg!(windows) {
+		return var("USERPROFILE").or_else(|| Some(var("HOMEDRIVE")?.join(var("HOMEPATH")?)));
+	}
+	var("HOME")
 }
 
 fn running_in_official_container() -> bool {
@@ -245,7 +296,7 @@ fn default_config_contents(dir: &std::path::Path) -> anyhow::Result<String> {
 	let db = dir.join("data.db");
 	let config =
 		agentgateway::types::local::default_standalone_config(&format!("sqlite://{}", db.display()));
-	let yaml = agentgateway::yamlviajson::to_string(&config)?;
+	let yaml = agentgateway::yaml::to_string(&config)?;
 	Ok(format!(
 		"# yaml-language-server: $schema=https://agentgateway.dev/schema/config\n{yaml}"
 	))
@@ -273,4 +324,98 @@ fn is_read_once_path(path: &std::path::Path) -> bool {
 	path == std::path::Path::new("/dev/stdin")
 		|| path.starts_with("/dev/fd")
 		|| path.starts_with("/proc/self/fd")
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+	use std::ffi::OsString;
+	use std::path::PathBuf;
+
+	use super::home_dir_in;
+
+	/// Builds a lookup over a fixed set of variables, so the tests never touch the process
+	/// environment.
+	fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+		let vars: HashMap<String, String> = vars
+			.iter()
+			.map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+			.collect();
+		move |name| vars.get(name).map(OsString::from)
+	}
+
+	// The platform branch is `cfg!`-selected inside home_dir_in, so each build tests its own
+	// platform -- the same thing CI's per-OS runners would do anyway.
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_prefers_userprofile() {
+		let vars = [("USERPROFILE", "users/u"), ("HOME", "home/u")];
+		assert_eq!(home_dir_in(env(&vars)), Some(PathBuf::from("users/u")));
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_falls_back_to_homedrive_and_homepath() {
+		let vars = [("HOMEDRIVE", "drive"), ("HOMEPATH", "users/u")];
+		assert_eq!(
+			home_dir_in(env(&vars)),
+			Some(PathBuf::from("drive").join("users/u"))
+		);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_needs_both_homedrive_and_homepath() {
+		assert_eq!(home_dir_in(env(&[("HOMEDRIVE", "drive")])), None);
+		assert_eq!(home_dir_in(env(&[("HOMEPATH", "users/u")])), None);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_returns_none_when_nothing_is_set() {
+		assert_eq!(home_dir_in(env(&[])), None);
+	}
+
+	#[cfg(not(windows))]
+	#[test]
+	fn unix_uses_home() {
+		assert_eq!(
+			home_dir_in(env(&[("HOME", "home/u")])),
+			Some(PathBuf::from("home/u"))
+		);
+	}
+
+	#[cfg(not(windows))]
+	#[test]
+	fn unix_ignores_windows_variables() {
+		let vars = [
+			("USERPROFILE", "users/u"),
+			("HOMEDRIVE", "drive"),
+			("HOMEPATH", "users/u"),
+		];
+		assert_eq!(home_dir_in(env(&vars)), None);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn empty_variables_fall_through_to_the_legacy_pair() {
+		// An empty USERPROFILE falls through to the legacy pair rather than resolving to the
+		// current directory.
+		let vars = [
+			("USERPROFILE", ""),
+			("HOMEDRIVE", "drive"),
+			("HOMEPATH", "users/u"),
+		];
+		assert_eq!(
+			home_dir_in(env(&vars)),
+			Some(PathBuf::from("drive").join("users/u"))
+		);
+	}
+
+	#[cfg(not(windows))]
+	#[test]
+	fn empty_home_is_skipped() {
+		assert_eq!(home_dir_in(env(&[("HOME", "")])), None);
+	}
 }

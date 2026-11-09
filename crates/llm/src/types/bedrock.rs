@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Copy, Clone, Deserialize, Serialize, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +56,11 @@ pub enum ReasoningContentBlock {
 	Structured {
 		#[serde(rename = "reasoningText")]
 		reasoning_text: ReasoningText,
+	},
+	// Encrypted reasoning: { "redactedContent": "<base64>" }.
+	Redacted {
+		#[serde(rename = "redactedContent")]
+		redacted_content: String,
 	},
 	// Legacy/simple format: { "text": "..." }
 	Simple {
@@ -141,11 +145,8 @@ pub struct InferenceConfiguration {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub temperature: Option<f32>,
 	/// Use nucleus sampling.
-	#[serde(skip_serializing_if = "Option::is_none")]
+	#[serde(rename = "topP", skip_serializing_if = "Option::is_none")]
 	pub top_p: Option<f32>,
-	/// Only sample from the top K options for each subsequent token (if supported by model).
-	#[serde(rename = "topK", skip_serializing_if = "Option::is_none")]
-	pub top_k: Option<usize>,
 	/// The stop sequences to use.
 	#[serde(rename = "stopSequences", skip_serializing_if = "Vec::is_empty")]
 	pub stop_sequences: Vec<String>,
@@ -153,8 +154,8 @@ pub struct InferenceConfiguration {
 
 #[derive(Clone, Serialize, Debug)]
 pub struct ConverseRequest {
-	/// Specifies the model or throughput with which to run inference.
-	#[serde(rename = "modelId")]
+	/// Specifies the model or throughput used in the Converse request URI.
+	#[serde(skip_serializing)]
 	pub model_id: String,
 	/// The messages that you want to send to the model.
 	pub messages: Vec<Message>,
@@ -194,6 +195,23 @@ pub struct ConverseRequest {
 	/// Performance configuration.
 	#[serde(rename = "performanceConfig", skip_serializing_if = "Option::is_none")]
 	pub performance_config: Option<PerformanceConfiguration>,
+	/// Processing tier used to serve the request.
+	#[serde(rename = "serviceTier", skip_serializing_if = "Option::is_none")]
+	pub service_tier: Option<ServiceTier>,
+}
+
+#[derive(Clone, Copy, Serialize, Debug, PartialEq, Eq)]
+pub struct ServiceTier {
+	#[serde(rename = "type")]
+	pub tier_type: ServiceTierType,
+}
+
+#[derive(Clone, Copy, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTierType {
+	Priority,
+	Default,
+	Flex,
 }
 
 #[derive(Clone, Serialize, Debug, PartialEq)]
@@ -255,6 +273,7 @@ pub struct InvokeModelBody {
 }
 
 #[derive(Clone, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolConfiguration {
 	/// An array of tools that you want to pass to a model.
 	pub tools: Vec<Tool>,
@@ -275,6 +294,8 @@ pub enum Tool {
 #[derive(Clone, std::fmt::Debug, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CachePointBlock {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ttl: Option<String>,
 	/// Specifies the type of cache point within the CachePointBlock.
 	pub r#type: CachePointType,
 }
@@ -360,7 +381,7 @@ pub enum ConverseOutput {
 }
 
 /// Token usage information
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenUsage {
 	/// The number of input tokens which were used
 	#[serde(rename = "inputTokens")]
@@ -383,6 +404,32 @@ pub struct TokenUsage {
 		skip_serializing_if = "Option::is_none"
 	)]
 	pub cache_write_input_tokens: Option<usize>,
+	/// Cache write tokens split by TTL
+	#[serde(
+		rename = "cacheDetails",
+		default,
+		skip_serializing_if = "Vec::is_empty"
+	)]
+	pub cache_details: Vec<CacheDetail>,
+}
+
+impl TokenUsage {
+	/// Cache write tokens with the given TTL ("5m" or "1h"), if Bedrock reported a split.
+	pub fn cache_write_input_tokens_for(&self, ttl: &str) -> Option<usize> {
+		self
+			.cache_details
+			.iter()
+			.filter(|d| d.ttl == ttl)
+			.map(|d| d.input_tokens)
+			.reduce(|a, b| a + b)
+	}
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CacheDetail {
+	#[serde(rename = "inputTokens")]
+	pub input_tokens: usize,
+	pub ttl: String,
 }
 
 /// Metrics for the Converse call
@@ -418,9 +465,9 @@ pub enum StopReason {
 #[serde(rename_all = "camelCase")]
 pub enum ToolChoice {
 	/// The model must request at least one tool (no text is generated).
-	Any,
+	Any {},
 	/// (Default). The Model automatically decides if a tool should be called or whether to generate text instead.
-	Auto,
+	Auto {},
 	/// The Model must request the specified tool. Only supported by Anthropic Claude 3 models.
 	Tool { name: String },
 	/// The `Unknown` variant represents cases where new union variant was received. Consider upgrading the SDK to the latest available version.
@@ -593,10 +640,19 @@ pub struct ToolUseBlockDelta {
 	pub input: String,
 }
 
+fn deserialize_base64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+	use base64::Engine;
+	let s = String::deserialize(deserializer)?;
+	base64::prelude::BASE64_STANDARD
+		.decode(s)
+		.map_err(serde::de::Error::custom)
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub enum ReasoningContentBlockDelta {
-	#[serde(rename = "redactedContent")]
-	RedactedContent(#[allow(unused)] Bytes),
+	// Bedrock blobs are base64 encoded; fragments must be decoded before they can be joined.
+	#[serde(rename = "redactedContent", deserialize_with = "deserialize_base64")]
+	RedactedContent(Vec<u8>),
 	#[serde(rename = "signature")]
 	Signature(#[allow(unused)] String),
 	#[serde(rename = "text")]
@@ -665,13 +721,63 @@ pub struct CohereEmbeddingRequest {
 	pub input_type: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub truncate: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_dimension: Option<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct CohereEmbeddingResponse {
-	pub embeddings: Vec<Vec<f32>>,
+	pub embeddings: CohereEmbeddings,
 	pub id: String,
 	pub texts: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+pub enum CohereEmbeddings {
+	ByIndex(Vec<Vec<f32>>),
+	ByType(HashMap<String, Vec<Vec<f32>>>),
+}
+
+// ---- Amazon Nova Multimodal Embeddings (amazon.nova-*-multimodal-embeddings-*) ----
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NovaEmbeddingTaskType {
+	SingleEmbedding,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct NovaEmbeddingRequest {
+	pub task_type: NovaEmbeddingTaskType,
+	pub single_embedding_params: NovaSingleEmbeddingParams,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct NovaSingleEmbeddingParams {
+	pub embedding_purpose: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub embedding_dimension: Option<u32>,
+	pub text: NovaEmbeddingText,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct NovaEmbeddingText {
+	pub truncation_mode: String,
+	pub value: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct NovaEmbeddingResponse {
+	pub embeddings: Vec<NovaEmbeddingResult>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct NovaEmbeddingResult {
+	pub embedding: Vec<f32>,
 }
 
 // ---- Bedrock Rerank (bedrock-agent-runtime Rerank API) ----

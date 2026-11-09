@@ -25,18 +25,19 @@ use std::task::{Context, Poll};
 
 use ::http::HeaderMap;
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use http_body::Frame;
 use pin_project_lite::pin_project;
 use tokio_sse_codec::{Event, Frame as SseFrame, SseDecoder};
 use tokio_util::codec::Decoder;
 use tracing::warn;
 
-use super::{
-	FailureMode, ResponseGuard, ResponseGuardKind, StreamingEvaluator, StreamingGuardrailOutcome,
-};
+use super::{FailureMode, ResponseGuard, StreamingEvaluator, StreamingGuardrailOutcome};
 use crate::cel::RequestSnapshot;
-use crate::llm::policy::PromptGuard;
+use crate::llm::policy::{Policy, PromptGuard};
 use crate::proxy::httpproxy::PolicyClient;
+use crate::telemetry::log::GuardrailLog;
+use crate::telemetry::metrics::{GuardrailAction, GuardrailPhase};
 
 /// Text bytes accumulated before triggering a guardrail evaluation.
 /// Larger values reduce guardrail API calls but increase time-to-first-byte
@@ -85,6 +86,19 @@ pub async fn evaluate_window(
 	None
 }
 
+/// Evaluate windows until one blocks
+async fn evaluate_windows(
+	mut evaluators: Vec<Box<dyn StreamingEvaluator>>,
+	windows: Vec<String>,
+) -> (Vec<Box<dyn StreamingEvaluator>>, Option<Bytes>) {
+	for window in windows {
+		if let Some(blocked) = evaluate_window(&mut evaluators, &window).await {
+			return (evaluators, Some(blocked));
+		}
+	}
+	(evaluators, None)
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -95,12 +109,15 @@ pub fn make_evaluator(
 	client: PolicyClient,
 	http_headers: HeaderMap,
 	original: Option<Arc<RequestSnapshot>>,
+	guardrail_log: GuardrailLog,
 ) -> Box<dyn StreamingEvaluator> {
 	Box::new(ResponseGuardEvaluator {
 		guard: guard.clone(),
 		client,
 		http_headers,
 		original,
+		guardrail_log,
+		worst_action: GuardrailAction::Allow,
 	})
 }
 
@@ -109,26 +126,69 @@ struct ResponseGuardEvaluator {
 	client: PolicyClient,
 	http_headers: HeaderMap,
 	original: Option<Arc<RequestSnapshot>>,
+	guardrail_log: GuardrailLog,
+	// Fold window results into one metric for the stream.
+	worst_action: GuardrailAction,
 }
 
-#[async_trait::async_trait]
+impl ResponseGuardEvaluator {
+	fn observe_action(&mut self, action: GuardrailAction) {
+		self.worst_action = self.worst_action.max(action);
+	}
+}
+
+impl Drop for ResponseGuardEvaluator {
+	fn drop(&mut self) {
+		Policy::record_guardrail_trip(&self.client, GuardrailPhase::Response, self.worst_action);
+	}
+}
+
 impl StreamingEvaluator for ResponseGuardEvaluator {
 	fn failure_mode(&self) -> FailureMode {
-		match &self.guard.kind {
-			ResponseGuardKind::Webhook(wh) => wh.failure_mode,
-			_ => FailureMode::FailOpen,
-		}
+		self.guard.failure_mode()
 	}
 
-	async fn evaluate(&mut self, window: &str) -> anyhow::Result<Option<StreamingGuardrailOutcome>> {
-		PromptGuard::evaluate_streaming_response_window(
-			&self.guard,
-			window,
-			&self.client,
-			&self.http_headers,
-			self.original.as_deref(),
-		)
-		.await
+	fn evaluate<'a>(
+		&'a mut self,
+		window: &'a str,
+	) -> BoxFuture<'a, anyhow::Result<Option<StreamingGuardrailOutcome>>> {
+		Box::pin(async move {
+			// Realtime reuses one evaluator for every response on a connection, so each window is
+			// folded into the log as the most severe action per guard.
+			let window_log = GuardrailLog::default();
+			let result = match PromptGuard::evaluate_streaming_response_window(
+				&self.guard,
+				window,
+				&self.client,
+				&self.http_headers,
+				self.original.as_deref(),
+				Some(&window_log),
+			)
+			.await
+			{
+				Ok((outcome, action)) => {
+					self.observe_action(action);
+					Ok(outcome)
+				},
+				Err(e) => {
+					let action = match self.failure_mode() {
+						FailureMode::FailClosed => GuardrailAction::Reject,
+						FailureMode::FailOpen => GuardrailAction::FailOpen,
+					};
+					super::record_guardrail(
+						Some(&window_log),
+						GuardrailPhase::Response,
+						self.guard.kind.name(),
+						action,
+						None,
+					);
+					self.observe_action(action);
+					Err(e)
+				},
+			};
+			super::merge_most_severe_guardrails(&self.guardrail_log, window_log);
+			result
+		})
 	}
 }
 
@@ -169,18 +229,55 @@ enum GuardedBodyState {
 	Done,
 }
 
+#[derive(Default)]
+struct ResponseDelta {
+	text: String,
+	reasoning: String,
+}
+
+impl ResponseDelta {
+	fn len(&self) -> usize {
+		self.text.len() + self.reasoning.len()
+	}
+
+	fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
+
+	fn append(&mut self, delta: Self) {
+		self.text.push_str(&delta.text);
+		self.reasoning.push_str(&delta.reasoning);
+	}
+
+	fn take_windows(&mut self, overlap: &mut Self) -> Vec<String> {
+		let mut windows = Vec::new();
+		for (pending, tail) in [
+			(&mut self.reasoning, &mut overlap.reasoning),
+			(&mut self.text, &mut overlap.text),
+		] {
+			if pending.is_empty() {
+				continue;
+			}
+			let window = format!("{tail}{}", std::mem::take(pending));
+			*tail = tail_chars(&window, OVERLAP_BYTES).to_string();
+			windows.push(window);
+		}
+		windows
+	}
+}
+
 pin_project! {
 	// An `http_body::Body` wrapper that implements windowed guardrail evaluation.
 	pub struct GuardedSseBody {
 		#[pin]
-		inner: crate::http::Body,
+		inner: agent_http::RawBody,
 		evaluators: Vec<Box<dyn StreamingEvaluator>>,
 		eval_threshold: usize,
 		buffer_limit: usize,
 		held_frames: Vec<Bytes>,
 		held_bytes: usize,
-		pending_text: String,
-		overlap_tail: String,
+		pending_text: ResponseDelta,
+		overlap_tail: ResponseDelta,
 		sse_decoder: SseDecoder<Bytes>,
 		decode_buffer: bytes::BytesMut,
 		state: GuardedBodyState,
@@ -200,11 +297,11 @@ impl GuardedSseBody {
 	// We do actually return Self; just wrapped in an http_body::Body. The annotation silences a false positive from clippy about that.
 	#[allow(clippy::new_ret_no_self)]
 	pub fn new(
-		inner: crate::http::Body,
+		inner: agent_http::RawBody,
 		evaluators: Vec<Box<dyn StreamingEvaluator>>,
 		buffer_limit: usize,
 		logger: Option<crate::llm::AmendOnDrop>,
-	) -> crate::http::Body {
+	) -> agent_http::RawBody {
 		Self::with_threshold(
 			inner,
 			evaluators,
@@ -216,21 +313,21 @@ impl GuardedSseBody {
 
 	/// Like [`GuardedSseBody::new`] but with an explicit evaluation threshold.
 	pub fn with_threshold(
-		inner: crate::http::Body,
+		inner: agent_http::RawBody,
 		evaluators: Vec<Box<dyn StreamingEvaluator>>,
 		buffer_limit: usize,
 		logger: Option<crate::llm::AmendOnDrop>,
 		eval_threshold: usize,
-	) -> crate::http::Body {
-		crate::http::Body::new(Self {
+	) -> agent_http::RawBody {
+		agent_http::RawBody::new(Self {
 			inner,
 			evaluators,
 			eval_threshold,
 			buffer_limit,
 			held_frames: Vec::new(),
 			held_bytes: 0,
-			pending_text: String::new(),
-			overlap_tail: String::new(),
+			pending_text: ResponseDelta::default(),
+			overlap_tail: ResponseDelta::default(),
 			sse_decoder: SseDecoder::with_max_size(buffer_limit),
 			decode_buffer: bytes::BytesMut::new(),
 			state: GuardedBodyState::Buffering,
@@ -238,39 +335,79 @@ impl GuardedSseBody {
 		})
 	}
 
-	/// Extract text delta from a parsed SSE frame if present.
-	fn extract_text_delta(frame: SseFrame<Bytes>) -> Option<String> {
+	/// Extract text and reasoning deltas from a parsed SSE frame if present.
+	fn extract_text_delta(frame: SseFrame<Bytes>) -> Option<ResponseDelta> {
 		let SseFrame::Event(Event { data, .. }) = frame else {
 			return None;
 		};
 		if data.as_ref() == b"[DONE]" {
 			return None;
 		}
-		if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data) {
-			// OpenAI responses: response.output_text.delta
-			if v.get("type").and_then(|t| t.as_str()) == Some("response.output_text.delta")
-				&& let Some(text) = v.get("delta").and_then(|s| s.as_str())
-			{
-				return Some(text.to_string());
+		let v = serde_json::from_slice::<serde_json::Value>(&data).ok()?;
+		let str_at = |v: &serde_json::Value, key: &str| v.get(key)?.as_str().map(str::to_string);
+		let mut out = ResponseDelta::default();
+		// OpenAI Responses
+		match v.get("type").and_then(|t| t.as_str()) {
+			Some("response.output_text.delta") => {
+				out.text = str_at(&v, "delta")?;
+				return Some(out);
+			},
+			Some("response.reasoning_text.delta" | "response.reasoning_summary_text.delta") => {
+				out.reasoning = str_at(&v, "delta")?;
+				return Some(out);
+			},
+			_ => {},
+		}
+		// OpenAI completions.
+		if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+			for delta in choices.iter().filter_map(|c| c.get("delta")) {
+				out.text.extend(str_at(delta, "content"));
+				out.reasoning.extend(str_at(delta, "reasoning"));
+				out.reasoning.extend(str_at(delta, "reasoning_content"));
+				for detail in delta
+					.get("reasoning_details")
+					.and_then(|d| d.as_array())
+					.into_iter()
+					.flatten()
+				{
+					let field = match detail.get("type").and_then(|t| t.as_str()) {
+						Some("reasoning.text") => "text",
+						Some("reasoning.summary") => "summary",
+						_ => continue,
+					};
+					out.reasoning.extend(str_at(detail, field));
+				}
 			}
-			// OpenAI completions: choices[0].delta.content
-			if let Some(text) = v
-				.get("choices")
-				.and_then(|c| c.get(0))
-				.and_then(|c| c.get("delta"))
-				.and_then(|d| d.get("content"))
-				.and_then(|s| s.as_str())
-			{
-				return Some(text.to_string());
+			return Some(out);
+		}
+		// Anthropic messages
+		if let Some(delta) = v.get("delta").or_else(|| v.get("content_block")) {
+			if let Some(text) = str_at(delta, "text") {
+				out.text = text;
+				return Some(out);
 			}
-			// Anthropic messages: delta.text
-			if let Some(text) = v
-				.get("delta")
-				.and_then(|d| d.get("text"))
-				.and_then(|s| s.as_str())
-			{
-				return Some(text.to_string());
+			if let Some(thinking) = str_at(delta, "thinking") {
+				out.reasoning = thinking;
+				return Some(out);
 			}
+		}
+		// Gemini
+		if let Some(candidates) = v.get("candidates").and_then(|c| c.as_array()) {
+			for part in candidates
+				.iter()
+				.filter_map(|c| c.get("content")?.get("parts")?.as_array())
+				.flatten()
+			{
+				let Some(text) = part.get("text").and_then(|t| t.as_str()) else {
+					continue;
+				};
+				if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+					out.reasoning.push_str(text);
+				} else {
+					out.text.push_str(text);
+				}
+			}
+			return Some(out);
 		}
 		None
 	}
@@ -354,7 +491,7 @@ impl http_body::Body for GuardedSseBody {
 								match this.sse_decoder.decode(this.decode_buffer) {
 									Ok(Some(sse_frame)) => {
 										if let Some(delta) = GuardedSseBody::extract_text_delta(sse_frame) {
-											this.pending_text.push_str(&delta);
+											this.pending_text.append(delta);
 										}
 									},
 									Ok(None) => break,
@@ -380,14 +517,9 @@ impl http_body::Body for GuardedSseBody {
 									*this.state = GuardedBodyState::Flushing { queue, eof: false };
 									continue;
 								}
-								let batch = std::mem::take(this.pending_text);
-								let window = format!("{}{}", this.overlap_tail, batch);
-								*this.overlap_tail = tail_chars(&window, OVERLAP_BYTES).to_string();
-								let mut evaluators = std::mem::take(this.evaluators);
-								let fut: EvalFuture = Box::pin(async move {
-									let blocked_body = evaluate_window(&mut evaluators, &window).await;
-									(evaluators, blocked_body)
-								});
+								let windows = this.pending_text.take_windows(this.overlap_tail);
+								let evaluators = std::mem::take(this.evaluators);
+								let fut: EvalFuture = Box::pin(evaluate_windows(evaluators, windows));
 								*this.state = GuardedBodyState::Evaluating { fut, eof: false };
 							}
 						},
@@ -396,7 +528,7 @@ impl http_body::Body for GuardedSseBody {
 								match this.sse_decoder.decode_eof(this.decode_buffer) {
 									Ok(Some(sse_frame)) => {
 										if let Some(delta) = GuardedSseBody::extract_text_delta(sse_frame) {
-											this.pending_text.push_str(&delta);
+											this.pending_text.append(delta);
 										}
 									},
 									Ok(None) => break,
@@ -415,14 +547,9 @@ impl http_body::Body for GuardedSseBody {
 								continue;
 							}
 
-							let batch = std::mem::take(this.pending_text);
-							let window = format!("{}{}", this.overlap_tail, batch);
-							this.overlap_tail.clear();
-							let mut evaluators = std::mem::take(this.evaluators);
-							let fut: EvalFuture = Box::pin(async move {
-								let blocked_body = evaluate_window(&mut evaluators, &window).await;
-								(evaluators, blocked_body)
-							});
+							let windows = this.pending_text.take_windows(this.overlap_tail);
+							let evaluators = std::mem::take(this.evaluators);
+							let fut: EvalFuture = Box::pin(evaluate_windows(evaluators, windows));
 							*this.state = GuardedBodyState::Evaluating { fut, eof: true };
 						},
 					}
@@ -440,27 +567,27 @@ mod tests {
 
 	struct PassEvaluator;
 
-	#[async_trait::async_trait]
 	impl StreamingEvaluator for PassEvaluator {
-		async fn evaluate(
-			&mut self,
-			_window: &str,
-		) -> anyhow::Result<Option<StreamingGuardrailOutcome>> {
-			Ok(None)
+		fn evaluate<'a>(
+			&'a mut self,
+			_window: &'a str,
+		) -> BoxFuture<'a, anyhow::Result<Option<StreamingGuardrailOutcome>>> {
+			Box::pin(async move { Ok(None) })
 		}
 	}
 
 	struct BlockEvaluator;
 
-	#[async_trait::async_trait]
 	impl StreamingEvaluator for BlockEvaluator {
-		async fn evaluate(
-			&mut self,
-			_window: &str,
-		) -> anyhow::Result<Option<StreamingGuardrailOutcome>> {
-			Ok(Some(StreamingGuardrailOutcome::Blocked(
-				Bytes::from_static(b"blocked"),
-			)))
+		fn evaluate<'a>(
+			&'a mut self,
+			_window: &'a str,
+		) -> BoxFuture<'a, anyhow::Result<Option<StreamingGuardrailOutcome>>> {
+			Box::pin(async move {
+				Ok(Some(StreamingGuardrailOutcome::Blocked(
+					Bytes::from_static(b"blocked"),
+				)))
+			})
 		}
 	}
 
@@ -468,18 +595,19 @@ mod tests {
 		pattern: regex::Regex,
 	}
 
-	#[async_trait::async_trait]
 	impl StreamingEvaluator for PatternEvaluator {
-		async fn evaluate(
-			&mut self,
-			window: &str,
-		) -> anyhow::Result<Option<StreamingGuardrailOutcome>> {
-			if self.pattern.is_match(window) {
-				return Ok(Some(StreamingGuardrailOutcome::Blocked(
-					Bytes::from_static(b"blocked"),
-				)));
-			}
-			Ok(None)
+		fn evaluate<'a>(
+			&'a mut self,
+			window: &'a str,
+		) -> BoxFuture<'a, anyhow::Result<Option<StreamingGuardrailOutcome>>> {
+			Box::pin(async move {
+				if self.pattern.is_match(window) {
+					return Ok(Some(StreamingGuardrailOutcome::Blocked(
+						Bytes::from_static(b"blocked"),
+					)));
+				}
+				Ok(None)
+			})
 		}
 	}
 
@@ -487,17 +615,16 @@ mod tests {
 		mode: crate::llm::policy::FailureMode,
 	}
 
-	#[async_trait::async_trait]
 	impl StreamingEvaluator for ErrorEvaluator {
 		fn failure_mode(&self) -> crate::llm::policy::FailureMode {
 			self.mode
 		}
 
-		async fn evaluate(
-			&mut self,
-			_window: &str,
-		) -> anyhow::Result<Option<StreamingGuardrailOutcome>> {
-			Err(anyhow::anyhow!("simulated evaluator error"))
+		fn evaluate<'a>(
+			&'a mut self,
+			_window: &'a str,
+		) -> BoxFuture<'a, anyhow::Result<Option<StreamingGuardrailOutcome>>> {
+			Box::pin(async move { Err(anyhow::anyhow!("simulated evaluator error")) })
 		}
 	}
 
@@ -512,12 +639,12 @@ mod tests {
 		))
 	}
 
-	fn make_body(chunks: Vec<Bytes>) -> crate::http::Body {
+	fn make_body(chunks: Vec<Bytes>) -> agent_http::RawBody {
 		use std::convert::Infallible;
 
 		use futures_util::stream;
 		let stream = stream::iter(chunks.into_iter().map(Ok::<Bytes, Infallible>));
-		crate::http::Body::from_stream(stream)
+		agent_http::RawBody::from_stream(stream)
 	}
 
 	fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -571,6 +698,225 @@ mod tests {
 		let bytes = guarded.collect().await.unwrap().to_bytes();
 		assert!(contains(&bytes, b"guardrail_blocked"));
 		assert!(!contains(&bytes, b"SSN"));
+	}
+
+	fn gemini_delta_bytes(text: &str, thought: &str) -> Bytes {
+		sse_bytes(&format!(
+			"{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"{}\",\"thought\":true}},{{\"text\":\"{}\"}}]}}}}]}}",
+			thought, text
+		))
+	}
+
+	#[tokio::test]
+	async fn test_gemini_sse_text_is_evaluated() {
+		let chunk1 = gemini_delta_bytes("my SSN", "planning the answer");
+		let chunk2 = gemini_delta_bytes(" is 123-45-6789", "still planning");
+		let body = make_body(vec![chunk1, chunk2]);
+
+		let guarded = GuardedSseBody::new(
+			body,
+			vec![Box::new(pattern_evaluator("SSN is"))],
+			1024 * 1024,
+			None,
+		);
+
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(contains(&bytes, b"guardrail_blocked"));
+		assert!(!contains(&bytes, b"123-45-6789"));
+	}
+
+	fn gemini_candidates_bytes(candidates: serde_json::Value) -> Bytes {
+		sse_bytes(&serde_json::json!({ "candidates": candidates }).to_string())
+	}
+
+	#[tokio::test]
+	async fn test_gemini_sse_evaluates_every_candidate() {
+		// candidateCount is client-controlled: the guard-relevant text sits in candidates[1]
+		// behind a candidates[0] that only carries a thought part.
+		let chunk = gemini_candidates_bytes(serde_json::json!([
+			{ "content": { "role": "model", "parts": [{ "text": "planning", "thought": true }] } },
+			{ "content": { "role": "model", "parts": [{ "text": "my SSN is 123-45-6789" }] } }
+		]));
+		let body = make_body(vec![chunk]);
+
+		let guarded = GuardedSseBody::new(
+			body,
+			vec![Box::new(pattern_evaluator("SSN"))],
+			1024 * 1024,
+			None,
+		);
+
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(contains(&bytes, b"guardrail_blocked"));
+		assert!(!contains(&bytes, b"123-45-6789"));
+	}
+
+	#[tokio::test]
+	async fn test_gemini_sse_scans_past_a_candidate_without_content() {
+		// A candidate can carry only a finishReason; that must not end the scan.
+		let chunk = gemini_candidates_bytes(serde_json::json!([
+			{ "finishReason": "STOP" },
+			{ "content": { "role": "model", "parts": [{ "text": "forbidden words" }] } }
+		]));
+		let body = make_body(vec![chunk]);
+
+		let guarded = GuardedSseBody::new(
+			body,
+			vec![Box::new(pattern_evaluator("forbidden"))],
+			1024 * 1024,
+			None,
+		);
+
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(contains(&bytes, b"guardrail_blocked"));
+		assert!(!contains(&bytes, b"forbidden"));
+	}
+
+	fn text_delta(chunk: serde_json::Value) -> Option<Vec<String>> {
+		GuardedSseBody::extract_text_delta(SseFrame::Event(Event {
+			id: None,
+			name: "message".into(),
+			data: Bytes::from(chunk.to_string()),
+		}))
+		.map(|mut delta| delta.take_windows(&mut ResponseDelta::default()))
+	}
+
+	#[test]
+	fn test_extract_text_delta_matches_one_arm_per_chunk_shape() {
+		assert_eq!(
+			text_delta(serde_json::json!({ "type": "response.output_text.delta", "delta": "a" })),
+			Some(vec!["a".to_string()])
+		);
+		assert_eq!(
+			text_delta(serde_json::json!({ "choices": [{ "delta": { "content": "b" } }] })),
+			Some(vec!["b".to_string()])
+		);
+		assert_eq!(
+			text_delta(serde_json::json!({ "type": "content_block_delta", "delta": { "text": "c" } })),
+			Some(vec!["c".to_string()])
+		);
+		assert_eq!(
+			text_delta(serde_json::json!({
+				"candidates": [
+					{ "content": { "parts": [{ "text": "d" }] } },
+					{ "content": { "parts": [{ "text": "e" }, { "text": "skip", "thought": true }] } }
+				]
+			})),
+			Some(vec!["skip".to_string(), "de".to_string()])
+		);
+		assert_eq!(text_delta(serde_json::json!({ "usageMetadata": {} })), None);
+	}
+
+	#[tokio::test]
+	async fn test_gemini_sse_evaluates_thought_parts() {
+		let chunk = gemini_delta_bytes("all good", "forbidden");
+		let body = make_body(vec![chunk.clone()]);
+
+		let guarded = GuardedSseBody::new(
+			body,
+			vec![Box::new(pattern_evaluator("forbidden"))],
+			1024 * 1024,
+			None,
+		);
+
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(!contains(&bytes, b"forbidden"));
+		assert!(contains(&bytes, b"guardrail_blocked"));
+	}
+
+	#[rstest::rstest]
+	#[case::responses(serde_json::json!({"type": "response.reasoning_text.delta", "delta": "forbidden"}))]
+	#[case::responses_summary(serde_json::json!({"type": "response.reasoning_summary_text.delta", "delta": "forbidden"}))]
+	#[case::completions(serde_json::json!({"choices": [{"delta": {"reasoning": "forbidden", "content": "fine"}}]}))]
+	#[case::completions_reasoning_content(serde_json::json!({"choices": [{"delta": {"reasoning_content": "forbidden", "content": null}}]}))]
+	#[case::completions_details(serde_json::json!({"choices": [{"delta": {"reasoning_details": [{"type": "reasoning.text", "text": "forbidden"}]}}]}))]
+	#[case::completions_summary(serde_json::json!({"choices": [{"delta": {"reasoning_details": [{"type": "reasoning.summary", "summary": "forbidden"}]}}]}))]
+	#[case::second_choice(serde_json::json!({"choices": [{"delta": {"content": "fine"}}, {"delta": {"reasoning_content": "forbidden"}}]}))]
+	#[case::anthropic(serde_json::json!({"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "forbidden"}}))]
+	#[case::anthropic_start(serde_json::json!({"type": "content_block_start", "content_block": {"type": "thinking", "thinking": "forbidden", "signature": "opaque"}}))]
+	#[tokio::test]
+	async fn reasoning_delta_is_blocked_before_forwarding(#[case] chunk: serde_json::Value) {
+		let chunk = sse_bytes(&chunk.to_string());
+		// Exercise partial SSE frames as well as reasoning-only responses at EOF.
+		let split = chunk.len() / 2;
+		let body = make_body(vec![chunk.slice(..split), chunk.slice(split..)]);
+		let guarded = GuardedSseBody::new(
+			body,
+			vec![Box::new(pattern_evaluator("forbidden"))],
+			1024 * 1024,
+			None,
+		);
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(contains(&bytes, b"guardrail_blocked"));
+		assert!(!contains(&bytes, b"forbidden"));
+	}
+
+	#[rstest::rstest]
+	#[case::reasoning(false)]
+	#[case::answer(true)]
+	#[tokio::test]
+	async fn interleaved_reasoning_preserves_overlap(#[case] match_answer: bool) {
+		let chunks: Vec<_> = [("credit", "fine"), (" card", "also fine")]
+			.into_iter()
+			.map(|(a, r)| {
+				if match_answer {
+					gemini_delta_bytes(a, r)
+				} else {
+					gemini_delta_bytes(r, a)
+				}
+			})
+			.collect();
+		// Check both a single window at EOF and a match spanning evaluation windows.
+		for threshold in [4, DEFAULT_EVAL_THRESHOLD] {
+			let guarded = GuardedSseBody::with_threshold(
+				make_body(chunks.clone()),
+				vec![Box::new(pattern_evaluator("credit card"))],
+				1024 * 1024,
+				None,
+				threshold,
+			);
+			let bytes = guarded.collect().await.unwrap().to_bytes();
+			assert!(contains(&bytes, b"guardrail_blocked"));
+			assert!(!contains(&bytes, b" card"));
+		}
+	}
+
+	#[tokio::test]
+	async fn reasoning_and_answer_do_not_match_across_streams() {
+		let guarded = GuardedSseBody::new(
+			make_body(vec![gemini_delta_bytes("card", "credit")]),
+			vec![Box::new(pattern_evaluator(r"credit\s*card"))],
+			1024 * 1024,
+			None,
+		);
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(!contains(&bytes, b"guardrail_blocked"));
+	}
+
+	#[tokio::test]
+	async fn opaque_reasoning_is_not_scanned() {
+		let chunks = vec![
+			sse_bytes(
+				r#"{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"forbidden"}}"#,
+			),
+			sse_bytes(
+				r#"{"type":"content_block_start","content_block":{"type":"redacted_thinking","data":"forbidden"}}"#,
+			),
+			sse_bytes(
+				r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"forbidden"}]}}]}"#,
+			),
+		];
+		let expected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+		let guarded = GuardedSseBody::new(
+			make_body(chunks),
+			vec![Box::new(pattern_evaluator("forbidden"))],
+			1024 * 1024,
+			None,
+		);
+		assert_eq!(
+			guarded.collect().await.unwrap().to_bytes().as_ref(),
+			expected
+		);
 	}
 
 	#[tokio::test]

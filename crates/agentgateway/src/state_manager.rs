@@ -37,7 +37,7 @@ impl StateManager {
 		config_metrics: Arc<agent_xds::Metrics>,
 		awaiting_ready: tokio::sync::watch::Sender<()>,
 		config_resource_store: Option<config_store::ConfigResourceStore>,
-		model_catalog: Arc<crate::llm::cost::ModelCatalog>,
+		model_catalog: Arc<crate::llm::catalog::ModelCatalog>,
 	) -> anyhow::Result<Self> {
 		let xds = &config.xds;
 		let stores = Stores::new_with_dynamic_ca_cert_cache(
@@ -47,12 +47,22 @@ impl StateManager {
 		);
 		let resource_manager = crate::resource_manager::ResourceManager::new(client.clone())?;
 		let xds_client = if let Some(addr) = &xds.address {
+			let headers = xds
+				.headers
+				.iter()
+				.map(|(name, value)| {
+					Ok((
+						name.parse::<::http::header::HeaderName>()?,
+						value.parse::<::http::HeaderValue>()?,
+					))
+				})
+				.collect::<anyhow::Result<Vec<_>>>()?;
 			let connector = control::grpc_connector(
 				client.clone(),
 				addr.clone(),
 				xds.auth.clone(),
 				xds.ca_cert.clone(),
-				vec![],
+				headers,
 			)
 			.await?;
 			Some(
@@ -117,7 +127,7 @@ pub struct LocalClient {
 	config: Arc<crate::Config>,
 	pub cfg: ConfigSource,
 	pub config_resource_store: Option<config_store::ConfigResourceStore>,
-	pub model_catalog: Arc<crate::llm::cost::ModelCatalog>,
+	pub model_catalog: Arc<crate::llm::catalog::ModelCatalog>,
 	pub stores: Stores,
 	pub client: Client,
 	pub resource_manager: crate::resource_manager::ResourceManager,
@@ -238,21 +248,28 @@ impl LocalClient {
 		let config_content = self.config_content().await?;
 		let resources =
 			crate::resource_manager::ResourceFetcher::managed(self.resource_manager.clone());
-		let config = crate::types::local::NormalizedLocalConfig::from(
+		let config = crate::types::local::NormalizedLocalConfig::from_expanded(
 			&self.config,
 			&resources,
 			self.gateway.clone(),
-			config_content.as_str(),
+			config_content,
 		)
 		.await?;
 		let model_catalog = config
 			.model_catalog
 			.unwrap_or_else(|| self.config.model_catalog.sources.clone());
 		self.model_catalog.replace_sources(model_catalog).await?;
+		self
+			.config
+			.logging
+			.standard_attributes
+			.store(config.standard_attributes);
+		self.config.logging.session.store(config.session_attribute);
 		info!("loaded config from {:?}", self.cfg);
 
-		// Sync the state
-		let next_binds = self.stores.binds.sync_local(
+		// Sync binds first, but always run discovery sync even when a new bind cannot open.
+		// Propagating bind errors before discovery sync would skip workload/service state.
+		let bind_result = self.stores.binds.sync_local(
 			config.binds,
 			config.listener_routes,
 			config.listener_tcp_routes,
@@ -266,6 +283,12 @@ impl LocalClient {
 				.stores
 				.discovery
 				.sync_local(config.services, config.workloads, prev.discovery)?;
+		let next_binds = bind_result?;
+		self
+			.config
+			.budget_policy
+			.apply_registration(config.budget_registration)?;
+		self.config.config_reload_status.record_success();
 
 		Ok(PreviousState {
 			binds: next_binds,
@@ -279,7 +302,7 @@ impl LocalClient {
 		{
 			return config_store::materialize_hybrid_config(&self.cfg, store).await;
 		}
-		self.cfg.read_to_string().await
+		crate::types::local::expand_env(&self.cfg.read_to_string().await?)
 	}
 
 	async fn reload_config_after_change(&self, prev: PreviousState) -> PreviousState {
@@ -292,6 +315,10 @@ impl LocalClient {
 			},
 			Err(e) => {
 				self.metrics.config_synchronized.set(0);
+				self
+					.config
+					.config_reload_status
+					.record_failure(e.to_string());
 				error!("Failed to reload config: {}", e);
 				prev
 			},
@@ -353,8 +380,7 @@ async fn watch_self_workload(
 	// allow a cluster id mismatch as a very common misconfiguration is that the control plane and
 	// dataplane mismatch on this but if we do hit a conflict (should be rare) we use the cluster_id
 	// as a tiebreaker
-	let lookup = || {
-		let store = stores.discovery.read();
+	let lookup = |store: &crate::store::DiscoveryStore| {
 		store
 			.workloads
 			.find_by_name(&name, &namespace)
@@ -364,7 +390,7 @@ async fn watch_self_workload(
 
 	{
 		let store = stores.discovery.read();
-		if let Some(w) = lookup() {
+		if let Some(w) = lookup(&store) {
 			store.self_workload.set((*w).clone());
 			store.rebucket_all();
 			return;
@@ -387,7 +413,7 @@ async fn watch_self_workload(
 	loop {
 		{
 			let store = stores.discovery.read();
-			if let Some(w) = lookup() {
+			if let Some(w) = lookup(&store) {
 				store.self_workload.set((*w).clone());
 				store.rebucket_all();
 				return;
@@ -438,6 +464,7 @@ mod tests {
 			&client::Config {
 				resolver_cfg: hickory_resolver::config::ResolverConfig::default(),
 				resolver_opts: hickory_resolver::config::ResolverOpts::default(),
+				max_ttl: None,
 			},
 			None,
 			crate::BackendConfig::default(),
@@ -449,6 +476,8 @@ mod tests {
 		format!(
 			r#"
 config:
+  standardAttributes:
+    user: '"{remove_field}"'
   modelCatalog:
   - inline:
       providers:
@@ -505,7 +534,7 @@ frontendPolicies:
 		.unwrap_or_else(|_| panic!("timed out waiting for access log remove {remove_field}"));
 	}
 
-	async fn wait_for_catalog_model(catalog: &crate::llm::cost::ModelCatalog, model: &str) {
+	async fn wait_for_catalog_model(catalog: &crate::llm::catalog::ModelCatalog, model: &str) {
 		tokio::time::timeout(Duration::from_secs(5), async {
 			loop {
 				if catalog
@@ -594,7 +623,7 @@ frontendPolicies:
 		let metrics = Arc::new(agent_xds::Metrics::new(&mut registry));
 		let client = test_client();
 		let resource_manager = crate::resource_manager::ResourceManager::new(client.clone()).unwrap();
-		let model_catalog = crate::llm::cost::ModelCatalog::empty();
+		let model_catalog = crate::llm::catalog::ModelCatalog::empty();
 		let local_client = LocalClient {
 			config: config.clone(),
 			cfg: ConfigSource::File(path.clone()),
@@ -607,9 +636,10 @@ frontendPolicies:
 			metrics,
 		};
 
-		local_client.run().await.unwrap();
+		local_client.clone().run().await.unwrap();
 		wait_for_access_log_remove(&config, &stores, "first").await;
 		wait_for_catalog_model(&model_catalog, "first").await;
+		let first_attributes = config.logging.standard_attributes.load_full();
 
 		fs_err::tokio::write(&path, local_config("ready"))
 			.await
@@ -630,5 +660,93 @@ frontendPolicies:
 		replace_config(&path, "third").await;
 		wait_for_access_log_remove(&config, &stores, "third").await;
 		wait_for_catalog_model(&model_catalog, "third").await;
+		let current_attributes = config.logging.standard_attributes.load_full();
+		let request = crate::http::Request::new(crate::http::Body::empty());
+		let exec = crate::cel::Executor::new_request(&request);
+		for (snapshot, expected) in [(&first_attributes, "first"), (&current_attributes, "third")] {
+			let expression = snapshot
+				.add
+				.iter()
+				.find(|(name, _)| name.as_ref() == "agentgateway.user")
+				.unwrap()
+				.1;
+			assert_eq!(
+				exec.eval(expression).unwrap().as_string().unwrap(),
+				expected
+			);
+		}
+
+		// Reject invalid expressions without publishing a partial attribute update.
+		let invalid = local_config("invalid").replace("'\"invalid\"'", "'('");
+		fs_err::tokio::write(&path, invalid).await.unwrap();
+		assert!(
+			local_client
+				.reload_config(PreviousState::default())
+				.await
+				.is_err()
+		);
+		let retained = config.logging.standard_attributes.load_full();
+		let expression = retained
+			.add
+			.iter()
+			.find(|(name, _)| name.as_ref() == "agentgateway.user")
+			.unwrap()
+			.1;
+		assert_eq!(exec.eval(expression).unwrap().as_string().unwrap(), "third");
+	}
+
+	#[tokio::test]
+	async fn rejected_reload_records_error_and_recovery_clears_it() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::tokio::write(&path, local_config("first"))
+			.await
+			.unwrap();
+
+		let mut config = test_config();
+		config.xds.local_config = Some(ConfigSource::File(path.clone()));
+		let config = Arc::new(config);
+		let stores = test_stores();
+		let mut registry = prometheus_client::registry::Registry::default();
+		let metrics = Arc::new(agent_xds::Metrics::new(&mut registry));
+		let client = test_client();
+		let resource_manager = crate::resource_manager::ResourceManager::new(client.clone()).unwrap();
+		let local_client = LocalClient {
+			config: config.clone(),
+			cfg: ConfigSource::File(path.clone()),
+			config_resource_store: None,
+			model_catalog: crate::llm::catalog::ModelCatalog::empty(),
+			stores,
+			client,
+			resource_manager,
+			gateway: config.gateway(),
+			metrics,
+		};
+
+		// The initial successful load starts with no recorded error.
+		let prev = local_client
+			.reload_config(PreviousState::default())
+			.await
+			.unwrap();
+		assert!(config.config_reload_status.last_error().is_none());
+
+		// A rejected reload records its error alongside the config_synchronized metric.
+		let invalid = local_config("invalid").replace("'\"invalid\"'", "'('");
+		fs_err::tokio::write(&path, invalid).await.unwrap();
+		let _ = local_client.reload_config_after_change(prev.clone()).await;
+		assert!(
+			config
+				.config_reload_status
+				.last_error()
+				.is_some_and(|e| !e.is_empty()),
+			"rejected reload should record its error"
+		);
+
+		// A subsequent successful reload clears the error.
+		fs_err::tokio::write(&path, local_config("second"))
+			.await
+			.unwrap();
+		let _ = local_client.reload_config_after_change(prev).await;
+		assert!(config.config_reload_status.last_error().is_none());
 	}
 }

@@ -1,12 +1,10 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
-use std::io;
 use std::path::PathBuf;
 
 #[cfg(feature = "schema")]
 pub use schemars::JsonSchema;
 use secrecy::SecretString;
-use serde::de::DeserializeOwned;
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serializer};
 #[cfg(not(feature = "schema"))]
@@ -33,33 +31,27 @@ pub fn is_default<T: Default + PartialEq>(t: &T) -> bool {
 	*t == Default::default()
 }
 
-/// Serde yaml represents things different than just as "JSON in YAML format".
-/// We don't want this. Instead, we transcode YAML via the JSON module.
-pub mod yamlviajson {
+/// YAML with recursively map-encoded enum variants.
+pub mod yaml {
 	use serde::{de, ser};
+	use serde_norway::with::singleton_map_recursive;
 
 	pub fn from_str<T>(s: &str) -> anyhow::Result<T>
 	where
 		T: for<'de> de::Deserialize<'de>,
 	{
-		let de_yaml = serde_yaml::Deserializer::from_str(s);
-		let mut buf = Vec::with_capacity(128);
-		{
-			let mut se_json = serde_json::Serializer::new(&mut buf);
-			serde_transcode::transcode(de_yaml, &mut se_json)?;
-		}
-		Ok(serde_json_path_to_error::from_slice(&buf)?)
+		Ok(singleton_map_recursive::deserialize(
+			serde_norway::Deserializer::from_str(s),
+		)?)
 	}
 
 	pub fn to_string<T>(value: &T) -> anyhow::Result<String>
 	where
 		T: ?Sized + ser::Serialize,
 	{
-		let js = serde_json::to_string(value)?;
 		let mut buf = Vec::with_capacity(128);
-		let mut se_yaml = serde_yaml::Serializer::new(&mut buf);
-		let de_serde = serde_yaml::Deserializer::from_str(&js);
-		serde_transcode::transcode(de_serde, &mut se_yaml)?;
+		let mut serializer = serde_norway::Serializer::new(&mut buf);
+		singleton_map_recursive::serialize(&value, &mut serializer)?;
 		Ok(String::from_utf8(buf)?)
 	}
 }
@@ -87,6 +79,24 @@ where
 	{
 		let s = String::deserialize(deserializer)?;
 		s.parse().map_err(serde::de::Error::custom)
+	}
+}
+
+pub struct SerAsHeaderValue;
+impl serde_with::SerializeAs<http::HeaderValue> for SerAsHeaderValue {
+	fn serialize_as<S>(source: &http::HeaderValue, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		ser_string_or_bytes(source, serializer)
+	}
+}
+impl<'de> serde_with::DeserializeAs<'de, http::HeaderValue> for SerAsHeaderValue {
+	fn deserialize_as<D>(deserializer: D) -> Result<http::HeaderValue, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		<SerAsStr as serde_with::DeserializeAs<'de, http::HeaderValue>>::deserialize_as(deserializer)
 	}
 }
 
@@ -295,8 +305,16 @@ pub fn ser_string_or_bytes<S: Serializer, T: AsRef<[u8]>>(
 	if let Ok(s) = std::str::from_utf8(b) {
 		serializer.serialize_str(s)
 	} else {
-		serializer.serialize_bytes(b)
+		serde::Serialize::serialize(b, serializer)
 	}
+}
+
+pub fn de_string_or_bytes<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+	D: Deserializer<'de>,
+	T: From<Vec<u8>>,
+{
+	serde_with::As::<serde_with::BytesOrString>::deserialize(deserializer).map(T::from)
 }
 
 pub fn ser_string_or_bytes_option<S: Serializer, T: AsRef<[u8]>>(
@@ -354,32 +372,6 @@ pub fn de_bytes<S: Serializer, T: AsRef<[u8]>>(t: &T, serializer: S) -> Result<S
 	}
 }
 
-pub fn deser_key_from_file<'de, D>(deserializer: D) -> Result<SecretString, D::Error>
-where
-	D: Deserializer<'de>,
-{
-	let input = FileOrInline::deserialize(deserializer)?;
-	load_secret(input).map_err(serde::de::Error::custom)
-}
-
-pub fn deser_key_from_file_option<'de, D>(deserializer: D) -> Result<Option<SecretString>, D::Error>
-where
-	D: Deserializer<'de>,
-{
-	let input = Option::<FileOrInline>::deserialize(deserializer)?;
-	let Some(input) = input else {
-		return Ok(None);
-	};
-	load_secret(input)
-		.map(Some)
-		.map_err(serde::de::Error::custom)
-}
-
-fn load_secret(input: FileOrInline) -> Result<SecretString, String> {
-	let key = input.load().map_err(|e| e.to_string())?;
-	Ok(SecretString::from(key.trim().to_string()))
-}
-
 pub fn deser_key<'de, D>(deserializer: D) -> Result<SecretString, D::Error>
 where
 	D: Deserializer<'de>,
@@ -387,31 +379,6 @@ where
 	let input = String::deserialize(deserializer)?;
 
 	Ok(SecretString::from(input))
-}
-
-pub fn de_as<'de, I, O, D>(deserializer: D) -> Result<O, D::Error>
-where
-	D: Deserializer<'de>,
-	I: DeserializeOwned,
-	O: TryFrom<I>,
-	<O as TryFrom<I>>::Error: Display,
-{
-	let s: I = I::deserialize(deserializer)?;
-	O::try_from(s).map_err(serde::de::Error::custom)
-}
-
-pub fn de_as_opt<'de, I, O, D>(deserializer: D) -> Result<Option<O>, D::Error>
-where
-	D: Deserializer<'de>,
-	I: DeserializeOwned,
-	O: TryFrom<I>,
-	<O as TryFrom<I>>::Error: Display,
-{
-	let s: Option<I> = <Option<I>>::deserialize(deserializer)?;
-	match s {
-		Some(i) => Ok(Some(O::try_from(i).map_err(serde::de::Error::custom)?)),
-		None => Ok(None),
-	}
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -423,15 +390,6 @@ pub enum FileOrInline {
 		file: PathBuf,
 	},
 	Inline(String),
-}
-
-impl FileOrInline {
-	pub fn load(&self) -> io::Result<String> {
-		match self {
-			FileOrInline::File { file } => fs_err::read_to_string(file),
-			FileOrInline::Inline(s) => Ok(s.clone()),
-		}
-	}
 }
 
 #[derive(Clone, Default, Debug)]
@@ -511,3 +469,6 @@ macro_rules! const_string {
 	};
 }
 pub use crate::const_string;
+
+#[cfg(test)]
+mod yaml_tests;

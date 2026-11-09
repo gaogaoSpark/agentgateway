@@ -20,6 +20,153 @@ fn test_apikey_equality() {
 	assert!(!map.contains_key(&APIKey::new("other-key")));
 }
 
+#[test]
+fn test_allowed_models_matching() {
+	let cases: &[(&str, Option<&[&str]>, &str, bool)] = &[
+		("omitted allows all", None, "gpt-4o", true),
+		("empty denies all", Some(&[]), "gpt-4o", false),
+		("exact match", Some(&["gpt-4o"]), "gpt-4o", true),
+		("exact mismatch", Some(&["gpt-4o"]), "gpt-4.1", false),
+		("prefix match", Some(&["openai/*"]), "openai/gpt-4o", true),
+		(
+			"prefix mismatch",
+			Some(&["openai/*"]),
+			"anthropic/claude",
+			false,
+		),
+		("suffix match", Some(&["*-latest"]), "gpt-4-latest", true),
+		(
+			"suffix mismatch",
+			Some(&["*-latest"]),
+			"gpt-4-preview",
+			false,
+		),
+		("all wildcard", Some(&["*"]), "any/model", true),
+		(
+			"any pattern may match",
+			Some(&["gpt-4o", "anthropic/*"]),
+			"anthropic/claude",
+			true,
+		),
+		(
+			"matching is case sensitive",
+			Some(&["GPT-*"]),
+			"gpt-4o",
+			false,
+		),
+	];
+
+	for (name, patterns, model, want) in cases {
+		let allowed = AllowedModels::compile(
+			patterns.map(|patterns| patterns.iter().map(|pattern| pattern.to_string()).collect()),
+		)
+		.unwrap();
+		assert_eq!(allowed.allows(model), *want, "{name}");
+	}
+}
+
+#[test]
+fn test_allowed_models_discovery_intersections() {
+	#[allow(clippy::type_complexity)]
+	let cases: &[(&str, Option<&[&str]>, &str, &[&str])] = &[
+		(
+			"omitted preserves configured pattern",
+			None,
+			"provider/*",
+			&["provider/*"],
+		),
+		("empty discovers nothing", Some(&[]), "provider/*", &[]),
+		(
+			"exact model is advertised through configured pattern",
+			Some(&["provider/model"]),
+			"provider/*",
+			&["provider/model"],
+		),
+		(
+			"nonmatching exact is hidden",
+			Some(&["other/model"]),
+			"provider/*",
+			&[],
+		),
+		(
+			"disjoint prefixes are hidden",
+			Some(&["other/*"]),
+			"provider/*",
+			&[],
+		),
+		(
+			"disjoint suffixes are hidden",
+			Some(&["*-preview"]),
+			"*-latest",
+			&[],
+		),
+		(
+			"narrower allowed pattern includes configured pattern",
+			Some(&["provider/gpt-*"]),
+			"provider/*",
+			&["provider/*"],
+		),
+		(
+			"narrower configured pattern is preserved",
+			Some(&["provider/*"]),
+			"provider/gpt-*",
+			&["provider/gpt-*"],
+		),
+		(
+			"overlapping prefix and suffix include configured pattern",
+			Some(&["provider/*"]),
+			"*-latest",
+			&["*-latest"],
+		),
+		(
+			"multiple exact models are advertised and deduplicated",
+			Some(&["provider/one", "provider/two", "provider/one"]),
+			"provider/*",
+			&["provider/one", "provider/two"],
+		),
+		(
+			"concrete configured models are filtered",
+			Some(&["provider/*"]),
+			"other/model",
+			&[],
+		),
+	];
+
+	for (name, patterns, configured, want) in cases {
+		let allowed = AllowedModels::compile(
+			patterns.map(|patterns| patterns.iter().map(|pattern| pattern.to_string()).collect()),
+		)
+		.unwrap();
+		let policy = ModelAccessPolicy {
+			allowed_models: allowed,
+		};
+		assert_eq!(
+			discoverable_models(Some(&policy), configured).collect::<Vec<_>>(),
+			*want,
+			"{name}"
+		);
+	}
+}
+
+#[test]
+fn test_allowed_models_rejects_invalid_patterns() {
+	let cases = [
+		(vec![""], "empty model name"),
+		(vec!["provider/*/model"], "at the beginning or end"),
+		(vec!["**"], "at most one wildcard"),
+		(vec!["*", "provider/model"], "cannot combine '*'"),
+	];
+
+	for (patterns, want) in cases {
+		let err =
+			AllowedModels::compile(Some(patterns.into_iter().map(str::to_string).collect())).unwrap_err();
+		assert!(
+			err.to_string().contains(want),
+			"error {err:?} did not contain {want:?}"
+		);
+	}
+}
+
 #[tokio::test]
 async fn test_apikey_query_parameter_extracts_and_strips() {
 	let auth = APIKeyAuthentication::new(
@@ -32,7 +179,7 @@ async fn test_apikey_query_parameter_extracts_and_strips() {
 
 	let mut req = ::http::Request::builder()
 		.uri("http://example.com/data?api_key=test-api-key&keep=yes")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)
@@ -56,7 +203,7 @@ async fn test_apikey_cookie_extracts_and_strips() {
 	let mut req = ::http::Request::builder()
 		.uri("http://example.com/data")
 		.header("cookie", "keep=yes; api_key=test-api-key")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)
@@ -90,7 +237,7 @@ async fn test_apikey_sha256_extracts_and_strips() {
 
 	let mut req = ::http::Request::builder()
 		.header(crate::http::header::AUTHORIZATION, "Bearer test-api-key")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)
@@ -123,7 +270,7 @@ async fn test_apikey_sha256_extracts_and_strips() {
 			crate::http::header::AUTHORIZATION,
 			"Bearer plaintext-api-key",
 		)
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)
@@ -178,7 +325,7 @@ async fn test_apikey_sha256_rejects_invalid_key() {
 
 	let mut req = ::http::Request::builder()
 		.header(crate::http::header::AUTHORIZATION, "Bearer invalid-api-key")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let err = crate::test_helpers::test_policy(&auth, &mut req)
@@ -187,9 +334,7 @@ async fn test_apikey_sha256_rejects_invalid_key() {
 
 	assert!(matches!(
 		err,
-		ProxyResponse::Error(ProxyError::APIKeyAuthenticationFailure(
-			Error::InvalidCredentials
-		))
+		ProxyError::APIKeyAuthenticationFailure(Error::InvalidCredentials)
 	));
 }
 
@@ -220,7 +365,7 @@ async fn test_apikey_permissive_invalid_key_ok_and_keeps_header() {
 
 	let mut req = ::http::Request::builder()
 		.header(crate::http::header::AUTHORIZATION, "Bearer invalid-api-key")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)
@@ -246,7 +391,7 @@ async fn test_apikey_permissive_valid_key_inserts_claims_and_removes_header() {
 
 	let mut req = ::http::Request::builder()
 		.header(crate::http::header::AUTHORIZATION, "Bearer test-api-key")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)

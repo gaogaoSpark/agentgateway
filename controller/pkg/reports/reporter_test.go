@@ -21,6 +21,54 @@ const fakeCondition = "agentgateway.dev/SomeCondition"
 var ctx = context.Background()
 
 func TestBuildGatewayStatus(t *testing.T) {
+	t.Run("recompute insecure frontend validation condition", func(t *testing.T) {
+		for _, tt := range []struct {
+			name        string
+			tls         *gwv1.GatewayTLSConfig
+			wantPresent bool
+		}{
+			{
+				name: "fallback disabled",
+				tls: &gwv1.GatewayTLSConfig{Frontend: &gwv1.FrontendTLSConfig{
+					Default: gwv1.TLSConfig{Validation: &gwv1.FrontendTLSValidation{Mode: gwv1.AllowValidOnly}},
+				}},
+			},
+			{
+				name: "per port fallback enabled",
+				tls: &gwv1.GatewayTLSConfig{Frontend: &gwv1.FrontendTLSConfig{
+					Default: gwv1.TLSConfig{Validation: &gwv1.FrontendTLSValidation{Mode: gwv1.AllowValidOnly}},
+					PerPort: []gwv1.TLSPortConfig{{
+						Port: 443,
+						TLS:  gwv1.TLSConfig{Validation: &gwv1.FrontendTLSValidation{Mode: gwv1.AllowInsecureFallback}},
+					}},
+				}},
+				wantPresent: true,
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				gw := gw()
+				gw.Generation = 2
+				gw.Spec.TLS = tt.tls
+				gw.Status.Conditions = []metav1.Condition{{
+					Type:               string(gwv1.GatewayConditionInsecureFrontendValidationMode),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 1,
+				}}
+				rm := reports.NewReportMap()
+				reports.NewReporter(&rm).Gateway(gw)
+				status := rm.BuildGWStatus(ctx, *gw, 0)
+				condition := meta.FindStatusCondition(status.Conditions, string(gwv1.GatewayConditionInsecureFrontendValidationMode))
+				if (condition != nil) != tt.wantPresent {
+					t.Fatalf("InsecureFrontendValidationMode = %v, want present: %v", condition, tt.wantPresent)
+				}
+				if tt.wantPresent {
+					assert.Equal(t, metav1.ConditionTrue, condition.Status)
+					assert.Equal(t, int64(2), condition.ObservedGeneration)
+				}
+			})
+		}
+	})
+
 	t.Run("build all positive conditions with an empty report", func(t *testing.T) {
 		gw := gw()
 		rm := reports.NewReportMap()
@@ -169,6 +217,25 @@ func TestBuildGatewayStatus(t *testing.T) {
 		assert.Equal(t, string(gwv1.GatewayReasonProgrammed), programmed.Reason)
 	})
 
+	t.Run("accepted false can default programmed true", func(t *testing.T) {
+		gw := gw()
+		rm := reports.NewReportMap()
+		r := reports.NewReporter(&rm)
+		r.Gateway(gw).SetCondition(reporter.GatewayCondition{
+			Type:    gwv1.GatewayConditionAccepted,
+			Status:  metav1.ConditionFalse,
+			Reason:  gwv1.GatewayReasonInvalid,
+			Message: "partially valid",
+		})
+		status := rm.BuildGWStatus(context.Background(), *gw, 0)
+
+		programmed := meta.FindStatusCondition(status.Conditions, string(gwv1.GatewayConditionProgrammed))
+		assert.Equal(t, true, programmed != nil)
+		assert.Equal(t, metav1.ConditionTrue, programmed.Status)
+		assert.Equal(t, string(gwv1.GatewayReasonProgrammed), programmed.Reason)
+		assert.Equal(t, reports.GatewayProgrammedMessage, programmed.Message)
+	})
+
 	t.Run("set negative listener conditions from report and not add extra conditions", func(t *testing.T) {
 		gw := gw()
 		rm := reports.NewReportMap()
@@ -222,6 +289,71 @@ func TestBuildGatewayStatus(t *testing.T) {
 		newTransitionTime := acceptedCond.LastTransitionTime
 		assert.Equal(t, oldTransitionTime, newTransitionTime)
 	})
+}
+
+func TestBuildGatewayStatusListenerMessages(t *testing.T) {
+	for _, tc := range []struct {
+		name, acceptedMessage, programmedMessage string
+		listenerNames                            []gwv1.SectionName
+		want                                     string
+	}{
+		{
+			name: "deduplicate identical condition messages", listenerNames: []gwv1.SectionName{"http"},
+			acceptedMessage: "conflict", programmedMessage: "conflict",
+			want: "Some listeners are not accepted: http: conflict",
+		},
+		{
+			name: "preserve distinct condition messages", listenerNames: []gwv1.SectionName{"http"},
+			acceptedMessage: "not accepted", programmedMessage: "not programmed",
+			want: "Some listeners are not accepted: http: not accepted; http: not programmed",
+		},
+		{
+			name: "preserve identical messages from different listeners", listenerNames: []gwv1.SectionName{"first", "second"},
+			acceptedMessage: "conflict", programmedMessage: "conflict",
+			want: "Some listeners are not accepted: first: conflict; second: conflict",
+		},
+		{
+			name: "preserve listener name fallback", listenerNames: []gwv1.SectionName{"http"},
+			want: "Some listeners are not accepted: http",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := gw()
+			gw.Spec.Listeners = nil
+			for _, name := range tc.listenerNames {
+				gw.Spec.Listeners = append(gw.Spec.Listeners, gwv1.Listener{Name: name})
+			}
+			rm := reports.NewReportMap()
+			gwReporter := reports.NewReporter(&rm).Gateway(gw)
+			for i := range gw.Spec.Listeners {
+				lr := gwReporter.Listener(&gw.Spec.Listeners[i])
+				lr.SetCondition(reporter.ListenerCondition{
+					Type: gwv1.ListenerConditionAccepted, Status: metav1.ConditionFalse,
+					Reason: gwv1.ListenerReasonHostnameConflict, Message: tc.acceptedMessage,
+				})
+				lr.SetCondition(reporter.ListenerCondition{
+					Type: gwv1.ListenerConditionProgrammed, Status: metav1.ConditionFalse,
+					Reason: gwv1.ListenerReasonHostnameConflict, Message: tc.programmedMessage,
+				})
+			}
+			status := rm.BuildGWStatus(context.Background(), *gw, 0)
+			accepted := meta.FindStatusCondition(status.Conditions, string(gwv1.GatewayConditionAccepted))
+			assert.Equal(t, true, accepted != nil)
+			assert.Equal(t, metav1.ConditionFalse, accepted.Status)
+			assert.Equal(t, string(gwv1.GatewayReasonListenersNotValid), accepted.Reason)
+			assert.Equal(t, tc.want, accepted.Message)
+			for _, listener := range status.Listeners {
+				for _, condition := range listener.Conditions {
+					switch condition.Type {
+					case string(gwv1.ListenerConditionAccepted):
+						assert.Equal(t, tc.acceptedMessage, condition.Message)
+					case string(gwv1.ListenerConditionProgrammed):
+						assert.Equal(t, tc.programmedMessage, condition.Message)
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestBuildRouteStatus(t *testing.T) {
@@ -284,10 +416,8 @@ func TestBuildRouteStatus(t *testing.T) {
 		r := reports.NewReporter(&rm)
 
 		route := &gwv1.HTTPRoute{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "route",
-				Namespace: "default",
-			},
+			Name:      "route",
+			Namespace: "default",
 			Spec: gwv1.HTTPRouteSpec{
 				CommonRouteSpec: gwv1.CommonRouteSpec{
 					ParentRefs: []gwv1.ParentReference{
@@ -321,10 +451,12 @@ func TestBuildRouteStatus(t *testing.T) {
 		status := rm.BuildRouteStatus(ctx, route, wellknown.DefaultAgwControllerName)
 
 		assert.Equal(t, true, status != nil)
-		// 1 parent is ours, 1 parent is other.
+		// 1 parent is ours, 1 parent is other. The other controller's entry keeps its position and ours is appended.
 		assert.Equal(t, 2, len(status.Parents))
-		// Ours will be first due to alphabetical ordering of controller name ('k' vs. 'o').
-		assert.Equal(t, 2, len(status.Parents[0].Conditions))
+		assert.Equal(t, gwv1.GatewayController("other.io/controller"), status.Parents[0].ControllerName)
+		assert.Equal(t, 1, len(status.Parents[0].Conditions))
+		assert.Equal(t, gwv1.GatewayController(wellknown.DefaultAgwControllerName), status.Parents[1].ControllerName)
+		assert.Equal(t, 2, len(status.Parents[1].Conditions))
 	})
 
 	t.Run("set negative route conditions from report and not add extra conditions", func(t *testing.T) {
@@ -703,10 +835,8 @@ func fakeTranslate(reporter reporter.Reporter, obj client.Object) {
 
 func httpRoute(conditions ...metav1.Condition) client.Object {
 	route := &gwv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "route",
-			Namespace: "default",
-		},
+		Name:      "route",
+		Namespace: "default",
 	}
 	route.Spec.CommonRouteSpec.ParentRefs = append(route.Spec.CommonRouteSpec.ParentRefs, *parentRef())
 	if len(conditions) > 0 {
@@ -721,10 +851,8 @@ func httpRoute(conditions ...metav1.Condition) client.Object {
 
 func tcpRoute(conditions ...metav1.Condition) client.Object {
 	route := &gwv1.TCPRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "route",
-			Namespace: "default",
-		},
+		Name:      "route",
+		Namespace: "default",
 	}
 	route.Spec.CommonRouteSpec.ParentRefs = append(route.Spec.CommonRouteSpec.ParentRefs, *parentRef())
 	if len(conditions) > 0 {
@@ -739,10 +867,8 @@ func tcpRoute(conditions ...metav1.Condition) client.Object {
 
 func tlsRoute(conditions ...metav1.Condition) client.Object {
 	route := &gwv1.TLSRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "route",
-			Namespace: "default",
-		},
+		Name:      "route",
+		Namespace: "default",
 	}
 	route.Spec.CommonRouteSpec.ParentRefs = append(route.Spec.CommonRouteSpec.ParentRefs, *parentRef())
 	if len(conditions) > 0 {
@@ -757,10 +883,8 @@ func tlsRoute(conditions ...metav1.Condition) client.Object {
 
 func grpcRoute(conditions ...metav1.Condition) client.Object {
 	route := &gwv1.GRPCRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "route",
-			Namespace: "default",
-		},
+		Name:      "route",
+		Namespace: "default",
 	}
 	route.Spec.CommonRouteSpec.ParentRefs = append(route.Spec.CommonRouteSpec.ParentRefs, *parentRef())
 	if len(conditions) > 0 {
@@ -787,10 +911,8 @@ func otherParentRef() *gwv1.ParentReference {
 
 func delegateeRoute(conditions ...metav1.Condition) client.Object {
 	route := &gwv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "child-route",
-			Namespace: "default",
-		},
+		Name:      "child-route",
+		Namespace: "default",
 	}
 	route.Spec.CommonRouteSpec.ParentRefs = append(route.Spec.CommonRouteSpec.ParentRefs, *parentRouteRef())
 	if len(conditions) > 0 {
@@ -814,10 +936,8 @@ func parentRouteRef() *gwv1.ParentReference {
 
 func gw() *gwv1.Gateway {
 	g := &gwv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "agentgateway-gtw",
-		},
+		Namespace: "default",
+		Name:      "agentgateway-gtw",
 	}
 	g.Spec.Listeners = append(g.Spec.Listeners, *listener())
 	return g

@@ -1,8 +1,8 @@
-use ::http::{HeaderMap, StatusCode};
+use ::http::HeaderMap;
 use itertools::Itertools;
 
 use crate::cel::{Executor, Expression};
-use crate::http::localratelimit::RateLimitType;
+use crate::http::localratelimit::{self, RateLimitType};
 use crate::http::remoteratelimit::proto::rate_limit_descriptor::Entry;
 use crate::http::remoteratelimit::proto::rate_limit_service_client::RateLimitServiceClient;
 use crate::http::remoteratelimit::proto::{RateLimitDescriptor, RateLimitRequest};
@@ -142,6 +142,13 @@ impl LLMResponseAmend {
 			default_tokens,
 			exec,
 		);
+		if self.request.descriptors.is_empty() {
+			debug!(
+				domain = %self.request.domain,
+				"skipping remote rate limit token amendment because no descriptors remain"
+			);
+			return;
+		}
 		tokio::task::spawn(async move {
 			let _ = self.base.check_internal(self.client, self.request).await;
 		});
@@ -153,6 +160,7 @@ impl LLMResponseAmend {
 		default_tokens: i64,
 		exec: &Executor,
 	) {
+		let domain = request.domain.clone();
 		let descriptors = std::mem::take(&mut request.descriptors);
 		request.descriptors = descriptors
 			.into_iter()
@@ -160,9 +168,27 @@ impl LLMResponseAmend {
 			.filter_map(|(mut d, cost)| {
 				d.hits_addend = if let Some(cost) = cost.as_ref() {
 					// if there is a cost expression, run it.
-					let Some(cost) = exec.eval(cost).ok().and_then(|v| v.as_unsigned().ok()) else {
-						// Failed to evaluate: skip descriptor
-						return None;
+					let value = match exec.eval(cost) {
+						Ok(value) => value,
+						Err(error) => {
+							debug!(
+								domain = %domain,
+								%error,
+								"remote rate limit token cost expression evaluation failed; skipping descriptor"
+							);
+							return None;
+						},
+					};
+					let cost = match value.as_unsigned() {
+						Ok(cost) => cost,
+						Err(error) => {
+							debug!(
+								domain = %domain,
+								%error,
+								"remote rate limit token cost must be a non-negative integer; skipping descriptor"
+							);
+							return None;
+						},
 					};
 					Some(cost as u64)
 				} else {
@@ -409,12 +435,21 @@ impl RemoteRateLimit {
 				})
 				.join(" | ")
 		);
-		let chan = self
-			.target
-			.grpc_channel(client.with_outbound(OutboundCallKind::Policy, OutboundCallSubtype::RateLimit));
+		let policy_client =
+			client.with_outbound(OutboundCallKind::Policy, OutboundCallSubtype::RateLimit);
+		let chan = self.target.grpc_channel(policy_client.clone());
 		let mut client = RateLimitServiceClient::new(chan);
+		let mut request = tonic::Request::new(request);
+		let mut span = policy_client.start_grpc_span(
+			&mut request,
+			self.target.target.as_ref(),
+			"/envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit",
+		);
 		let resp = client.should_rate_limit(request).await;
-		trace!("check response: {:?}", resp);
+		if let Some(span) = span.as_deref_mut() {
+			span.record_grpc_result(&resp);
+		}
+		trace!(overall_code = ?resp.as_ref().map(|r| r.get_ref().overall_code()).map_err(|e| e.code()), "check response");
 		if let Err(ref error) = resp {
 			let ignore = self.failure_mode == FailureMode::FailOpen;
 			warn!(
@@ -435,24 +470,33 @@ impl RemoteRateLimit {
 	}
 
 	fn apply(req: &mut Request, cr: proto::RateLimitResponse) -> Result<PolicyResponse, ProxyError> {
+		let proto::RateLimitResponse {
+			overall_code,
+			statuses,
+			response_headers_to_add,
+			request_headers_to_add,
+			raw_body,
+			..
+		} = cr;
 		let mut res = PolicyResponse::default();
-		// if not OK, we directly respond
-		if cr.overall_code != (proto::rate_limit_response::Code::Ok as i32) {
-			let mut rb = ::http::response::Builder::new().status(StatusCode::TOO_MANY_REQUESTS);
-			if let Some(hm) = rb.headers_mut() {
-				process_headers(hm, cr.response_headers_to_add)
-			}
-			let resp = rb
-				.body(http::Body::from(cr.raw_body))
-				.map_err(|e| ProxyError::Processing(e.into()))?;
-			res.direct_response = Some(resp);
-			return Ok(res);
+		// if not OK, deny; ProxyError::into_response_with_grpc builds the 429 from this error
+		if overall_code != (proto::rate_limit_response::Code::Ok as i32) {
+			let mut hm = HeaderMap::new();
+			process_headers(&mut hm, response_headers_to_add);
+			process_ratelimit_status_headers(&mut hm, &statuses, true);
+			return Err(ProxyError::RemoteRateLimitExceeded {
+				status: ratelimit_status(&statuses),
+				raw_body,
+				response_headers: Box::new(hm),
+			});
 		}
 
-		process_headers(req.headers_mut(), cr.request_headers_to_add);
-		if !cr.response_headers_to_add.is_empty() {
-			let mut hm = HeaderMap::new();
-			process_headers(&mut hm, cr.response_headers_to_add);
+		process_headers(req.headers_mut(), request_headers_to_add);
+		// Surface the standard x-ratelimit-* headers on allowed responses so clients can self-throttle.
+		let mut hm = HeaderMap::new();
+		process_headers(&mut hm, response_headers_to_add);
+		process_ratelimit_status_headers(&mut hm, &statuses, false);
+		if !hm.is_empty() {
 			res.response_headers = Some(hm);
 		}
 		Ok(res)
@@ -534,8 +578,8 @@ impl crate::store::RequestPolicyTrait for RemoteRateLimit {
 		client: &PolicyClient,
 		_log: &mut crate::telemetry::log::RequestLog,
 		req: &mut Request,
-	) -> Result<PolicyResponse, crate::proxy::ProxyResponse> {
-		Ok(self.check(client.clone(), req).await?)
+	) -> Result<PolicyResponse, ProxyError> {
+		self.check(client.clone(), req).await
 	}
 
 	fn expressions(&self) -> impl Iterator<Item = &Expression> {
@@ -546,6 +590,57 @@ impl crate::store::RequestPolicyTrait for RemoteRateLimit {
 fn process_headers(hm: &mut HeaderMap, headers: Vec<proto::HeaderValue>) {
 	for h in headers {
 		let _ = envoy_proto_common::apply_header_value(hm, &h);
+	}
+}
+
+/// When multiple descriptors apply, the most-constrained one (fewest requests remaining)
+/// is reported, matching the limit a client is most likely to hit next.
+fn ratelimit_status(
+	statuses: &[proto::rate_limit_response::DescriptorStatus],
+) -> Option<localratelimit::RateLimitStatus> {
+	let best = statuses
+		.iter()
+		.filter(|status| status.current_limit.is_some())
+		.min_by_key(|status| status.limit_remaining)?;
+	let limit = best.current_limit.as_ref()?;
+	let reset_seconds = best
+		.duration_until_reset
+		.as_ref()
+		.map(|d| d.seconds.max(0) as u64)
+		.unwrap_or(0);
+	Some(localratelimit::RateLimitStatus {
+		limit: limit.requests_per_unit as u64,
+		remaining: best.limit_remaining as u64,
+		reset_seconds,
+	})
+}
+
+fn process_ratelimit_status_headers(
+	hm: &mut HeaderMap,
+	statuses: &[proto::rate_limit_response::DescriptorStatus],
+	denied: bool,
+) {
+	if let Some(status) = ratelimit_status(statuses) {
+		http::x_headers::set_ratelimit_headers(
+			hm,
+			status.limit,
+			status.remaining,
+			status.reset_seconds,
+		);
+	}
+	// Only denials need Retry-After; allowed responses still get advisory quota headers.
+	// Like Envoy, derive the longest denied reset separately: current_limit may be
+	// absent, and advisory x-ratelimit headers may describe a different descriptor.
+	if denied
+		&& let Some(reset) = statuses
+			.iter()
+			.filter(|s| s.code == proto::rate_limit_response::Code::OverLimit as i32)
+			.filter_map(|s| s.duration_until_reset.as_ref())
+			.map(|d| (d.seconds.max(0) as u64 + u64::from(d.nanos > 0)).max(1))
+			.max()
+	{
+		hm.entry(::http::header::RETRY_AFTER)
+			.or_insert(reset.into());
 	}
 }
 

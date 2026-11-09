@@ -7,8 +7,8 @@ use crate::{RouteType, apply};
 #[cfg_attr(feature = "schema", schemars(rename = "AnthropicProvider"))]
 pub struct Provider {
 	/// Model ID to send to Anthropic, overriding the model in the client request.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub model: Option<Strng>,
+	#[serde(default, rename = "model", skip_serializing_if = "Option::is_none")]
+	pub model_override: Option<Strng>,
 }
 
 impl super::Provider for Provider {
@@ -18,6 +18,10 @@ pub const DEFAULT_HOST_STR: &str = "api.anthropic.com";
 pub const DEFAULT_HOST: Strng = strng::literal!(DEFAULT_HOST_STR);
 
 pub const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
+
+/// Default anthropic-version when the client sends none.
+// TODO should this be configurable?
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 pub const DEFAULT_BASE_PATH: &str = "/v1";
 

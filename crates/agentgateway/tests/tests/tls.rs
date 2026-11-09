@@ -19,20 +19,23 @@ pub(in crate::tests) fn test_server_tls_config() -> agentgateway::types::agent::
 	.expect("test server tls config")
 }
 
-pub(in crate::tests) fn https_bind() -> Bind {
-	Bind {
-		key: BIND_KEY,
-		address: "127.0.0.1:0".parse().unwrap(),
-		listeners: ListenerSet::from_list([Listener {
+pub(in crate::tests) fn https_bind() -> BindSnapshot {
+	BindSnapshot::new(
+		Bind {
+			key: BIND_KEY,
+			address: "127.0.0.1:0".parse().unwrap(),
+			protocol: BindProtocol::tls,
+			tunnel_protocol: Default::default(),
+			mode: Default::default(),
+		},
+		ListenerSet::from_list([Listener {
 			key: LISTENER_KEY,
 			name: Default::default(),
 			hostname: strng::new("*.example.com"),
 			protocol: ListenerProtocol::HTTPS(test_server_tls_config()),
+			..Default::default()
 		}]),
-		protocol: BindProtocol::tls,
-		tunnel_protocol: Default::default(),
-		mode: Default::default(),
-	}
+	)
 }
 
 async fn serve_https_http1_connection(
@@ -54,6 +57,7 @@ async fn serve_https_http1_connection(
 			alpn: None,
 			subject_alt_names: None,
 			key_exchange_groups: None,
+			spiffe: false,
 		}
 		.try_into()
 		.unwrap();
@@ -182,6 +186,7 @@ async fn tls_connection_drains_when_listener_changes() {
 			name: Default::default(),
 			hostname: strng::new("*.example.com"),
 			protocol: ListenerProtocol::HTTPS(agentgateway::types::agent::ServerTLSConfig::new_invalid()),
+			..Default::default()
 		},
 		BIND_KEY,
 	);
@@ -210,7 +215,7 @@ async fn tls_connection_drains_when_listener_changes() {
 }
 
 #[tokio::test]
-#[cfg(feature = "tls-aws-lc")]
+#[cfg(feature = "crypto-aws-lc")]
 async fn tls_backend_connection() {
 	let (mock, certs) = tls_mock().await;
 	let backend_tls = agentgateway::http::backendtls::ResolvedBackendTLS {
@@ -243,7 +248,35 @@ async fn tls_backend_connection() {
 }
 
 #[tokio::test]
-#[cfg(feature = "tls-aws-lc")]
+async fn tls_backend_invalid_does_not_connect() {
+	use agentgateway::http::backendtls::{BackendTLS, BackendTLSSource};
+
+	let mock = simple_mock().await;
+	let backend_tls = BackendTLS {
+		hostname_override: None,
+		source: BackendTLSSource::Invalid(strng::new("rejected")),
+		metadata: Default::default(),
+	};
+
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_raw_backend(BackendWithPolicies {
+			backend: Backend::Opaque(
+				ResourceName::new(strng::format!("{}", mock.address()), "".into()),
+				Target::Address(*mock.address()),
+			),
+			inline_policies: vec![BackendTrafficPolicy::BackendTLS(backend_tls)],
+		})
+		.with_bind(simple_bind())
+		.with_route(basic_route(*mock.address()));
+
+	let res = send_http_version(&t, Version::HTTP_11).await;
+	assert_eq!(res.status(), 503);
+	assert_eq!(mock.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+#[cfg(feature = "crypto-aws-lc")]
 async fn tls_backend_connection_alpn() {
 	let (mock, certs) = tls_mock().await;
 	let backend_tls = agentgateway::http::backendtls::ResolvedBackendTLS {
@@ -285,7 +318,7 @@ async fn tls_backend_connection_alpn() {
 }
 
 #[tokio::test]
-#[cfg(feature = "tls-aws-lc")]
+#[cfg(feature = "crypto-aws-lc")]
 async fn tls_backend_http2_version() {
 	let (mock, certs) = tls_mock().await;
 	let backend_tls = agentgateway::http::backendtls::ResolvedBackendTLS {
@@ -327,7 +360,7 @@ async fn tls_backend_http2_version() {
 }
 
 #[tokio::test]
-#[cfg(feature = "tls-aws-lc")]
+#[cfg(feature = "crypto-aws-lc")]
 async fn tls_backend_http1_version() {
 	let (mock, certs) = tls_mock().await;
 	let backend_tls = agentgateway::http::backendtls::ResolvedBackendTLS {
@@ -369,7 +402,7 @@ async fn tls_backend_http1_version() {
 }
 
 #[tokio::test]
-#[cfg(feature = "tls-aws-lc")]
+#[cfg(feature = "crypto-aws-lc")]
 async fn tls_backend_version_with_alpn() {
 	let (mock, certs) = tls_mock().await;
 	let backend_tls = agentgateway::http::backendtls::ResolvedBackendTLS {
@@ -433,4 +466,148 @@ pub fn route_with_prefix(target: std::net::SocketAddr, prefix: &str) -> Route {
 		query: vec![],
 	}];
 	route
+}
+
+fn tls_passthrough_bind() -> BindSnapshot {
+	BindSnapshot::new(
+		Bind {
+			key: BIND_KEY,
+			address: "127.0.0.1:0".parse().unwrap(),
+			protocol: BindProtocol::tls,
+			tunnel_protocol: Default::default(),
+			mode: Default::default(),
+		},
+		ListenerSet::from_list([Listener {
+			key: LISTENER_KEY,
+			// Use the default gateway name so frontend policies attach to this listener.
+			name: agentgateway::types::agent::ListenerName {
+				gateway_name: strng::literal!("default"),
+				gateway_namespace: strng::literal!("default"),
+				listener_name: strng::EMPTY,
+				listener_set: None,
+			},
+			hostname: strng::new("*.example.com"),
+			// No TLS config: passthrough
+			protocol: ListenerProtocol::TLS(None),
+			..Default::default()
+		}]),
+	)
+}
+
+fn hbone_identity(service_account: &str) -> agentgateway::transport::tls::TlsInfo {
+	agentgateway::transport::tls::TlsInfo {
+		identity: Some(agentgateway::transport::tls::IstioIdentity::new(
+			strng::literal!("cluster.local"),
+			strng::literal!("default"),
+			strng::new(service_account),
+		)),
+		..Default::default()
+	}
+}
+
+/// Start a plain TCP backend that captures the first bytes it receives. For TLS passthrough
+/// the gateway forwards the raw TLS bytes, so on success the backend sees the ClientHello.
+async fn passthrough_capture_backend() -> (std::net::SocketAddr, oneshot::Receiver<Vec<u8>>) {
+	let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = backend.local_addr().unwrap();
+	let (tx, rx) = oneshot::channel();
+	tokio::spawn(async move {
+		if let Ok((mut conn, _)) = backend.accept().await {
+			let mut buf = vec![0u8; 5];
+			if conn.read_exact(&mut buf).await.is_ok() {
+				let _ = tx.send(buf);
+			}
+		}
+	});
+	(addr, rx)
+}
+
+/// Drive a TLS ClientHello from the client side of the duplex. The handshake never completes
+/// (the backend is only a byte sink), we just need the gateway to sniff the SNI, run
+/// authorization, and (on allow) forward the raw bytes.
+fn spawn_client_hello(io: tokio::io::DuplexStream) -> tokio::task::JoinHandle<bool> {
+	let tls: agentgateway::http::backendtls::BackendTLS =
+		agentgateway::http::backendtls::ResolvedBackendTLS {
+			cert: None,
+			key: None,
+			root: Some(include_bytes!("../../../../examples/mcp-tls/certs/ca-cert.pem").to_vec()),
+			hostname: Some("a.example.com".to_string()),
+			insecure: false,
+			insecure_host: true,
+			alpn: None,
+			subject_alt_names: None,
+			key_exchange_groups: None,
+			spiffe: false,
+		}
+		.try_into()
+		.unwrap();
+	tokio::spawn(async move {
+		TlsConnector::from(tls.base_config().config)
+			.connect(ServerName::try_from("a.example.com").unwrap(), io)
+			.await
+			.is_ok()
+	})
+}
+
+/// A TLS passthrough listener must preserve the mTLS identity authenticated by an outer HBONE
+/// layer, so authorization policies asserting on `source.identity` still apply
+/// (https://github.com/agentgateway/agentgateway regression: passthrough dropped the identity).
+#[tokio::test]
+async fn tls_passthrough_preserves_hbone_identity_for_authz() {
+	let (backend_addr, rx) = passthrough_capture_backend().await;
+
+	let mut t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(backend_addr)
+		.with_bind(tls_passthrough_bind())
+		.with_tcp_route(basic_named_tcp_route(strng::format!("/{}", backend_addr)));
+	t.attach_frontend_policy(json!({
+		"networkAuthorization": {
+			"rules": [r#"source.identity.serviceAccount == "test-sa""#],
+		},
+	}))
+	.await;
+
+	let io = t.serve_with_src_identity(BIND_KEY, hbone_identity("test-sa"));
+	let _client = spawn_client_hello(io);
+
+	// The identity matches the policy, so the raw TLS bytes must reach the backend.
+	let first = tokio::time::timeout(Duration::from_secs(5), rx)
+		.await
+		.expect("timed out: passthrough bytes never reached the backend (identity dropped?)")
+		.expect("backend closed without receiving data");
+	assert_eq!(first[0], 0x16, "expected a TLS handshake record");
+}
+
+/// Inverse of the allow test: a non-matching HBONE identity must be denied by the
+/// authorization policy on a TLS passthrough listener.
+#[tokio::test]
+async fn tls_passthrough_hbone_identity_authz_deny() {
+	let (backend_addr, rx) = passthrough_capture_backend().await;
+
+	let mut t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(backend_addr)
+		.with_bind(tls_passthrough_bind())
+		.with_tcp_route(basic_named_tcp_route(strng::format!("/{}", backend_addr)));
+	t.attach_frontend_policy(json!({
+		"networkAuthorization": {
+			"rules": [r#"source.identity.serviceAccount == "test-sa""#],
+		},
+	}))
+	.await;
+
+	let io = t.serve_with_src_identity(BIND_KEY, hbone_identity("other-sa"));
+	let client = spawn_client_hello(io);
+
+	// The gateway denies the connection, so the client's handshake fails...
+	let connected = client.await.unwrap();
+	assert!(!connected, "handshake must fail when authorization denies");
+	// ...and the backend never receives any bytes.
+	assert!(
+		tokio::time::timeout(Duration::from_millis(500), rx)
+			.await
+			.is_err(),
+		"backend must not receive bytes for a denied connection"
+	);
 }

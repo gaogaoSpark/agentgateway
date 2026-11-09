@@ -60,6 +60,12 @@ func InternalBackendKey(backendNamespace, backendName, targetName string) string
 	return name
 }
 
+// InternalTypedBackendKey returns the internal key for a backend Kubernetes resource whose
+// group and kind must be retained to distinguish it from other backend resource types.
+func InternalTypedBackendKey(group, kind, namespace, name string) string {
+	return group + "/" + kind + "/" + namespace + "/" + name
+}
+
 func ListenerName(namespace, name, listener string, listenerSet *api.ResourceName) *api.ListenerName {
 	return &api.ListenerName{
 		GatewayName:      name,
@@ -176,15 +182,25 @@ func RouteTarget[T ~string](namespace, name, kind string, ruleName *T) *api.Poli
 }
 
 func BackendTarget[T ~string](backendNamespace, backendName string, section *T) *api.PolicyTarget_Backend {
-	var ls *string
+	return TypedBackendTarget("", backendNamespace, backendName, section)
+}
+
+// TypedBackendTarget is BackendTarget for backend resources that must be distinguished from other
+// backend resource types sharing the same namespace and name. An empty kind is untyped.
+func TypedBackendTarget[T ~string](kind, backendNamespace, backendName string, section *T) *api.PolicyTarget_Backend {
+	var ls, k *string
 	if section != nil {
 		ls = new((string)(*section))
+	}
+	if kind != "" {
+		k = &kind
 	}
 	return &api.PolicyTarget_Backend{
 		Backend: &api.PolicyTarget_BackendTarget{
 			Name:      backendName,
 			Namespace: backendNamespace,
 			Section:   ls,
+			Kind:      k,
 		},
 	}
 }
@@ -195,11 +211,9 @@ var TypedNamespacedNameIndexCollectionFunc = krt.WithIndexCollectionFromString(f
 		panic("invalid TypedNamespacedName: " + s)
 	}
 	return TypedNamespacedName{
-		NamespacedName: types.NamespacedName{
-			Namespace: parts[1],
-			Name:      parts[2],
-		},
-		Kind: parts[0],
+		Namespace: parts[1],
+		Name:      parts[2],
+		Kind:      parts[0],
 	}
 })
 
@@ -218,10 +232,8 @@ var SectionedNamespacedNameIndexCollectionFunc = krt.WithIndexCollectionFromStri
 		panic("invalid SectionedNamespacedName: " + s)
 	}
 	return SectionedNamespacedName{
-		NamespacedName: types.NamespacedName{
-			Namespace: parts[0],
-			Name:      parts[1],
-		},
+		Namespace:   parts[0],
+		Name:        parts[1],
 		SectionName: gwv1.SectionName(parts[2]),
 	}
 })

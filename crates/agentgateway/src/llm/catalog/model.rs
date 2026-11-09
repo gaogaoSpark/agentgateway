@@ -1,0 +1,1229 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::str::FromStr;
+
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+use super::PricingTier;
+use crate::llm::{Provider as _, vertex};
+
+// Unknown fields are captured rather than denied by serde, so catalogs from newer versions can be
+// loaded leniently. `validate` rejects them for catalogs written for this version.
+pub type Unknown = BTreeMap<String, serde_json::Value>;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+pub struct Catalog {
+	/// Identifies a generated base catalog and when its contents last changed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub metadata: Option<CatalogMetadata>,
+	/// Map of provider name to its supported models and pricing.
+	#[serde(default)]
+	pub providers: BTreeMap<String, Provider>,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	pub unknown: Unknown,
+}
+
+impl Catalog {
+	pub fn validate(&self) -> anyhow::Result<()> {
+		self.check(true)
+	}
+
+	/// Validates a catalog that may come from a newer version. Unknown fields are ignored, except that
+	/// tiers with unknown conditions are dropped since they cannot be applied correctly.
+	pub fn validate_newer(&mut self) -> anyhow::Result<()> {
+		for m in self
+			.providers
+			.values_mut()
+			.flat_map(|p| p.models.values_mut())
+		{
+			m.tiers.retain(|t| t.unknown.is_empty());
+		}
+		self.check(false)
+	}
+
+	fn check(&self, strict: bool) -> anyhow::Result<()> {
+		let reject_unknown = |path: &dyn fmt::Display, unknown: &Unknown| {
+			if strict && let Some(k) = unknown.keys().next() {
+				anyhow::bail!("{path}: unknown field {k:?}");
+			}
+			Ok(())
+		};
+		reject_unknown(&"catalog", &self.unknown)?;
+		if let Some(metadata) = &self.metadata {
+			reject_unknown(&"metadata", &metadata.unknown)?;
+		}
+		for (provider, entry) in &self.providers {
+			reject_unknown(provider, &entry.unknown)?;
+			for (model, pricing) in &entry.models {
+				reject_unknown(&format_args!("{provider}/{model}"), &pricing.unknown)?;
+				for (field, unknown) in [
+					("rates", &pricing.rates.unknown),
+					("limits", &pricing.limits.unknown),
+					("modalities", &pricing.modalities.unknown),
+					("capabilities", &pricing.capabilities.unknown),
+					("reasoning", &pricing.reasoning.unknown),
+				] {
+					reject_unknown(&format_args!("{provider}/{model} {field}"), unknown)?;
+				}
+				if let Some(budget) = &pricing.reasoning.budget_tokens {
+					reject_unknown(
+						&format_args!("{provider}/{model} reasoning budgetTokens"),
+						&budget.unknown,
+					)?;
+				}
+				let mut previous = BTreeMap::new();
+				for (index, tier) in pricing.tiers.iter().enumerate() {
+					reject_unknown(
+						&format_args!("{provider}/{model} tier {index}"),
+						&tier.unknown,
+					)?;
+					reject_unknown(
+						&format_args!("{provider}/{model} tier {index} rates"),
+						&tier.rates.unknown,
+					)?;
+					if let Some(prior) = previous.insert(tier.service_tier, tier.context_over)
+						&& tier.context_over <= prior
+					{
+						anyhow::bail!(
+							"{provider}/{model}: tier {index} contextOver must increase within its serviceTier"
+						);
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+
+	pub fn override_with(mut self, overlay: Catalog) -> Catalog {
+		for (pid, op) in overlay.providers {
+			let base = self.providers.entry(pid).or_default();
+			for (mid, om) in op.models {
+				// Deep-merge per model so an overlay adding only tags keeps the base's costs.
+				let merged = match base.models.remove(&mid) {
+					Some(mut bm) => {
+						bm.rates = bm.rates.overlay(&om.rates);
+						if !om.tiers.is_empty() {
+							// Replace each supplied service tier while preserving other service tiers.
+							bm.tiers
+								.retain(|t| !om.tiers.iter().any(|o| o.service_tier == t.service_tier));
+							bm.tiers.extend(om.tiers);
+						}
+						bm.tags.extend(om.tags);
+						bm.name = om.name.or(bm.name);
+						bm.status = om.status.or(bm.status);
+						bm.released = om.released.or(bm.released);
+						bm.endpoints = om.endpoints.or(bm.endpoints);
+						bm.limits = Limits {
+							context: om.limits.context.or(bm.limits.context),
+							input: om.limits.input.or(bm.limits.input),
+							output: om.limits.output.or(bm.limits.output),
+							unknown: Unknown::new(),
+						};
+						if !om.modalities.input.is_empty() {
+							bm.modalities.input = om.modalities.input;
+						}
+						if !om.modalities.output.is_empty() {
+							bm.modalities.output = om.modalities.output;
+						}
+						bm.capabilities = Capabilities {
+							reasoning: om.capabilities.reasoning.or(bm.capabilities.reasoning),
+							structured_output: om
+								.capabilities
+								.structured_output
+								.or(bm.capabilities.structured_output),
+							tool_call: om.capabilities.tool_call.or(bm.capabilities.tool_call),
+							temperature: om.capabilities.temperature.or(bm.capabilities.temperature),
+							unknown: Unknown::new(),
+						};
+						bm.reasoning.toggle = om.reasoning.toggle.or(bm.reasoning.toggle);
+						if !om.reasoning.effort.is_empty() {
+							bm.reasoning.effort = om.reasoning.effort;
+						}
+						bm.reasoning.budget_tokens =
+							match (om.reasoning.budget_tokens, bm.reasoning.budget_tokens) {
+								(Some(o), Some(b)) => Some(BudgetTokens {
+									min: o.min.or(b.min),
+									max: o.max.or(b.max),
+									unknown: Unknown::new(),
+								}),
+								(o, b) => o.or(b),
+							};
+						bm
+					},
+					None => om,
+				};
+				base.models.insert(mid, merged);
+			}
+		}
+		self
+	}
+
+	pub fn resolve(&self, provider: &str, model: &str) -> Option<&Model> {
+		self.resolve_entry(provider, model).map(|(_, m)| m)
+	}
+
+	/// Like `resolve`, but also returns the catalog model ID that matched.
+	pub fn resolve_entry(&self, provider: &str, model: &str) -> Option<(&String, &Model)> {
+		let models = &self.providers.get(provider)?.models;
+		models.get_key_value(model).or_else(|| {
+			if provider != vertex::Provider::NAME.as_str() {
+				return None;
+			}
+			models.get_key_value(vertex::Provider::canonical_model(model).as_str())
+		})
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogMetadata {
+	/// Legacy provenance field retained for compatibility with older generated catalogs.
+	#[serde(default, skip_serializing)]
+	pub source: Option<String>,
+	/// Time the generated catalog contents last changed.
+	pub generated_at: DateTime<Utc>,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	pub unknown: Unknown,
+}
+
+pub fn from_json(s: &str) -> anyhow::Result<Catalog> {
+	let catalog: Catalog = serde_json::from_str(s)?;
+	catalog.validate()?;
+	Ok(catalog)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+pub struct Provider {
+	/// Map of model ID to its pricing rates and tiers.
+	#[serde(default)]
+	pub models: BTreeMap<String, Model>,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	pub unknown: Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct Model {
+	/// Human-readable display name.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub name: Option<String>,
+	/// Lifecycle stage (alpha, beta, deprecated); absent means generally available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub status: Option<String>,
+	/// Release date, as YYYY-MM-DD or YYYY-MM.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub released: Option<String>,
+	/// Client endpoints the model serves; absent means a chat model.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub endpoints: Option<Vec<String>>,
+	/// Base pricing rates for this model.
+	#[serde(default, skip_serializing_if = "Rates::is_empty")]
+	pub rates: Rates,
+	/// Pricing rules ordered by increasing context threshold within each service tier.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub tiers: Vec<Tier>,
+	/// Freeform capability/routing tags for this model.
+	#[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+	pub tags: BTreeSet<String>,
+	/// Token limits.
+	#[serde(default, skip_serializing_if = "crate::serdes::is_default")]
+	pub limits: Limits,
+	/// Supported input and output modalities.
+	#[serde(default, skip_serializing_if = "crate::serdes::is_default")]
+	pub modalities: Modalities,
+	/// Supported features. Absent fields are unknown.
+	#[serde(default, skip_serializing_if = "crate::serdes::is_default")]
+	pub capabilities: Capabilities,
+	/// How reasoning can be controlled.
+	#[serde(default, skip_serializing_if = "crate::serdes::is_default")]
+	pub reasoning: Reasoning,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	pub unknown: Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ::cel::DynamicType)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct Limits {
+	/// Total context window, shared by input and output.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub context: Option<u64>,
+	/// Maximum input tokens, when tighter than the context window allows.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub input: Option<u64>,
+	/// Maximum output tokens.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub output: Option<u64>,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	#[dynamic(skip)]
+	pub unknown: Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ::cel::DynamicType)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct Modalities {
+	/// Input modalities, such as text, image, pdf, audio, or video.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub input: Vec<String>,
+	/// Output modalities, such as text, image, audio, or video.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub output: Vec<String>,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	#[dynamic(skip)]
+	pub unknown: Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ::cel::DynamicType)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct Capabilities {
+	/// Whether the model supports reasoning.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reasoning: Option<bool>,
+	/// Whether the model supports JSON Schema structured outputs.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[dynamic(rename = "structuredOutput")]
+	pub structured_output: Option<bool>,
+	/// Whether the model supports tool calling.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[dynamic(rename = "toolCall")]
+	pub tool_call: Option<bool>,
+	/// Whether the model accepts the temperature parameter.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub temperature: Option<bool>,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	#[dynamic(skip)]
+	pub unknown: Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ::cel::DynamicType)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct Reasoning {
+	/// Whether reasoning can be turned on and off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub toggle: Option<bool>,
+	/// Accepted effort levels.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub effort: Vec<String>,
+	/// Accepted reasoning token budget range.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[dynamic(rename = "budgetTokens")]
+	pub budget_tokens: Option<BudgetTokens>,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	#[dynamic(skip)]
+	pub unknown: Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ::cel::DynamicType)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetTokens {
+	/// Minimum reasoning token budget.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub min: Option<u64>,
+	/// Maximum reasoning token budget.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub max: Option<u64>,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	#[dynamic(skip)]
+	pub unknown: Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct Rates {
+	/// Cost per 1M input (prompt) tokens.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub input: Option<Money>,
+	/// Cost per 1M output (completion) tokens.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub output: Option<Money>,
+	/// Cost per 1M tokens read from cache.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_read: Option<Money>,
+	/// Cost per 1M tokens written to cache.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_write: Option<Money>,
+	/// Cost per 1M tokens written to cache, keyed by non-default TTL (`1h`, `12h`). TTLs not set fall back to cacheWrite.
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub cache_write_details: BTreeMap<String, Money>,
+	/// Cost per 1M reasoning tokens. Falls back to the output rate if unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reasoning: Option<Money>,
+	/// Cost per 1M input audio tokens. Falls back to the input rate if unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub input_audio: Option<Money>,
+	/// Cost per 1M output audio tokens. Falls back to the output rate if unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub output_audio: Option<Money>,
+	/// Cost per page, for document/OCR models.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub per_page: Option<Money>,
+	/// Cost per minute of input audio, for models billed by duration (such as `whisper-1`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub per_audio_minute: Option<Money>,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	pub unknown: Unknown,
+}
+
+impl Rates {
+	pub fn is_empty(&self) -> bool {
+		*self == Rates::default()
+	}
+
+	pub fn overlay(&self, delta: &Rates) -> Rates {
+		let pick = |base: &Option<Money>, d: &Option<Money>| d.clone().or_else(|| base.clone());
+		Rates {
+			input: pick(&self.input, &delta.input),
+			output: pick(&self.output, &delta.output),
+			cache_read: pick(&self.cache_read, &delta.cache_read),
+			cache_write: pick(&self.cache_write, &delta.cache_write),
+			cache_write_details: self
+				.cache_write_details
+				.iter()
+				.chain(&delta.cache_write_details)
+				.map(|(k, v)| (k.clone(), v.clone()))
+				.collect(),
+			reasoning: pick(&self.reasoning, &delta.reasoning),
+			input_audio: pick(&self.input_audio, &delta.input_audio),
+			output_audio: pick(&self.output_audio, &delta.output_audio),
+			per_page: pick(&self.per_page, &delta.per_page),
+			per_audio_minute: pick(&self.per_audio_minute, &delta.per_audio_minute),
+			unknown: Unknown::new(),
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct Tier {
+	/// Context-token threshold above which this rule applies. Defaults to zero.
+	#[serde(default, skip_serializing_if = "crate::serdes::is_default")]
+	pub context_over: u64,
+	/// Normalized served service tier; absent matches any service tier.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub service_tier: Option<PricingTier>,
+	/// Pricing rates for this tier, overlaid on the base model rates.
+	pub rates: Rates,
+	/// Fields not understood by this version.
+	#[serde(flatten, skip_serializing)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	pub unknown: Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Money(pub Decimal);
+
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Money {
+	fn schema_name() -> std::borrow::Cow<'static, str> {
+		"Money".into()
+	}
+
+	fn json_schema(schema_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+		String::json_schema(schema_gen)
+	}
+}
+
+impl Money {
+	pub fn parse(s: &str) -> Result<Money, String> {
+		let d = Decimal::from_str(s).map_err(|e| format!("invalid decimal {s:?}: {e}"))?;
+		if d < Decimal::ZERO {
+			return Err(format!("negative rate not allowed: {s:?}"));
+		}
+		if d.scale() > 6 {
+			return Err(format!("more than 6 fractional digits: {s:?}"));
+		}
+		Ok(Money(d))
+	}
+}
+
+impl fmt::Display for Money {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{}", self.0)
+	}
+}
+
+impl TryFrom<String> for Money {
+	type Error = String;
+
+	fn try_from(s: String) -> Result<Money, String> {
+		Money::parse(&s)
+	}
+}
+
+impl From<Money> for String {
+	fn from(m: Money) -> String {
+		m.0.to_string()
+	}
+}
+const TOKENS_PER_UNIT: u64 = 1_000_000;
+const MILLIS_PER_MINUTE: u64 = 60_000;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Usage {
+	pub input: u64,
+	pub cache_read: u64,
+	pub cache_write: u64,
+	pub cache_write_1h: u64,
+	pub cache_write_12h: u64,
+	pub output: u64,
+	pub reasoning: u64,
+	pub input_audio: u64,
+	pub output_audio: u64,
+	pub pages: u64,
+	pub audio_millis: u64,
+}
+
+impl Usage {
+	pub fn context_tokens(&self) -> u64 {
+		self
+			.input
+			.saturating_add(self.cache_read)
+			.saturating_add(self.cache_write)
+			.saturating_add(self.cache_write_1h)
+			.saturating_add(self.cache_write_12h)
+			.saturating_add(self.input_audio)
+	}
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Breakdown {
+	pub input: Decimal,
+	pub cache_read: Decimal,
+	pub cache_write: Decimal,
+	pub cache_write_1h: Decimal,
+	pub cache_write_12h: Decimal,
+	pub output: Decimal,
+	pub reasoning: Decimal,
+	pub input_audio: Decimal,
+	pub output_audio: Decimal,
+	pub pages: Decimal,
+	pub audio_duration: Decimal,
+}
+
+impl std::ops::AddAssign for Breakdown {
+	fn add_assign(&mut self, other: Self) {
+		self.input += other.input;
+		self.cache_read += other.cache_read;
+		self.cache_write += other.cache_write;
+		self.cache_write_1h += other.cache_write_1h;
+		self.cache_write_12h += other.cache_write_12h;
+		self.output += other.output;
+		self.reasoning += other.reasoning;
+		self.input_audio += other.input_audio;
+		self.output_audio += other.output_audio;
+		self.pages += other.pages;
+		self.audio_duration += other.audio_duration;
+	}
+}
+
+impl Breakdown {
+	pub fn total(&self) -> Decimal {
+		self.input
+			+ self.cache_read
+			+ self.cache_write
+			+ self.cache_write_1h
+			+ self.cache_write_12h
+			+ self.output
+			+ self.reasoning
+			+ self.input_audio
+			+ self.output_audio
+			+ self.pages
+			+ self.audio_duration
+	}
+}
+
+impl Rates {
+	pub fn breakdown(&self, usage: &Usage) -> Breakdown {
+		let unit = Decimal::from(TOKENS_PER_UNIT);
+		// Audio and reasoning counts are provider-reported subsets of text totals.
+		// If no dedicated modality rate exists, bill them at the text rate.
+		let reasoning_rate = self.reasoning.as_ref().or(self.output.as_ref());
+		let input_audio_rate = self.input_audio.as_ref().or(self.input.as_ref());
+		let output_audio_rate = self.output_audio.as_ref().or(self.output.as_ref());
+		let cache_write_rate = |ttl| {
+			self
+				.cache_write_details
+				.get(ttl)
+				.or(self.cache_write.as_ref())
+		};
+		Breakdown {
+			input: line(usage.input, self.input.as_ref()) / unit,
+			cache_read: line(usage.cache_read, self.cache_read.as_ref()) / unit,
+			cache_write: line(usage.cache_write, self.cache_write.as_ref()) / unit,
+			cache_write_1h: line(usage.cache_write_1h, cache_write_rate("1h")) / unit,
+			cache_write_12h: line(usage.cache_write_12h, cache_write_rate("12h")) / unit,
+			output: line(usage.output, self.output.as_ref()) / unit,
+			reasoning: line(usage.reasoning, reasoning_rate) / unit,
+			input_audio: line(usage.input_audio, input_audio_rate) / unit,
+			output_audio: line(usage.output_audio, output_audio_rate) / unit,
+			pages: line(usage.pages, self.per_page.as_ref()),
+			audio_duration: line(usage.audio_millis, self.per_audio_minute.as_ref())
+				/ Decimal::from(MILLIS_PER_MINUTE),
+		}
+	}
+}
+
+impl Model {
+	#[cfg(test)]
+	pub fn price(&self, usage: &Usage) -> Decimal {
+		self.breakdown(usage).total()
+	}
+
+	#[cfg(test)]
+	pub fn breakdown(&self, usage: &Usage) -> Breakdown {
+		self
+			.effective_rates(usage.context_tokens(), PricingTier::Standard)
+			.breakdown(usage)
+	}
+
+	pub(super) fn effective_rates(&self, context_tokens: u64, service_tier: PricingTier) -> Rates {
+		let select = |service_tier: Option<PricingTier>| {
+			self
+				.tiers
+				.iter()
+				.rev()
+				.find(|tier| tier.service_tier == service_tier && context_tokens > tier.context_over)
+		};
+		// Service-tier rates overlay the context tier, so components a service tier omits use the
+		// context-appropriate standard rate.
+		[select(None), select(Some(service_tier))]
+			.into_iter()
+			.flatten()
+			.fold(self.rates.clone(), |rates, tier| rates.overlay(&tier.rates))
+	}
+}
+
+// count: [tokens|pages] and rate: [per n tokens|per page].
+fn line(count: u64, rate: Option<&Money>) -> Decimal {
+	match rate {
+		Some(Money(r)) => Decimal::from(count) * *r,
+		None => Decimal::ZERO,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn m(s: &str) -> Money {
+		Money::parse(s).unwrap()
+	}
+
+	fn d(s: &str) -> Decimal {
+		Decimal::from_str(s).unwrap()
+	}
+
+	fn entry(rates: Rates, tiers: Vec<Tier>) -> Model {
+		Model {
+			rates,
+			tiers,
+			..Default::default()
+		}
+	}
+
+	fn tier(context_over: u64, rates: Rates) -> Tier {
+		Tier {
+			context_over,
+			service_tier: None,
+			rates,
+			unknown: Unknown::new(),
+		}
+	}
+
+	fn rates(input: &str, output: &str) -> Rates {
+		Rates {
+			input: Some(m(input)),
+			output: Some(m(output)),
+			..Default::default()
+		}
+	}
+
+	const GOLDEN_CATALOG: &str = include_str!("testdata/model_catalog.golden.json");
+
+	#[test]
+	fn contract_parses_and_round_trips() {
+		let catalog = from_json(GOLDEN_CATALOG).expect("golden catalog must parse");
+
+		let reemitted = serde_json::to_string(&catalog).unwrap();
+		let reparsed = from_json(&reemitted).unwrap();
+		assert_eq!(catalog, reparsed);
+
+		let gemini = &catalog.providers["gcp.gemini"].models["gemini-2.5-pro"];
+		assert_eq!(gemini.tiers.len(), 1);
+		assert_eq!(gemini.tiers[0].context_over, 200_000);
+		assert_eq!(
+			gemini.rates.cache_read,
+			Some(Money::parse("0.125").unwrap())
+		);
+
+		let audio = &catalog.providers["openai"].models["gpt-4o-mini-audio-preview"];
+		assert_eq!(audio.rates.input_audio, Some(Money::parse("10").unwrap()));
+		assert_eq!(audio.rates.output_audio, Some(Money::parse("20").unwrap()));
+
+		let anthropic = &catalog.providers["anthropic"].models["claude-sonnet-4-5"];
+		assert_eq!(
+			anthropic.rates.cache_write,
+			Some(Money::parse("3.75").unwrap())
+		);
+
+		let mini = catalog.resolve("openai", "gpt-4o-mini");
+		assert!(mini.is_some(), "OpenAI entry resolves");
+		assert!(
+			!mini
+				.unwrap()
+				.effective_rates(0, PricingTier::Standard)
+				.is_empty(),
+			"and is priced"
+		);
+	}
+
+	#[test]
+	fn unknown_nested_fields_are_rejected() {
+		let err = from_json(
+			r#"{"providers":{"openai":{"models":{"m":{"rates":{"input":"1"},"limits":{"contextWindow":128000}}}}}}"#,
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("unknown field"), "{err}");
+	}
+
+	#[test]
+	fn override_with_deep_merges_and_keeps_costs() {
+		// A later overlay that only adds a tag must not wipe the base model's rates.
+		let base = from_json(
+			r#"{"providers":{"openai":{"models":{"m":{"rates":{"input":"3","output":"6"}}}}}}"#,
+		)
+		.unwrap();
+		let overlay =
+			from_json(r#"{"providers":{"openai":{"models":{"m":{"tags":["preview"]}}}}}"#).unwrap();
+		let merged = base.override_with(overlay);
+		let model = merged.resolve("openai", "m").expect("model survives");
+		assert_eq!(model.rates.input, Some(m("3")), "base cost preserved");
+		assert_eq!(model.rates.output, Some(m("6")));
+		assert!(model.tags.contains("preview"), "overlay tag applied");
+	}
+
+	#[test]
+	fn override_with_merges_reasoning() {
+		let base = from_json(
+			r#"{"providers":{"openai":{"models":{"m":{"reasoning":{"toggle":true,"budgetTokens":{"min":1024,"max":32000}}}}}}}"#,
+		)
+		.unwrap();
+		let overlay = from_json(
+			r#"{"providers":{"openai":{"models":{"m":{"reasoning":{"toggle":false,"budgetTokens":{"min":2048}}}}}}}"#,
+		)
+		.unwrap();
+		let merged = base.override_with(overlay);
+		let reasoning = &merged.resolve("openai", "m").unwrap().reasoning;
+		assert_eq!(reasoning.toggle, Some(false), "explicit false wins");
+		let budget = reasoning.budget_tokens.as_ref().unwrap();
+		assert_eq!((budget.min, budget.max), (Some(2048), Some(32000)));
+	}
+
+	#[test]
+	fn resolve_is_provider_scoped() {
+		let catalog =
+			from_json(r#"{"providers":{"openai":{"models":{"shared":{"rates":{"input":"5"}}}}}}"#)
+				.unwrap();
+		assert!(catalog.resolve("openai", "shared").is_some());
+		assert!(
+			catalog.resolve("custom", "shared").is_none(),
+			"another provider's model does not leak"
+		);
+		assert!(catalog.resolve("openai", "no-such-model").is_none());
+	}
+
+	#[test]
+	fn resolve_vertex_aliases() {
+		let catalog = from_json(
+			r#"{"providers":{
+				"gcp.vertex_ai":{"models":{
+					"gemini-x":{"rates":{"input":"1"}},
+					"claude-x@20250929":{"rates":{"input":"2"}},
+					"google/pinned":{"rates":{"input":"3"}},
+					"pinned":{"rates":{"input":"4"}}
+				}},
+				"openai":{"models":{"gemini-x":{"rates":{"input":"1"}}}}
+			}}"#,
+		)
+		.unwrap();
+		let input = |p, m| catalog.resolve(p, m).and_then(|m| m.rates.input.clone());
+		assert_eq!(input("gcp.vertex_ai", "google/gemini-x"), Some(m("1")));
+		assert_eq!(
+			input("gcp.vertex_ai", "publishers/google/models/gemini-x"),
+			Some(m("1"))
+		);
+		assert_eq!(
+			input("gcp.vertex_ai", "anthropic/claude-x-20250929"),
+			Some(m("2"))
+		);
+		assert_eq!(input("gcp.vertex_ai", "google/pinned"), Some(m("3")));
+		assert_eq!(input("openai", "google/gemini-x"), None);
+	}
+
+	#[test]
+	fn money_is_a_string_not_a_number() {
+		assert_eq!(serde_json::to_string(&m("0.175")).unwrap(), "\"0.175\"");
+		let ok: Rates = serde_json::from_str(r#"{"input": "0.175"}"#).unwrap();
+		assert_eq!(ok.input, Some(m("0.175")));
+		let err = serde_json::from_str::<Rates>(r#"{"input": 0.175}"#).unwrap_err();
+		assert!(err.to_string().contains("string"), "{err}");
+	}
+
+	#[test]
+	fn money_validation() {
+		assert!(Money::parse("-1").is_err(), "negative rejected");
+		assert!(Money::parse("0.1234567").is_err(), ">6 dp rejected");
+		assert!(Money::parse("0").is_ok());
+		assert!(Money::parse("0.123456").is_ok());
+	}
+
+	#[test]
+	fn newer_catalog_ignores_unknown_fields() {
+		let json = r#"{"future":1,"providers":{"openai":{"models":{"m":{
+			"rates":{"input":"1","future":"2"},
+			"tiers":[
+				{"contextOver":100,"rates":{"input":"3","future":"4"}},
+				{"contextOver":100,"region":"us","rates":{"input":"5"}}
+			]}}}}}"#;
+		assert!(from_json(json).is_err());
+		let mut catalog: Catalog = serde_json::from_str(json).unwrap();
+		catalog.validate_newer().unwrap();
+		let expected = from_json(
+			r#"{"providers":{"openai":{"models":{"m":{"rates":{"input":"1"},"tiers":[{"contextOver":100,"rates":{"input":"3"}}]}}}}}"#,
+		)
+		.unwrap();
+		assert_eq!(
+			serde_json::to_value(&catalog).unwrap(),
+			serde_json::to_value(&expected).unwrap()
+		);
+	}
+
+	#[test]
+	fn rates_overlay_prefers_delta() {
+		let base = Rates {
+			input: Some(m("5")),
+			output: Some(m("25")),
+			..Default::default()
+		};
+		let delta = Rates {
+			input: Some(m("6")),
+			..Default::default()
+		};
+		let merged = base.overlay(&delta);
+		assert_eq!(merged.input, Some(m("6")), "delta wins");
+		assert_eq!(
+			merged.output,
+			Some(m("25")),
+			"base kept where delta is absent"
+		);
+	}
+
+	#[test]
+	fn override_merges_fields_and_keeps_siblings() {
+		let base: Catalog = serde_json::from_str(
+			r#"{"providers":{"openai":{"models":{
+					"gpt-5":{"rates":{"input":"1.25","output":"10"}},
+					"gpt-4o":{"rates":{"input":"2.5","output":"10"}}
+				}}}}"#,
+		)
+		.unwrap();
+		let overlay: Catalog = serde_json::from_str(
+			r#"{"providers":{"openai":{"models":{"gpt-5":{"rates":{"output":"8"}}}}}}"#,
+		)
+		.unwrap();
+		let merged = base.override_with(overlay);
+		let gpt5 = &merged.providers["openai"].models["gpt-5"];
+		assert_eq!(gpt5.rates.output, Some(m("8")), "overlay field wins");
+		assert_eq!(
+			gpt5.rates.input,
+			Some(m("1.25")),
+			"base field kept where overlay is absent"
+		);
+		assert_eq!(
+			merged.providers["openai"].models["gpt-4o"].rates.input,
+			Some(m("2.5")),
+			"sibling untouched"
+		);
+	}
+
+	#[test]
+	fn breakdown_components_sum_to_price() {
+		let e = entry(
+			Rates {
+				input: Some(m("3")),
+				output: Some(m("15")),
+				cache_read: Some(m("0.3")),
+				cache_write: Some(m("3.75")),
+				cache_write_details: BTreeMap::from([("1h".into(), m("6")), ("12h".into(), m("7.5"))]),
+				reasoning: Some(m("15")),
+				input_audio: Some(m("40")),
+				output_audio: Some(m("80")),
+				per_page: None,
+				per_audio_minute: None,
+				unknown: Unknown::new(),
+			},
+			vec![],
+		);
+		let u = Usage {
+			input: 1000,
+			cache_read: 2000,
+			cache_write: 500,
+			cache_write_1h: 300,
+			cache_write_12h: 200,
+			output: 500,
+			reasoning: 100,
+			input_audio: 50,
+			output_audio: 25,
+			pages: 0,
+			audio_millis: 0,
+		};
+		let b = e.breakdown(&u);
+		assert_eq!(b.input, d("0.003"));
+		assert_eq!(b.cache_read, d("0.0006"));
+		assert_eq!(b.cache_write, d("0.001875"));
+		assert_eq!(b.cache_write_1h, d("0.0018"));
+		assert_eq!(b.cache_write_12h, d("0.0015"));
+		assert_eq!(b.output, d("0.0075"));
+		assert_eq!(b.reasoning, d("0.0015"));
+		assert_eq!(b.input_audio, d("0.002"));
+		assert_eq!(b.output_audio, d("0.002"));
+		assert_eq!(b.total(), e.price(&u));
+		assert_eq!(b.total(), d("0.021775"));
+	}
+
+	#[test]
+	fn cache_write_1h_falls_back_to_cache_write() {
+		let mut r = rates("3", "15");
+		r.cache_write = Some(m("3.75"));
+		let e = entry(r, vec![]);
+		let b = e.breakdown(&Usage {
+			cache_write_1h: 1000,
+			..Default::default()
+		});
+		assert_eq!(b.cache_write_1h, d("0.00375"));
+	}
+
+	#[test]
+	fn cache_write_details_overlay() {
+		let mut base = rates("3", "15");
+		base.cache_write = Some(m("3.75"));
+		base.cache_write_details.insert("12h".into(), m("7.5"));
+		let delta = Rates {
+			cache_write_details: BTreeMap::from([("1h".into(), m("6"))]),
+			..Default::default()
+		};
+		let r = base.overlay(&delta);
+		assert_eq!(r.cache_write, Some(m("3.75")));
+		assert_eq!(
+			r.cache_write_details,
+			BTreeMap::from([("1h".into(), m("6")), ("12h".into(), m("7.5"))])
+		);
+	}
+
+	#[test]
+	fn absent_modality_rate_falls_back_to_text() {
+		let e = entry(rates("3", "15"), vec![]);
+		let u = Usage {
+			input: 1000,
+			output: 500,
+			reasoning: 2000,
+			input_audio: 100,
+			output_audio: 50,
+			..Default::default()
+		};
+		let b = e.breakdown(&u);
+		assert_eq!(
+			b.reasoning,
+			d("0.03"),
+			"reasoning falls back to output rate"
+		);
+		assert_eq!(
+			b.input_audio,
+			d("0.0003"),
+			"input audio falls back to input rate"
+		);
+		assert_eq!(
+			b.output_audio,
+			d("0.00075"),
+			"output audio falls back to output rate"
+		);
+	}
+
+	#[test]
+	fn absent_cache_rate_is_not_charged() {
+		let e = entry(rates("3", "15"), vec![]);
+		let u = Usage {
+			input: 1000,
+			cache_read: 5000,
+			..Default::default()
+		};
+		let b = e.breakdown(&u);
+		assert_eq!(b.cache_read, Decimal::ZERO, "no cache rate -> not billed");
+	}
+
+	#[test]
+	fn tier_reprices_the_whole_request() {
+		let e = entry(rates("1.25", "10"), vec![tier(200_000, rates("2.5", "15"))]);
+		let usage = |input| Usage {
+			input,
+			output: 1000,
+			..Default::default()
+		};
+		assert_eq!(e.price(&usage(100_000)), d("0.135"), "below threshold");
+		assert_eq!(
+			e.price(&usage(200_000)),
+			d("0.26"),
+			"exact threshold stays base"
+		);
+		assert_eq!(
+			e.price(&usage(250_000)),
+			d("0.64"),
+			"above threshold whole-request reprice"
+		);
+	}
+
+	#[test]
+	fn legacy_context_tiers_select_highest_threshold() {
+		let e = entry(
+			Rates {
+				input: Some(m("1")),
+				..Default::default()
+			},
+			vec![
+				tier(
+					100_000,
+					Rates {
+						input: Some(m("2")),
+						..Default::default()
+					},
+				),
+				tier(
+					500_000,
+					Rates {
+						input: Some(m("4")),
+						..Default::default()
+					},
+				),
+			],
+		);
+		let u = Usage {
+			input: 600_000,
+			..Default::default()
+		};
+		assert_eq!(e.price(&u), d("2.4"));
+	}
+
+	#[test]
+	fn validates_rule_order() {
+		let catalog = |tiers: &str| {
+			from_json(&format!(
+				r#"{{"providers":{{"openai":{{"models":{{"m":{{"tiers":[{tiers}]}}}}}}}}}}"#
+			))
+		};
+		assert!(catalog(r#"{"contextOver":100,"rates":{}},{"contextOver":200,"rates":{}}"#).is_ok());
+		assert!(catalog(r#"{"contextOver":200,"rates":{}},{"contextOver":100,"rates":{}}"#).is_err());
+		assert!(
+			catalog(
+				r#"{"serviceTier":"flex","rates":{}},{"serviceTier":"flex","contextOver":200,"rates":{}}"#
+			)
+			.is_ok()
+		);
+		assert!(
+			catalog(
+				r#"{"serviceTier":"flex","contextOver":200,"rates":{}},{"serviceTier":"flex","rates":{}}"#
+			)
+			.is_err()
+		);
+	}
+
+	#[test]
+	fn tier_omitted_component_falls_back_to_base() {
+		let e = entry(
+			rates("1.25", "10"),
+			vec![tier(
+				200_000,
+				Rates {
+					input: Some(m("2.5")),
+					..Default::default()
+				},
+			)],
+		);
+		let u = Usage {
+			input: 250_000,
+			output: 1000,
+			..Default::default()
+		};
+		let b = e.breakdown(&u);
+		assert_eq!(b.input, d("0.625"));
+		assert_eq!(
+			b.output,
+			d("0.01"),
+			"omitted output falls back to base rate"
+		);
+	}
+
+	#[test]
+	fn has_pricing_depends_on_effective_tier() {
+		let input_rate = Rates {
+			input: Some(m("1")),
+			..Default::default()
+		};
+		assert!(
+			entry(Rates::default(), vec![])
+				.effective_rates(0, PricingTier::Standard)
+				.is_empty()
+		);
+		assert!(
+			!entry(input_rate.clone(), vec![])
+				.effective_rates(0, PricingTier::Standard)
+				.is_empty()
+		);
+
+		let tier_only = entry(Rates::default(), vec![tier(100_000, input_rate)]);
+		assert!(
+			tier_only
+				.effective_rates(100_000, PricingTier::Standard)
+				.is_empty()
+		);
+		assert!(
+			!tier_only
+				.effective_rates(100_001, PricingTier::Standard)
+				.is_empty()
+		);
+
+		assert!(
+			entry(Rates::default(), vec![tier(100_000, Rates::default())])
+				.effective_rates(100_001, PricingTier::Standard)
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn sub_micro_amounts_are_exact() {
+		let e = entry(
+			Rates {
+				input: Some(m("0.075")),
+				..Default::default()
+			},
+			vec![],
+		);
+		let u = Usage {
+			input: 333,
+			..Default::default()
+		};
+		assert_eq!(e.price(&u), d("0.000024975"));
+	}
+
+	fn page_rate(price: &str) -> Rates {
+		Rates {
+			per_page: Some(m(price)),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn page_rate_is_priced_per_page_not_per_million() {
+		let b = entry(page_rate("0.005"), vec![]).breakdown(&Usage {
+			pages: 4,
+			..Default::default()
+		});
+		assert_eq!(b.pages, d("0.02"), "a perPage rate is not divided by 1M");
+		assert_eq!(b.total(), d("0.02"));
+	}
+
+	#[test]
+	fn audio_rate_is_priced_per_minute() {
+		let r = Rates {
+			per_audio_minute: Some(m("0.006")),
+			..Default::default()
+		};
+		let b = entry(r, vec![]).breakdown(&Usage {
+			audio_millis: 90_000,
+			..Default::default()
+		});
+		assert_eq!(b.audio_duration, d("0.009"));
+		assert_eq!(b.total(), d("0.009"));
+	}
+
+	#[test]
+	fn page_and_token_pricing_do_not_leak_into_each_other() {
+		// A token-priced model is unaffected by a page count it has no rate for.
+		let b = entry(rates("3", "15"), vec![]).breakdown(&Usage {
+			input: 1000,
+			pages: 4,
+			..Default::default()
+		});
+		assert_eq!(b.pages, Decimal::ZERO, "no page rate -> pages not billed");
+		assert_eq!(b.total(), d("0.003"), "token cost unchanged by page count");
+
+		// And a page-priced model does not bill tokens.
+		let b = entry(page_rate("0.005"), vec![]).breakdown(&Usage {
+			input: 1000,
+			output: 500,
+			..Default::default()
+		});
+		assert_eq!(b.total(), Decimal::ZERO);
+	}
+
+	#[test]
+	fn per_page_rate_round_trips_through_json() {
+		let json = r#"{"providers":{"mistral":{"models":{"ocr":{"rates":{"perPage":"0.005"}}}}}}"#;
+		let c = super::from_json(json).unwrap();
+		let model = &c.providers["mistral"].models["ocr"];
+		assert_eq!(model.rates.per_page, Some(m("0.005")));
+		assert_eq!(serde_json::to_string(&c).unwrap(), json);
+	}
+
+	#[test]
+	fn tier_can_override_the_page_rate() {
+		let overlaid = page_rate("0.005").overlay(&page_rate("0.004"));
+		assert_eq!(overlaid.per_page, Some(m("0.004")));
+		// An overlay that sets no page rate keeps the base one.
+		let kept = page_rate("0.005").overlay(&rates("3", "15"));
+		assert_eq!(kept.per_page, Some(m("0.005")));
+	}
+}

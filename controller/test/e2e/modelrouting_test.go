@@ -3,14 +3,18 @@
 package e2e_test
 
 import (
+	"encoding/base64"
 	"net/http"
 	"testing"
 
 	"github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/agentgateway/agentgateway/controller/pkg/utils/requestutils/curl"
 	"github.com/agentgateway/agentgateway/controller/test/e2e/base"
+	"github.com/agentgateway/agentgateway/controller/test/e2e/testutils/assertions"
 	testmatchers "github.com/agentgateway/agentgateway/controller/test/gomega/matchers"
 )
 
@@ -28,8 +32,14 @@ func TestAgentgatewayModelRouting(tt *testing.T) {
 
 	gw := modelRoutingGateway(t)
 
+	t.Run("Status", func(t base.Test) {
+		testAgentgatewayModelStatus(t)
+	})
 	t.Run("Visibility", func(t base.Test) {
 		testAgentgatewayModelVisibility(t, gw)
+	})
+	t.Run("GatewayBoundModelsUseDefaultRoute", func(t base.Test) {
+		testGatewayBoundModelsUseDefaultRoute(t, gw)
 	})
 	t.Run("WeightedVirtualModel", func(t base.Test) {
 		testAgentgatewayModelWeightedRouting(t, gw)
@@ -43,6 +53,22 @@ func TestAgentgatewayModelRouting(tt *testing.T) {
 	t.Run("FailoverVirtualModel", func(t base.Test) {
 		testAgentgatewayModelFailoverRouting(t, gw)
 	})
+	t.Run("FailoverVirtualModelAuthorization", func(t base.Test) {
+		testAgentgatewayModelFailoverAuthorization(t, gw)
+	})
+	t.Run("PathScopedModelRoute", func(t base.Test) {
+		testPathScopedModelRoute(t, gw)
+	})
+	t.Run("MultiplePathScopedModelRoutes", func(t base.Test) {
+		testMultiplePathScopedModelRoutes(t, gw)
+	})
+}
+
+func testAgentgatewayModelStatus(t base.Test) {
+	assertions.EventuallyAgentgatewayModelCondition(t, "public-direct", modelRoutingNamespace, gwv1.RouteConditionAccepted, metav1.ConditionTrue)
+	assertions.EventuallyAgentgatewayModelCondition(t, "public-direct", modelRoutingNamespace, gwv1.RouteConditionResolvedRefs, metav1.ConditionTrue)
+	assertions.EventuallyAgentgatewayModelCondition(t, "invalid-target", modelRoutingNamespace, gwv1.RouteConditionAccepted, metav1.ConditionTrue)
+	assertions.EventuallyAgentgatewayModelCondition(t, "invalid-target", modelRoutingNamespace, gwv1.RouteConditionResolvedRefs, metav1.ConditionFalse)
 }
 
 func testAgentgatewayModelVisibility(t base.Test, gw base.Gateway) {
@@ -69,6 +95,44 @@ func testAgentgatewayModelVisibility(t base.Test, gw base.Gateway) {
 			Body:       gomega.ContainSubstring(`model_not_found`),
 		},
 		modelRoutingCompletion("internal-fast")...,
+	)
+}
+
+// A model bound directly to a Gateway listener must work without an HTTPRoute.
+// This is the default path for users who do not need path-scoped model sets.
+func testGatewayBoundModelsUseDefaultRoute(t base.Test, gw base.Gateway) {
+	gw.Send(
+		t,
+		&testmatchers.HttpResponse{
+			StatusCode: http.StatusOK,
+			Body:       gomega.ContainSubstring(`"id":"public-direct"`),
+		},
+		curl.WithPath("/v1/models"),
+	)
+
+	gw.Send(
+		t,
+		modelRoutingExpectModel("agw-public-direct"),
+		modelRoutingCompletion("public-direct")...,
+	)
+
+	// This model has transformations; they must preserve the Messages route format.
+	expected := modelRoutingExpectModel("agw-public-direct")
+	expected.Body = gomega.And(
+		gomega.ContainSubstring(`"type":"message"`),
+		gomega.ContainSubstring(`"content":[{"type":"text","text":"The name of this project is agentgateway"}]`),
+		gomega.ContainSubstring(`"stop_reason":"end_turn"`),
+		gomega.ContainSubstring(`"input_tokens":10`),
+		gomega.ContainSubstring(`"output_tokens":10`),
+		gomega.Not(gomega.ContainSubstring(`"choices"`)),
+	)
+	gw.Send(
+		t,
+		expected,
+		curl.WithPath("/v1/messages"),
+		curl.WithPostBody(`{"model":"public-direct","max_tokens":128,"messages":[{"role":"user","content":[{"type":"text","text":"What is the name of this project?"}]}]}`),
+		curl.WithHeader("Content-Type", "application/json"),
+		curl.WithHeader("anthropic-version", "2023-06-01"),
 	)
 }
 
@@ -112,6 +176,113 @@ func testAgentgatewayModelFailoverRouting(t base.Test, gw base.Gateway) {
 	)
 }
 
+func testAgentgatewayModelFailoverAuthorization(t base.Test, gw base.Gateway) {
+	gw.Send(
+		t,
+		base.ExpectForbidden(gomega.ContainSubstring("authorization failed")),
+		modelRoutingCompletion("protected-resilient")...,
+	)
+
+	gw.Send(
+		t,
+		modelRoutingExpectModel("agw-protected-fallback"),
+		append(
+			modelRoutingCompletion("protected-resilient"),
+			curl.WithHeader("x-model-access", "allowed"),
+		)...,
+	)
+}
+
+func testPathScopedModelRoute(t base.Test, gw base.Gateway) {
+	t.HTTPRouteAccepted("scoped-models", modelRoutingNamespace)
+
+	gw.Send(
+		t,
+		base.Expect(http.StatusUnauthorized),
+		curl.WithPath("/scoped/v1/models"),
+	)
+	gw.Send(
+		t,
+		base.Expect(http.StatusUnauthorized),
+		append(
+			modelRoutingCompletion("scoped-model"),
+			curl.WithPath("/scoped/v1/chat/completions"),
+		)...,
+	)
+
+	gw.Send(
+		t,
+		&testmatchers.HttpResponse{
+			StatusCode: http.StatusOK,
+			Body: gomega.And(
+				gomega.ContainSubstring(`"id":"scoped-model"`),
+				gomega.Not(gomega.ContainSubstring(`"id":"tenant-a-model"`)),
+			),
+		},
+		curl.WithPath("/scoped/v1/models"),
+		curl.WithHeader("Authorization", basicAuthHeader("scoped", "alicepassword")),
+	)
+
+	gw.Send(
+		t,
+		modelRoutingExpectModel("agw-scoped-model"),
+		append(
+			modelRoutingCompletion("scoped-model"),
+			curl.WithPath("/scoped/v1/chat/completions"),
+			curl.WithHeader("Authorization", basicAuthHeader("scoped", "alicepassword")),
+		)...,
+	)
+}
+
+func testMultiplePathScopedModelRoutes(t base.Test, gw base.Gateway) {
+	t.HTTPRouteAccepted("tenant-a-models", modelRoutingNamespace)
+	t.HTTPRouteAccepted("tenant-b-models", modelRoutingNamespace)
+
+	for _, tt := range []struct {
+		path          string
+		user          string
+		password      string
+		model         string
+		otherModel    string
+		upstreamModel string
+	}{
+		{"/tenant-a", "tenant-a", "alicepassword", "tenant-a-model", "tenant-b-model", "agw-tenant-a-model"},
+		{"/tenant-b", "tenant-b", "bobpassword", "tenant-b-model", "tenant-a-model", "agw-tenant-b-model"},
+	} {
+		t.Run(tt.model, func(t base.Test) {
+			gw.Send(
+				t,
+				&testmatchers.HttpResponse{
+					StatusCode: http.StatusOK,
+					Body: gomega.And(
+						gomega.ContainSubstring(`"id":"`+tt.model+`"`),
+						gomega.Not(gomega.ContainSubstring(`"id":"`+tt.otherModel+`"`)),
+					),
+				},
+				curl.WithPath(tt.path+"/v1/models"),
+				curl.WithHeader("Authorization", basicAuthHeader(tt.user, tt.password)),
+			)
+
+			gw.Send(
+				t,
+				modelRoutingExpectModel(tt.upstreamModel),
+				append(
+					modelRoutingCompletion(tt.model),
+					curl.WithPath(tt.path+"/v1/chat/completions"),
+					curl.WithHeader("Authorization", basicAuthHeader(tt.user, tt.password)),
+				)...,
+			)
+		})
+	}
+
+	gw.Send(
+		t,
+		base.Expect(http.StatusUnauthorized),
+		curl.WithPath("/tenant-a/v1/models"),
+		curl.WithHeader("Authorization", basicAuthHeader("tenant-b", "bobpassword")),
+	)
+}
+
 func modelRoutingGateway(t base.Test) base.Gateway {
 	name := types.NamespacedName{Name: modelRoutingGatewayName, Namespace: modelRoutingNamespace}
 	return base.Gateway{
@@ -137,4 +308,8 @@ func modelRoutingExpectModel(selectedModel string) *testmatchers.HttpResponse {
 			"x-agw-response-model": "gpt-4o-mini",
 		},
 	}
+}
+
+func basicAuthHeader(username, password string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
 }

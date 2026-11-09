@@ -1,3 +1,4 @@
+use http_body_util::BodyExt;
 use secrecy::SecretString;
 use serde_json::Map;
 
@@ -5,6 +6,33 @@ use super::*;
 use crate::http::jwt::Claims;
 use crate::llm::bedrock::AwsRegion;
 use crate::test_helpers::proxymock::setup_proxy_test;
+
+#[rstest::rstest]
+#[case::normal(100, Duration::from_secs(300), Duration::from_secs(10), 90, 400)]
+#[case::fractional_lifetime(100, Duration::from_millis(1500), Duration::from_secs(10), 90, 102)]
+#[case::issued_at_underflow(5, Duration::from_secs(30), Duration::from_secs(10), 0, 35)]
+fn test_jwt_claim_times(
+	#[case] now: u64,
+	#[case] lifetime: Duration,
+	#[case] issued_at_backdate: Duration,
+	#[case] expected_issued_at: u64,
+	#[case] expected_expires_at: u64,
+) {
+	assert_eq!(
+		jwt_claim_times(now, lifetime, issued_at_backdate).unwrap(),
+		JwtClaimTimes {
+			issued_at: expected_issued_at,
+			expires_at: expected_expires_at,
+		}
+	);
+}
+
+#[rstest::rstest]
+#[case::timestamp(u64::MAX, Duration::from_secs(1))]
+#[case::rounded_lifetime(1, Duration::new(u64::MAX, 1))]
+fn test_jwt_claim_times_rejects_expiration_overflow(#[case] now: u64, #[case] lifetime: Duration) {
+	assert!(jwt_claim_times(now, lifetime, Duration::from_secs(10)).is_err());
+}
 
 #[test]
 fn test_aws_auth_deserializes_assume_role() {
@@ -23,6 +51,41 @@ fn test_aws_auth_deserializes_assume_role() {
 			}
 		),
 		"expected implicit AWS auth with assume role"
+	);
+}
+
+#[test]
+fn test_aws_auth_deserializes_assume_role_with_external_id() {
+	let implicit: AwsAuth = serde_json::from_value(serde_json::json!({
+		"assumeRole": {
+			"roleArn": "arn:aws:iam::123456789012:role/backend",
+			"externalId": "tenant-a:prod/12345"
+		}
+	}))
+	.expect("should deserialize assume role with external id");
+	match implicit {
+		AwsAuth::Implicit {
+			assume_role: Some(ar),
+			..
+		} => assert_eq!(ar.external_id.as_deref(), Some("tenant-a:prod/12345")),
+		_ => panic!("expected implicit AWS auth with assume role"),
+	}
+}
+
+#[rstest::rstest]
+#[case::too_short("a")]
+#[case::too_long(&"a".repeat(1225))]
+#[case::bad_charset("tenant a")]
+fn test_aws_auth_rejects_invalid_external_id(#[case] external_id: &str) {
+	let result: Result<AwsAuth, _> = serde_json::from_value(serde_json::json!({
+		"assumeRole": {
+			"roleArn": "arn:aws:iam::123456789012:role/backend",
+			"externalId": external_id
+		}
+	}));
+	assert!(
+		result.is_err(),
+		"external id {external_id:?} should be rejected"
 	);
 }
 
@@ -280,7 +343,7 @@ fn test_authorization_location_expression_extracts_from_cel() {
 #[test]
 fn test_authorization_location_expression_deserializes_flat_expression() {
 	let location: AuthorizationLocation =
-		crate::serdes::yamlviajson::from_str(r#"expression: 'request.headers["authorization"]'"#)
+		crate::serdes::yaml::from_str(r#"expression: 'request.headers["authorization"]'"#)
 			.expect("expression location should deserialize");
 
 	let expression = location
@@ -327,6 +390,7 @@ async fn test_backend_auth_passthrough_happy_path() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
@@ -359,12 +423,13 @@ async fn test_backend_auth_key() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
 
 	let key_auth = BackendAuth::new(BackendAuthKind::Key {
-		value: SecretString::new("my-secret-key".into()),
+		value: SecretString::new("my-secret-key".into()).into(),
 		location: None,
 	});
 	apply_backend_auth(&backend_info, &key_auth, &mut req)
@@ -394,12 +459,13 @@ async fn test_backend_auth_key_query_parameter() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
 
 	let key_auth = BackendAuth::new(BackendAuthKind::Key {
-		value: SecretString::new("my-secret-key".into()),
+		value: SecretString::new("my-secret-key".into()).into(),
 		location: Some(AuthorizationLocation::QueryParameter { name: "key".into() }),
 	});
 	apply_backend_auth(&backend_info, &key_auth, &mut req)
@@ -425,12 +491,13 @@ async fn test_backend_auth_key_default_sets_non_explicit_extension() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
 
 	let key_auth = BackendAuth::new(BackendAuthKind::Key {
-		value: SecretString::new("my-secret-key".into()),
+		value: SecretString::new("my-secret-key".into()).into(),
 		location: None,
 	});
 	apply_backend_auth(&backend_info, &key_auth, &mut req)
@@ -460,12 +527,13 @@ async fn test_backend_auth_key_explicit_location_sets_explicit_extension() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
 
 	let key_auth = BackendAuth::new(BackendAuthKind::Key {
-		value: SecretString::new("my-secret-key".into()),
+		value: SecretString::new("my-secret-key".into()).into(),
 		location: Some(AuthorizationLocation::bearer_header()),
 	});
 	apply_backend_auth(&backend_info, &key_auth, &mut req)
@@ -500,14 +568,23 @@ async fn test_aws_sign_request_explicit_region() {
 
 	// Should use the explicit region and attempt signing
 	// Will fail on credentials but should not fail on region
-	aws::sign_request(&mut req, &aws_auth)
+	aws::sign_request(&crate::test_helpers::test_client(), &mut req, &aws_auth)
 		.await
 		.expect("signing failed");
-	// get the signature header
+	// Assert on the credential scope rather than the whole header: the signature
+	// covers `x-amz-date`, which comes from the wall clock, so two signings that
+	// straddle a UTC second boundary legitimately differ.
 	let auth = req
 		.headers()
 		.get(http::header::AUTHORIZATION)
-		.expect("authorization header must be set");
+		.expect("authorization header must be set")
+		.to_str()
+		.unwrap()
+		.to_string();
+	assert!(
+		auth.contains("/us-west-2/bedrock/"),
+		"credential scope must use the explicit region: {auth}"
+	);
 
 	// Part 2
 	// now, repeat with adefault region to make sure explicit region takes precedence
@@ -524,16 +601,26 @@ async fn test_aws_sign_request_explicit_region() {
 
 	// Should use the explicit region and attempt signing
 	// Will fail on credentials but should not fail on region
-	aws::sign_request(&mut req, &aws_auth)
+	aws::sign_request(&crate::test_helpers::test_client(), &mut req, &aws_auth)
 		.await
 		.expect("signing failed");
 	// get the signature header
 	let auth2 = req
 		.headers()
 		.get(http::header::AUTHORIZATION)
-		.expect("authorization header must be set");
+		.expect("authorization header must be set")
+		.to_str()
+		.unwrap()
+		.to_string();
 
-	assert_eq!(auth, auth2, "Signatures should match with explicit region");
+	assert!(
+		auth2.contains("/us-west-2/bedrock/"),
+		"explicit region must win over the AwsRegion extension: {auth2}"
+	);
+	assert!(
+		!auth2.contains("eu-central-1"),
+		"the extension region must not be used when a region is configured: {auth2}"
+	);
 }
 
 #[tokio::test]
@@ -559,45 +646,9 @@ async fn test_aws_sign_requestallback() {
 	});
 
 	// Should use the default region in the extension
-	aws::sign_request(&mut req, &aws_auth)
+	aws::sign_request(&crate::test_helpers::test_client(), &mut req, &aws_auth)
 		.await
 		.expect("signing failed");
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_aws_sign_request_no_region_error() {
-	unsafe {
-		// prevent loading from default profile on developer's laptops, so this test passes consistently.
-		std::env::set_var("AWS_PROFILE", "/dev/null");
-	}
-
-	// Test AWS signing fails with clear error when no region available
-	let mut req = crate::http::Request::new(crate::http::Body::empty());
-	*req.uri_mut() = "https://bedrock-runtime.amazonaws.com/model/invoke"
-		.parse()
-		.unwrap();
-	*req.method_mut() = http::Method::POST;
-
-	let aws_auth = AwsAuth::ExplicitConfig {
-		access_key_id: SecretString::new("AKIAIOSFODNN7EXAMPLE".into()),
-		secret_access_key: SecretString::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into()),
-		region: None, // No region in config
-		session_token: None,
-		service_name: None,
-	};
-
-	// No default region in request extensions.
-
-	// Should fail with specific "Region must be specified" error
-	let result = aws::sign_request(&mut req, &aws_auth).await;
-	assert!(result.is_err(), "Should fail without region");
-
-	let err = result.unwrap_err().to_string();
-	assert!(
-		err.contains("No region found in AWS config or request extensions"),
-		"Error should mention missing region, got: {}",
-		err
-	);
 }
 
 #[tokio::test]
@@ -633,7 +684,7 @@ async fn test_aws_sign_request_implicit_with_extension() {
 	};
 
 	// Should use region from request extensions
-	let result = aws::sign_request(&mut req, &aws_auth).await;
+	let result = aws::sign_request(&crate::test_helpers::test_client(), &mut req, &aws_auth).await;
 
 	// Clean up environment variables
 	unsafe {
@@ -676,7 +727,7 @@ async fn test_aws_sign_request_implicit_configured_region_wins() {
 		assume_role_cache: Default::default(),
 	};
 
-	let result = aws::sign_request(&mut req, &aws_auth).await;
+	let result = aws::sign_request(&crate::test_helpers::test_client(), &mut req, &aws_auth).await;
 
 	unsafe {
 		std::env::remove_var("AWS_ACCESS_KEY_ID");
@@ -829,7 +880,7 @@ fn credential(name: &'static str, value: &str, prefix: Option<&str>) -> BackendA
 			name: ::http::HeaderName::from_static(name),
 			prefix: prefix.map(Into::into),
 		},
-		key: SecretString::new(value.to_string().into()),
+		source: BackendAuthCredentialSource::Key(SecretString::new(value.to_string().into()).into()),
 	}
 }
 
@@ -844,6 +895,7 @@ async fn test_backend_auth_credentials_only_injects_all() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
@@ -887,6 +939,7 @@ async fn test_backend_auth_credential_with_prefix() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
@@ -921,13 +974,14 @@ async fn test_backend_auth_credential_query_parameter() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
 
 	let credentials = vec![BackendAuthCredential {
 		location: AuthorizationLocation::QueryParameter { name: "key".into() },
-		key: SecretString::new("my-secret-key".into()),
+		source: BackendAuthCredentialSource::Key(SecretString::new("my-secret-key".into()).into()),
 	}];
 
 	let auth = BackendAuth {
@@ -945,6 +999,136 @@ async fn test_backend_auth_credential_query_parameter() {
 }
 
 #[tokio::test]
+async fn test_backend_auth_gcp_credential_failure_rejects_request() {
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	req.headers_mut().insert(
+		::http::header::AUTHORIZATION,
+		::http::HeaderValue::from_static("Bearer caller-token"),
+	);
+	let t = setup_proxy_test("{}").expect("setup proxy inputs");
+	let backend_info = BackendInfo {
+		call_target: Target::Address("0.0.0.0:80".parse().unwrap()),
+		target: BackendTarget::Backend {
+			name: Default::default(),
+			namespace: Default::default(),
+			section: None,
+			kind: None,
+		},
+		inputs: t.inputs(),
+	};
+	let auth = BackendAuth {
+		kind: None,
+		credentials: vec![BackendAuthCredential {
+			location: AuthorizationLocation::Header {
+				name: ::http::header::PROXY_AUTHORIZATION,
+				prefix: Some("Bearer ".into()),
+			},
+			source: BackendAuthCredentialSource::Gcp(GcpAuth::IdToken {
+				r#type: gcp::IdToken,
+				audience: Some("iap-client-id".to_string()),
+				credential: Some(gcp::GcpCredential::new_invalid(
+					"invalid credential".to_string(),
+				)),
+			}),
+		}],
+	};
+
+	let err = apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect_err("a failed gcp credential must reject the request");
+	assert!(matches!(
+		err,
+		ProxyError::BackendAuthenticationFailed(BackendAuthError::Local(_))
+	));
+	assert!(
+		req
+			.headers()
+			.get(::http::header::PROXY_AUTHORIZATION)
+			.is_none()
+	);
+	assert_eq!(
+		req.headers().get(::http::header::AUTHORIZATION).unwrap(),
+		"Bearer caller-token"
+	);
+}
+
+#[tokio::test]
+async fn test_backend_auth_gcp_credential_alongside_passthrough() {
+	use wiremock::matchers::{method, path};
+	use wiremock::{Mock, MockServer, ResponseTemplate};
+
+	let id_token = "gcp.id.token";
+	let server = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/token"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+			"access_token": "gcp-access-token",
+			"id_token": id_token,
+			"expires_in": 3600,
+			"token_type": "Bearer",
+		})))
+		.expect(1..)
+		.mount(&server)
+		.await;
+	let credential = serde_json::json!({
+		"type": "authorized_user",
+		"client_id": "client-id",
+		"client_secret": "client-secret",
+		"refresh_token": "refresh-token",
+		"token_uri": format!("{}/token", server.uri()),
+	});
+
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	req.extensions_mut().insert(Claims {
+		inner: Map::new(),
+		jwt: SecretString::new("header.payload.signature".into()),
+	});
+	let t = setup_proxy_test("{}").expect("setup proxy inputs");
+	let backend_info = BackendInfo {
+		call_target: Target::Address("0.0.0.0:80".parse().unwrap()),
+		target: BackendTarget::Backend {
+			name: Default::default(),
+			namespace: Default::default(),
+			section: None,
+			kind: None,
+		},
+		inputs: t.inputs(),
+	};
+	let auth = BackendAuth {
+		kind: Some(BackendAuthKind::Passthrough { location: None }),
+		credentials: vec![BackendAuthCredential {
+			location: AuthorizationLocation::Header {
+				name: ::http::header::PROXY_AUTHORIZATION,
+				prefix: Some("Bearer ".into()),
+			},
+			source: BackendAuthCredentialSource::Gcp(GcpAuth::IdToken {
+				r#type: gcp::IdToken,
+				audience: Some("iap-client-id".to_string()),
+				credential: Some(
+					gcp::GcpCredential::new(SecretString::from(credential.to_string()))
+						.expect("valid credential"),
+				),
+			}),
+		}],
+	};
+
+	apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect("apply backend auth");
+
+	let proxy_auth = req
+		.headers()
+		.get(::http::header::PROXY_AUTHORIZATION)
+		.expect("Proxy-Authorization must be set");
+	assert_eq!(proxy_auth.to_str().unwrap(), format!("Bearer {id_token}"));
+	assert!(proxy_auth.is_sensitive());
+	assert_eq!(
+		req.headers().get(::http::header::AUTHORIZATION).unwrap(),
+		"Bearer header.payload.signature"
+	);
+}
+
+#[tokio::test]
 async fn test_backend_auth_combined_key_and_credentials() {
 	let mut req = crate::http::Request::new(crate::http::Body::empty());
 	let t = setup_proxy_test("{}").expect("setup proxy inputs");
@@ -955,13 +1139,14 @@ async fn test_backend_auth_combined_key_and_credentials() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
 
 	let auth = BackendAuth {
 		kind: Some(BackendAuthKind::Key {
-			value: SecretString::new("primary".into()),
+			value: SecretString::new("primary".into()).into(),
 			location: None,
 		}),
 		credentials: vec![credential("x-auth-email", "user@example.com", None)],
@@ -983,7 +1168,7 @@ async fn test_backend_auth_combined_key_and_credentials() {
 }
 
 #[tokio::test]
-async fn test_backend_auth_credentials_invalid_value_errors() {
+async fn test_backend_auth_credentials_invalid_value_is_local() {
 	let mut req = crate::http::Request::new(crate::http::Body::empty());
 	let t = setup_proxy_test("{}").expect("setup proxy inputs");
 	let inputs = t.inputs();
@@ -993,6 +1178,7 @@ async fn test_backend_auth_credentials_invalid_value_errors() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
@@ -1002,15 +1188,68 @@ async fn test_backend_auth_credentials_invalid_value_errors() {
 		kind: None,
 		credentials: vec![credential("x-bad", "value\nwith\nnewlines", None)],
 	};
-	let err = apply_backend_auth(&backend_info, &auth, &mut req).await;
-	assert!(err.is_err(), "invalid header value must error");
+	let err = apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect_err("invalid header value must error");
+	assert!(matches!(
+		&err,
+		ProxyError::BackendAuthenticationFailed(BackendAuthError::Local(_))
+	));
+	assert_eq!(
+		err.into_response_with_grpc(false).status(),
+		http::StatusCode::INTERNAL_SERVER_ERROR
+	);
+}
+
+#[tokio::test]
+async fn test_invalid_backend_auth_rejects_without_changing_request() {
+	let mut req = ::http::Request::builder()
+		.header(http::header::AUTHORIZATION, "Bearer subj")
+		.body(crate::http::Body::empty())
+		.unwrap();
+	let t = setup_proxy_test("{}").expect("setup proxy inputs");
+	let backend_info = BackendInfo {
+		call_target: Target::Address("0.0.0.0:80".parse().unwrap()),
+		target: BackendTarget::Backend {
+			name: Default::default(),
+			namespace: Default::default(),
+			section: None,
+			kind: None,
+		},
+		inputs: t.inputs(),
+	};
+	let reason = "missing Secret default/oauth-client";
+	let auth = BackendAuth {
+		kind: Some(BackendAuthKind::Invalid {
+			kind: "oauthTokenExchange",
+			reason: reason.to_string(),
+		}),
+		credentials: vec![credential("x-extra", "v", None)],
+	};
+
+	let err = apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect_err("invalid backend auth must reject");
+
+	assert!(matches!(
+		&err,
+		ProxyError::BackendAuthenticationFailed(BackendAuthError::Local(_))
+	));
+	let message = err.to_string();
+	assert!(message.contains("oauthTokenExchange configuration is invalid"));
+	assert!(!message.contains(reason));
+	assert_eq!(
+		req.headers().get(http::header::AUTHORIZATION).unwrap(),
+		"Bearer subj"
+	);
+	assert!(req.headers().get("x-extra").is_none());
 }
 
 #[test]
 fn test_apply_tunnel_auth_rejects_credentials() {
 	let auth = BackendAuth {
 		kind: Some(BackendAuthKind::Key {
-			value: SecretString::new("primary".into()),
+			value: SecretString::new("primary".into()).into(),
 			location: None,
 		}),
 		credentials: vec![credential("x-extra", "v", None)],
@@ -1028,10 +1267,10 @@ fn test_backend_auth_serde_backward_compat_no_credentials() {
 	use crate::types::agent::BackendTrafficPolicy;
 
 	let policy = BackendTrafficPolicy::backend_auth(BackendAuthKind::Key {
-		value: SecretString::new("primary".into()),
+		value: SecretString::new("primary".into()).into(),
 		location: None,
 	});
-	let yaml = serde_yaml::to_string(&policy).expect("serialize");
+	let yaml = serde_norway::to_string(&policy).expect("serialize");
 	assert!(
 		yaml.contains("backendAuth")
 			&& yaml.contains("key:")
@@ -1047,12 +1286,12 @@ fn test_backend_auth_serde_with_credentials_includes_field() {
 
 	let policy = BackendTrafficPolicy::BackendAuth(BackendAuth {
 		kind: Some(BackendAuthKind::Key {
-			value: SecretString::new("primary".into()),
+			value: SecretString::new("primary".into()).into(),
 			location: None,
 		}),
 		credentials: vec![credential("x-extra", "v", None)],
 	});
-	let yaml = serde_yaml::to_string(&policy).expect("serialize");
+	let yaml = serde_norway::to_string(&policy).expect("serialize");
 	assert!(
 		yaml.contains("credentials:") && yaml.contains("x-extra"),
 		"credentials should appear in serialized output: {yaml}"
@@ -1070,6 +1309,7 @@ async fn test_backend_auth_credential_authorization_marks_explicit() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
@@ -1102,13 +1342,14 @@ async fn test_backend_auth_credential_other_header_keeps_primary_marker() {
 			name: Default::default(),
 			namespace: Default::default(),
 			section: None,
+			kind: None,
 		},
 		inputs,
 	};
 
 	let auth = BackendAuth {
 		kind: Some(BackendAuthKind::Key {
-			value: SecretString::new("primary".into()),
+			value: SecretString::new("primary".into()).into(),
 			location: None,
 		}),
 		credentials: vec![credential("x-api-key", "v", None)],
@@ -1125,5 +1366,535 @@ async fn test_backend_auth_credential_other_header_keeps_primary_marker() {
 	assert!(
 		!applied.explicit,
 		"non-Authorization credentials must not override the primary marker"
+	);
+}
+
+const TEST_JWT_SIGN_EC_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgltxBTVDLg7C6vE1T
+7OtwJIZ/dpm8ygE2MBTjPCY3hgahRANCAARYzu50EeBrT0rELmTGroaGtn0zdjxL
+1lOGr9fGw5wOGcXO0+Gn5F5sIxGyTM0FwnUHFNz2SoixZR5dtxhNc+Lo
+-----END PRIVATE KEY-----
+";
+
+const TEST_JWT_SIGN_RSA_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDcmuLma5j1MBQs
+yXsGn15tsQEjEQusgFfVahUxPIFdyI0X60Hfv89rYVClkxOFI92GA63XDu5Ez6jO
+wyPQm1CBzhgZ7eQG42hCP48iqUR23E3Cfamszxol7aOg8bWTMLfmElfPB+vwEXEZ
+951s6eVQet7e+4I1Nu6+kAayrxz8YFLkF0tGyj74566q9w9s6HuA6tvJ6e8xhT3D
+ARdj1VT91WdHw5lzS/0vXDuUv3wXUp1nAyUvfsBRqGTxqXDvhmm6FBiUi6kmZs6u
+5xtH+klGTbNzT2UedemtBgHURZ8R/mDxasclzzZEUoZ29upnvoO0s8cQ9GraHPqK
+FFA2sppBAgMBAAECggEAAh+PY9Ts+Y3qUUuphoDi3gDZSjvlHCaGdeVb5avTsc4r
+AbwV59IxBBtJRTU0F7zOil5TYlusZlsWcJJFMFIo3013SttY1apDWfkiMsTs3c0h
+Nlgq2ZD7GyqpR6yg5Q0v1XAHcmSk2CxGTa/19ucNygFrPwueG06Tc+AHcPmFkJ4l
+BO/bGAGn/dXo4ZwV7jXlBrvG7nQYYmwsqexvrzoLV3PK49pA7JilsLKRYg4c15H/
+EbB1RF1KT1MDSRgXqH47ekmlmzg8kvGUOSvrynG4lxeoNOPNQXsz/u1NXOoetWmg
+ufy7gsJqgjNVbDUo/zh2UlL7Nc48z8ghkNW4KbuIoQKBgQD38aTLFZuXMy40wfcf
+6UMpemtwcO8JVPxMHA8+AwCv9J10LIkft3VVOYUB4pkSoG/jxuyglORa4Km9xlvx
+enIm5Ylun7DNB4G3q+BFsiwxECh1IgKqHbCVAH1jwz00xY07r6TMELLDdxBogMQA
+nJkaF7WGHDP/lGaDlRpDabCz4QKBgQDjxdebekxFLjTd576xNfjNneuF4zxhhenk
+tsun3/7wZdyihm12NJlyg9uuromH5FogcdK76/byeiKDXE6zqaFA7rGKkfslGYtK
+yEXLM7ZdLfdc6h9oKLMtr3GiBjvyGrDVDj9hWKNYywOXlaZoU41kunV+vmo0jSb1
+ZEqFwyyyYQKBgAFV4t5ZKnJhCzGrjco1NnBlwWhko1T4iTdbu1VJLNrFxYdXqhFq
+qo4f9jBxaQOpq5CdhK7EvooixadJBzvAvhapi9j1sT0ZekBkA5w8fnJxNNaUrVD/
+QfE7hHFiHtVG7yDQLGIRAPV+ka8Oan/aWBTE5exoAHuy7+5rgi20xwfhAoGBAN8b
+1SU7t2fwaeKPdS/agTrPnHuKaYPRi5j4ISbwd6V88ZDVgnVN8pzEYjSKTLcqy8mK
+FPT0nvFHB3WKvqCn4Qdch9YHRm1BxzpaUFtJ7TD6rJl7z4XUkCaI+xLNbnyo/lvD
+1/t/uoloWr1p3hXE+fQX3K1o0VlmhinKsmCyHJ8hAoGBANe5tdFqvZl5hxe2G4uW
+BGd4xBvRmuztIN0KtWOi959fWJGkZi2F9tu9asaYDh47jSz7553+p1lfYjur2Zrl
+BqOQbiy+bEAngKRBgRq14YeIynwV30uCXnItBN8RTevsrrQy5bcyQ6/Xqnzr3P9v
+ehBAQUBIgwI9zUaXIhEw8jNW
+-----END PRIVATE KEY-----
+";
+
+fn jwt_sign_auth(
+	kid: Option<String>,
+	ttl: Option<std::time::Duration>,
+	location: Option<AuthorizationLocation>,
+) -> BackendAuth {
+	let claims = [
+		("iss".to_string(), "ACCT.USER.SHA256:fp".into()),
+		("sub".to_string(), "ACCT.USER".into()),
+	]
+	.into_iter()
+	.collect();
+	BackendAuth::new(BackendAuthKind::JwtSign(Box::new(
+		JwtSignAuth::try_new(
+			TEST_JWT_SIGN_EC_KEY,
+			JwtSigningAlg::Es256,
+			kid,
+			claims,
+			ttl,
+			location,
+		)
+		.expect("jwt sign auth should build"),
+	)))
+}
+
+fn decode_jwt_parts(token: &str) -> (serde_json::Value, serde_json::Value) {
+	use base64::Engine;
+	use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+
+	let parts: Vec<&str> = token.split('.').collect();
+	assert_eq!(parts.len(), 3, "expected a JWS compact serialization");
+	let header: serde_json::Value =
+		serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+	let payload: serde_json::Value =
+		serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+	(header, payload)
+}
+
+#[tokio::test]
+async fn test_backend_auth_jwt_sign() {
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	let t = setup_proxy_test("{}").expect("setup proxy inputs");
+	let inputs = t.inputs();
+
+	let backend_info = BackendInfo {
+		call_target: Target::Address("0.0.0.0:80".parse().unwrap()),
+		target: BackendTarget::Backend {
+			name: Default::default(),
+			namespace: Default::default(),
+			section: None,
+			kind: None,
+		},
+		inputs,
+	};
+
+	let auth = jwt_sign_auth(
+		Some("kid-1".to_string()),
+		Some(std::time::Duration::from_secs(600)),
+		None,
+	);
+	apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect("apply backend auth");
+
+	let header_value = req
+		.headers()
+		.get(http::header::AUTHORIZATION)
+		.expect("authorization header must be set");
+	assert!(header_value.is_sensitive());
+	let token = header_value
+		.to_str()
+		.unwrap()
+		.strip_prefix("Bearer ")
+		.expect("default location must use a Bearer prefix");
+
+	let (header, payload) = decode_jwt_parts(token);
+	assert_eq!(header["alg"], "ES256");
+	assert_eq!(header["kid"], "kid-1");
+	assert_eq!(payload["iss"], "ACCT.USER.SHA256:fp");
+	assert_eq!(payload["sub"], "ACCT.USER");
+	let iat = payload["iat"].as_u64().expect("iat must be set");
+	let exp = payload["exp"].as_u64().expect("exp must be set");
+	// The lifetime starts at signing time while iat is backdated by 10s.
+	assert_eq!(exp - iat, 600 + 10);
+	assert!(
+		payload.get("nbf").is_none(),
+		"nbf must not be emitted; iat already conveys the issue time"
+	);
+
+	let ext = req
+		.extensions()
+		.get::<AppliedBackendAuthLocation>()
+		.expect("extension must be set");
+	assert!(
+		!ext.explicit,
+		"a defaulted jwtSign location must retain normal backend-auth semantics"
+	);
+}
+
+#[tokio::test]
+async fn test_backend_auth_jwt_sign_explicit_location() {
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	req.headers_mut().insert(
+		http::header::AUTHORIZATION,
+		http::HeaderValue::from_static("Bearer client-supplied-token"),
+	);
+	let t = setup_proxy_test("{}").expect("setup proxy inputs");
+	let inputs = t.inputs();
+
+	let backend_info = BackendInfo {
+		call_target: Target::Address("0.0.0.0:80".parse().unwrap()),
+		target: BackendTarget::Backend {
+			name: Default::default(),
+			namespace: Default::default(),
+			section: None,
+			kind: None,
+		},
+		inputs,
+	};
+
+	let auth = jwt_sign_auth(
+		None,
+		None,
+		Some(AuthorizationLocation::Header {
+			name: http::HeaderName::from_static("x-signed-jwt"),
+			prefix: None,
+		}),
+	);
+	apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect("apply backend auth");
+
+	let header_value = req
+		.headers()
+		.get("x-signed-jwt")
+		.expect("custom header must be set");
+	let (header, payload) = decode_jwt_parts(header_value.to_str().unwrap());
+	assert_eq!(header["alg"], "ES256");
+	assert!(header.get("kid").is_none_or(|kid| kid.is_null()));
+	// Default 300s lifetime starts at signing time; iat is backdated 10s.
+	let iat = payload["iat"].as_u64().unwrap();
+	let exp = payload["exp"].as_u64().unwrap();
+	assert_eq!(exp - iat, 300 + 10);
+	assert!(payload.get("nbf").is_none());
+
+	assert_eq!(
+		req.headers().get(http::header::AUTHORIZATION),
+		Some(&http::HeaderValue::from_static(
+			"Bearer client-supplied-token"
+		)),
+		"a custom jwtSign location must not remove unrelated Authorization credentials"
+	);
+
+	let ext = req
+		.extensions()
+		.get::<AppliedBackendAuthLocation>()
+		.expect("extension must be set");
+	assert!(ext.explicit, "explicit location must be marked explicit");
+}
+
+#[test]
+fn test_jwt_sign_rejects_reserved_claims_and_allows_empty_claims() {
+	let reserved = JwtSignAuth::try_new(
+		TEST_JWT_SIGN_EC_KEY,
+		JwtSigningAlg::Es256,
+		None,
+		[("exp".to_string(), "123".into())].into_iter().collect(),
+		None,
+		None,
+	);
+	assert!(
+		reserved.is_err_and(|e| e.contains("exp")),
+		"reserved claims must be rejected"
+	);
+
+	let reserved_nbf = JwtSignAuth::try_new(
+		TEST_JWT_SIGN_EC_KEY,
+		JwtSigningAlg::Es256,
+		None,
+		[("nbf".to_string(), "123".into())].into_iter().collect(),
+		None,
+		None,
+	);
+	assert!(
+		reserved_nbf.is_err_and(|e| e.contains("nbf")),
+		"reserved claims must be rejected"
+	);
+
+	let reserved_iat = JwtSignAuth::try_new(
+		TEST_JWT_SIGN_EC_KEY,
+		JwtSigningAlg::Es256,
+		None,
+		[("iat".to_string(), "123".into())].into_iter().collect(),
+		None,
+		None,
+	);
+	assert!(
+		reserved_iat.is_err_and(|e| e.contains("iat")),
+		"reserved claims must be rejected"
+	);
+
+	let empty = JwtSignAuth::try_new(
+		TEST_JWT_SIGN_EC_KEY,
+		JwtSigningAlg::Es256,
+		None,
+		Default::default(),
+		None,
+		None,
+	);
+	assert!(empty.is_ok(), "signer-generated claims are sufficient");
+}
+
+#[test]
+fn test_jwt_sign_rejects_zero_ttl_and_bad_key() {
+	let claims: std::collections::BTreeMap<String, serde_json::Value> =
+		[("iss".to_string(), "me".into())].into_iter().collect();
+
+	let zero_ttl = JwtSignAuth::try_new(
+		TEST_JWT_SIGN_EC_KEY,
+		JwtSigningAlg::Es256,
+		None,
+		claims.clone(),
+		Some(std::time::Duration::ZERO),
+		None,
+	);
+	assert!(zero_ttl.is_err(), "zero ttl must be rejected");
+
+	// Sub-second TTLs truncate to zero seconds and would mint tokens with
+	// exp == iat, so they must be rejected too.
+	let sub_second_ttl = JwtSignAuth::try_new(
+		TEST_JWT_SIGN_EC_KEY,
+		JwtSigningAlg::Es256,
+		None,
+		claims.clone(),
+		Some(std::time::Duration::from_millis(500)),
+		None,
+	);
+	assert!(sub_second_ttl.is_err(), "sub-second ttl must be rejected");
+
+	let bad_key = JwtSignAuth::try_new("not a pem", JwtSigningAlg::Es256, None, claims, None, None);
+	assert!(bad_key.is_err(), "invalid PEM must be rejected");
+}
+
+#[tokio::test]
+async fn test_backend_auth_jwt_sign_rounds_up_sub_second_ttl() {
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	let t = setup_proxy_test("{}").expect("setup proxy inputs");
+	let inputs = t.inputs();
+
+	let backend_info = BackendInfo {
+		call_target: Target::Address("0.0.0.0:80".parse().unwrap()),
+		target: BackendTarget::Backend {
+			name: Default::default(),
+			namespace: Default::default(),
+			section: None,
+			kind: None,
+		},
+		inputs,
+	};
+
+	let auth = jwt_sign_auth(None, Some(std::time::Duration::from_millis(1500)), None);
+	apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect("apply backend auth");
+
+	let token = req
+		.headers()
+		.get(http::header::AUTHORIZATION)
+		.expect("authorization header must be set")
+		.to_str()
+		.unwrap()
+		.strip_prefix("Bearer ")
+		.expect("default location must use a Bearer prefix");
+	let (_, payload) = decode_jwt_parts(token);
+	let iat = payload["iat"].as_u64().expect("iat must be set");
+	let exp = payload["exp"].as_u64().expect("exp must be set");
+	assert_eq!(
+		exp - iat,
+		2 + 10,
+		"a 1500ms ttl must round up to 2s and iat must be backdated by 10s"
+	);
+}
+
+#[tokio::test]
+async fn test_jwt_sign_deserializes() {
+	let local: jwt_sign::LocalJwtSignAuth = serde_json::from_value(serde_json::json!({
+		"signingKey": TEST_JWT_SIGN_EC_KEY,
+		"alg": "ES256",
+		"kid": "kid-1",
+		"claims": {"iss": "acct.user", "sub": "acct.user"},
+		"ttl": "600s",
+		"location": {"header": {"name": "x-signed-jwt"}}
+	}))
+	.expect("jwtSign auth should deserialize");
+	let resources = crate::resource_manager::ResourceFetcher::files_only();
+	let auth = local
+		.try_into(&resources)
+		.await
+		.expect("jwtSign auth should resolve");
+	assert!(auth.location().is_some());
+}
+
+#[test]
+fn test_jwt_sign_serialization_preserves_fractional_ttl() {
+	let auth = jwt_sign_auth(None, Some(std::time::Duration::from_millis(1500)), None);
+	let value = serde_json::to_value(&auth).expect("jwtSign auth should serialize");
+	assert_eq!(value["jwtSign"]["ttl"], "1.5s");
+}
+
+#[tokio::test]
+async fn test_invalid_jwt_sign_rejects_before_request_mutation() {
+	const DIAGNOSTIC_MARKER: &str = "secret default/private-signing-key not found";
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	req.headers_mut().insert(
+		http::header::AUTHORIZATION,
+		http::HeaderValue::from_static("Bearer client-supplied-token"),
+	);
+	let t = setup_proxy_test("{}").expect("setup proxy inputs");
+	let backend_info = BackendInfo {
+		call_target: Target::Address("0.0.0.0:80".parse().unwrap()),
+		target: BackendTarget::Backend {
+			name: Default::default(),
+			namespace: Default::default(),
+			section: None,
+			kind: None,
+		},
+		inputs: t.inputs(),
+	};
+	let auth = BackendAuth {
+		kind: Some(BackendAuthKind::JwtSign(Box::new(
+			JwtSignAuth::new_invalid(DIAGNOSTIC_MARKER.to_string()),
+		))),
+		credentials: vec![credential("x-api-key", "secondary-credential", None)],
+	};
+
+	let err = apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect_err("invalid jwtSign must reject the request");
+	assert!(matches!(err, ProxyError::BackendAuthenticationFailed(_)));
+	assert_eq!(
+		req.headers().get(http::header::AUTHORIZATION),
+		Some(&http::HeaderValue::from_static(
+			"Bearer client-supplied-token"
+		))
+	);
+	assert!(
+		req.headers().get("x-api-key").is_none(),
+		"additional credentials must not be applied after jwtSign rejects"
+	);
+
+	let rendered = err.to_string();
+	assert!(rendered.contains("jwtSign configuration is invalid"));
+	assert!(
+		!rendered.contains(DIAGNOSTIC_MARKER),
+		"client-facing error leaked the translation diagnostic: {rendered}"
+	);
+	let response = err.into_response_with_grpc(false);
+	let body = response
+		.into_body()
+		.collect()
+		.await
+		.expect("error response body should collect")
+		.to_bytes();
+	let body = String::from_utf8(body.to_vec()).expect("error response should be UTF-8");
+	assert!(
+		!body.contains(DIAGNOSTIC_MARKER),
+		"client-facing response leaked the translation diagnostic: {body}"
+	);
+}
+
+#[test]
+fn test_invalid_jwt_sign_serializes_only_translation_error() {
+	let auth = JwtSignAuth::new_invalid("recognizable diagnostic".to_string());
+	assert_eq!(
+		serde_json::to_value(auth).expect("invalid jwtSign should serialize"),
+		serde_json::json!({"translationError": "recognizable diagnostic"})
+	);
+}
+
+#[tokio::test]
+async fn test_backend_auth_jwt_sign_rsa() {
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	let t = setup_proxy_test("{}").expect("setup proxy inputs");
+	let inputs = t.inputs();
+
+	let backend_info = BackendInfo {
+		call_target: Target::Address("0.0.0.0:80".parse().unwrap()),
+		target: BackendTarget::Backend {
+			name: Default::default(),
+			namespace: Default::default(),
+			section: None,
+			kind: None,
+		},
+		inputs,
+	};
+
+	let auth = BackendAuth::new(BackendAuthKind::JwtSign(Box::new(
+		JwtSignAuth::try_new(
+			TEST_JWT_SIGN_RSA_KEY,
+			JwtSigningAlg::Rs256,
+			None,
+			[
+				("iss".to_string(), "acct.user".into()),
+				("aud".to_string(), serde_json::json!(["svc-a", "svc-b"])),
+				("lifetime".to_string(), serde_json::json!(3600)),
+			]
+			.into_iter()
+			.collect(),
+			None,
+			None,
+		)
+		.expect("rsa jwt sign auth should build"),
+	)));
+	apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect("apply backend auth");
+
+	let token = req
+		.headers()
+		.get(http::header::AUTHORIZATION)
+		.expect("authorization header must be set")
+		.to_str()
+		.unwrap()
+		.strip_prefix("Bearer ")
+		.expect("default location must use a Bearer prefix");
+	let (header, payload) = decode_jwt_parts(token);
+	assert_eq!(header["alg"], "RS256");
+	assert_eq!(payload["iss"], "acct.user");
+	assert_eq!(payload["aud"], serde_json::json!(["svc-a", "svc-b"]));
+	assert_eq!(payload["lifetime"], 3600);
+}
+
+#[tokio::test]
+async fn test_backend_auth_jwt_sign_rejects_ttl_that_overflows_exp() {
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	let t = setup_proxy_test("{}").expect("setup proxy inputs");
+	let inputs = t.inputs();
+
+	let backend_info = BackendInfo {
+		call_target: Target::Address("0.0.0.0:80".parse().unwrap()),
+		target: BackendTarget::Backend {
+			name: Default::default(),
+			namespace: Default::default(),
+			section: None,
+			kind: None,
+		},
+		inputs,
+	};
+
+	let auth = jwt_sign_auth(None, Some(std::time::Duration::from_secs(u64::MAX)), None);
+	let err = apply_backend_auth(&backend_info, &auth, &mut req)
+		.await
+		.expect_err("a ttl that overflows the exp timestamp must be rejected");
+	assert!(
+		err.to_string().contains("overflows"),
+		"unexpected error: {err}"
+	);
+}
+
+#[tokio::test]
+async fn test_local_jwt_sign_resolves_file_key_into_runtime_auth() {
+	crate::crypto::jwt::init();
+	let dir = tempfile::tempdir().unwrap();
+	let key_path = dir.path().join("signing.pem");
+	std::fs::write(&key_path, TEST_JWT_SIGN_EC_KEY).unwrap();
+
+	let local: jwt_sign::LocalJwtSignAuth = serde_json::from_value(serde_json::json!({
+		"signingKey": {"file": key_path},
+		"alg": "ES256",
+		"claims": {"iss": "acct.user"}
+	}))
+	.expect("file-based jwtSign auth should deserialize without reading the file");
+
+	let resources = crate::resource_manager::ResourceFetcher::files_only();
+	let auth = local
+		.try_into(&resources)
+		.await
+		.expect("conversion should load and parse the file key");
+	auth.sign().expect("resolved runtime auth must sign");
+}
+
+#[test]
+fn test_jwt_sign_rejects_unknown_field() {
+	let result: Result<jwt_sign::LocalJwtSignAuth, _> = serde_json::from_value(serde_json::json!({
+		"signingKey": TEST_JWT_SIGN_EC_KEY,
+		"claims": {"iss": "acct.user"},
+		"notAField": "oops"
+	}));
+	assert!(
+		result.is_err(),
+		"unknown fields in jwtSign config must be rejected"
 	);
 }
