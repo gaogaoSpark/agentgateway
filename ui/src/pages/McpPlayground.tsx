@@ -66,20 +66,20 @@ export function McpPlaygroundPage() {
 			: false;
 	const fileCorsOwned = Boolean(
 		mcpData.rawConfig.data?.mcp?.policies &&
-			Object.prototype.hasOwnProperty.call(mcpData.rawConfig.data.mcp.policies, 'cors')
+			Object.hasOwn(mcpData.rawConfig.data.mcp.policies, 'cors')
 	);
 
 	useEffect(() => {
 		localStorage.removeItem('mcpPlaygroundArgs');
 	}, []);
 
-	useEffect(() => {
-		if (selectedTool?.inputSchema) {
-			setArgumentValues(defaultArgumentsFromSchema(selectedTool.inputSchema));
-		} else {
-			setArgumentValues({});
-		}
-	}, [selectedTool?.name, selectedTool?.inputSchema]);
+	const [argumentTool, setArgumentTool] = useState(selectedTool);
+	if (argumentTool !== selectedTool) {
+		setArgumentTool(selectedTool);
+		setArgumentValues(
+			selectedTool?.inputSchema ? defaultArgumentsFromSchema(selectedTool.inputSchema) : {}
+		);
+	}
 
 	async function initialize() {
 		setLoading('initialize');
@@ -167,7 +167,7 @@ export function McpPlaygroundPage() {
 		<div className="page-stack">
 			<PageHeader
 				title="MCP Playground"
-				description="Initialize a gateway MCP session, list tools, and call a tool through the MCP listener."
+				description="List and call tools through the MCP gateway."
 			/>
 			{needsCors ? (
 				<StatusBanner
@@ -543,6 +543,8 @@ function McpResultView(props: { response: McpResponse }) {
 		payload && typeof payload === 'object' ? (payload as { result?: unknown }).result : undefined;
 	const error =
 		payload && typeof payload === 'object' ? (payload as { error?: unknown }).error : undefined;
+	const toolError =
+		result && typeof result === 'object' && (result as { isError?: unknown }).isError === true;
 	const tools = extractMcpTools(props.response.body);
 	const content =
 		result && typeof result === 'object' && Array.isArray((result as { content?: unknown }).content)
@@ -556,8 +558,8 @@ function McpResultView(props: { response: McpResponse }) {
 	return (
 		<div className="mcp-result-view">
 			<div className="mcp-result-status">
-				<span className={error ? 'badge bad' : 'badge ok'}>
-					{error ? 'error' : `HTTP ${props.response.status}`}
+				<span className={error || toolError ? 'badge bad' : 'badge ok'}>
+					{error ? 'error' : toolError ? 'tool error' : `HTTP ${props.response.status}`}
 				</span>
 				{props.response.sessionId ? <span className="mono">{props.response.sessionId}</span> : null}
 			</div>
@@ -583,8 +585,9 @@ function McpResultView(props: { response: McpResponse }) {
 				</div>
 			) : content.length > 0 || structuredContent !== undefined ? (
 				<div className="mcp-result-card">
-					<strong>Tool output</strong>
+					<strong>{toolError ? 'Tool error' : 'Tool output'}</strong>
 					{content.map((item, index) => (
+						// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
 						<ContentBlock block={item} key={index} />
 					))}
 					{structuredContent !== undefined ? (
@@ -596,7 +599,7 @@ function McpResultView(props: { response: McpResponse }) {
 				</div>
 			) : (
 				<div className="mcp-result-card">
-					<strong>Response</strong>
+					<strong>{toolError ? 'Tool error' : 'Response'}</strong>
 					<JsonBlock value={result ?? props.response.body} />
 				</div>
 			)}

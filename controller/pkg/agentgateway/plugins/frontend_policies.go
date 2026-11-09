@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 
-	"istio.io/istio/pkg/ptr"
-
 	"github.com/agentgateway/agentgateway/api"
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
 	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
@@ -139,6 +137,13 @@ func translateFrontendTracing(ctx PolicyCtx, policy *agentgateway.AgentgatewayPo
 		})
 	}
 
+	var parentNotSampled *string
+	if tracing.ParentNotSampled != nil {
+		parentNotSampled = castCELPtr(tracing.ParentNotSampled, func(expr agentgateway.CELExpression) {
+			errs = append(errs, fmt.Errorf("frontend tracing parentNotSampled is not a valid CEL expression: %s", expr))
+		})
+	}
+
 	var filter *string
 	if tracing.Filter != nil {
 		filter = castCELPtr(tracing.Filter, func(expr agentgateway.CELExpression) {
@@ -161,7 +166,7 @@ func translateFrontendTracing(ctx PolicyCtx, policy *agentgateway.AgentgatewayPo
 	case agentgateway.OTLPProtocolHttp:
 		protocol = api.FrontendPolicySpec_Tracing_HTTP
 	default:
-		// default to HTTP
+		// Default to GRPC.
 		protocol = api.FrontendPolicySpec_Tracing_GRPC
 	}
 	if parsedURL != nil && parsedURL.EscapedPath() != "" && protocol != api.FrontendPolicySpec_Tracing_HTTP {
@@ -174,16 +179,17 @@ func translateFrontendTracing(ctx PolicyCtx, policy *agentgateway.AgentgatewayPo
 		Kind: &api.Policy_Frontend{
 			Frontend: &api.FrontendPolicySpec{
 				Kind: &api.FrontendPolicySpec_Tracing_{Tracing: &api.FrontendPolicySpec_Tracing{
-					ProviderBackend: provider,
-					InlinePolicies:  inlinePolicies,
-					Attributes:      addAttributes,
-					Remove:          rmAttributes,
-					Resources:       addResources,
-					Protocol:        protocol,
-					Path:            path,
-					RandomSampling:  randomSampling,
-					ClientSampling:  clientSampling,
-					Filter:          filter,
+					ProviderBackend:  provider,
+					InlinePolicies:   inlinePolicies,
+					Attributes:       addAttributes,
+					Remove:           rmAttributes,
+					Resources:        addResources,
+					Protocol:         protocol,
+					Path:             path,
+					RandomSampling:   randomSampling,
+					ClientSampling:   clientSampling,
+					ParentNotSampled: parentNotSampled,
+					Filter:           filter,
 				}},
 			},
 		},
@@ -200,6 +206,12 @@ func translateFrontendAccessLog(ctx PolicyCtx, policy *agentgateway.Agentgateway
 	logging := policy.Spec.Frontend.AccessLog
 	spec := &api.FrontendPolicySpec_Logging{}
 	var errs []error
+	if preset := logging.Preset; preset != nil {
+		switch *preset {
+		case agentgateway.AccessLogPresetOtel:
+			spec.Preset = api.FrontendPolicySpec_Logging_OTEL
+		}
+	}
 	if f := logging.Filter; f != nil {
 		spec.Filter = castCELPtr(f, func(expr agentgateway.CELExpression) {
 			errs = append(errs, fmt.Errorf("frontend accessLog filter is not a valid CEL expression: %s", expr))
@@ -470,9 +482,9 @@ func translateFrontendTLS(policy *agentgateway.AgentgatewayPolicy, name string) 
 	if tls.MaxTLSVersion != nil {
 		switch *tls.MaxTLSVersion {
 		case agentgateway.TLSVersion1_2:
-			spec.MaxVersion = ptr.Of(api.TLSConfig_TLS_V1_2)
+			spec.MaxVersion = new(api.TLSConfig_TLS_V1_2)
 		case agentgateway.TLSVersion1_3:
-			spec.MaxVersion = ptr.Of(api.TLSConfig_TLS_V1_3)
+			spec.MaxVersion = new(api.TLSConfig_TLS_V1_3)
 		default:
 			logger.Warn("unknown tls version for max", "version", tls.MaxTLSVersion)
 			spec.MaxVersion = nil
@@ -482,9 +494,9 @@ func translateFrontendTLS(policy *agentgateway.AgentgatewayPolicy, name string) 
 	if tls.MinTLSVersion != nil {
 		switch *tls.MinTLSVersion {
 		case agentgateway.TLSVersion1_2:
-			spec.MinVersion = ptr.Of(api.TLSConfig_TLS_V1_2)
+			spec.MinVersion = new(api.TLSConfig_TLS_V1_2)
 		case agentgateway.TLSVersion1_3:
-			spec.MinVersion = ptr.Of(api.TLSConfig_TLS_V1_3)
+			spec.MinVersion = new(api.TLSConfig_TLS_V1_3)
 		default:
 			logger.Warn("unknown tls version for min", "version", tls.MinTLSVersion)
 			spec.MinVersion = nil
@@ -596,6 +608,22 @@ func translateFrontendHTTP(policy *agentgateway.AgentgatewayPolicy, name string)
 	spec.MaxConnectionDuration = durationToProto(http.MaxConnectionDuration)
 	if v := http.MaxConcurrentRequests; v != nil {
 		spec.MaxConcurrentRequests = castUint32(v) //nolint:gosec // G115: kubebuilder validation ensures safe for uint32
+	}
+	for _, normalize := range http.Normalize {
+		switch normalize {
+		case agentgateway.FrontendHTTPNormalizeMergeSlash:
+			spec.Normalize = append(spec.Normalize, api.FrontendPolicySpec_HTTP_MERGE_SLASH)
+		case agentgateway.FrontendHTTPNormalizeDotSegment:
+			spec.Normalize = append(spec.Normalize, api.FrontendPolicySpec_HTTP_DOT_SEGMENT)
+		case agentgateway.FrontendHTTPNormalizeDecodeUnreserved:
+			spec.Normalize = append(spec.Normalize, api.FrontendPolicySpec_HTTP_DECODE_UNRESERVED)
+		case agentgateway.FrontendHTTPNormalizeRejectEscapedSlash:
+			spec.Normalize = append(spec.Normalize, api.FrontendPolicySpec_HTTP_REJECT_ESCAPED_SLASH)
+		case agentgateway.FrontendHTTPNormalizeUnescapeSlash:
+			spec.Normalize = append(spec.Normalize, api.FrontendPolicySpec_HTTP_UNESCAPE_SLASH)
+		default:
+			logger.Warn("unknown http normalization rule", "normalize", normalize)
+		}
 	}
 
 	httpPolicy := &api.Policy{

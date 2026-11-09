@@ -129,7 +129,7 @@ export function DumpPoliciesPage() {
 }
 
 function FieldLabel(props: { children: string }) {
-	return <label className="field-label">{props.children}</label>;
+	return <h4 className="field-label">{props.children}</h4>;
 }
 
 function policyName(policy: TargetedPolicy) {

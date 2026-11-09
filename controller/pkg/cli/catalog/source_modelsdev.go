@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -22,7 +23,7 @@ func init() {
 		if err != nil {
 			return nil, nil, err
 		}
-		return modelsDevTransform(api, modelsDevSelectProviders(api, opts.providers), opts.legacy)
+		return modelsDevTransform(api, modelsDevSelectProviders(api, opts.providers, opts.excludeProviders), opts.legacy)
 	}
 }
 
@@ -36,18 +37,30 @@ var modelsDevProviderIDs = map[string]string{
 	"azure":          "azure",
 	"github-copilot": "copilot",
 	// TODO: not yet exposed at cost time — proxy resolves these custom-backed providers as "custom".
-	"cohere":       "cohere",
-	"baseten":      "baseten",
-	"cerebras":     "cerebras",
-	"deepinfra":    "deepinfra",
-	"deepseek":     "deepseek",
-	"groq":         "groq",
-	"huggingface":  "huggingface",
-	"mistral":      "mistral",
-	"openrouter":   "openrouter",
-	"togetherai":   "togetherai",
-	"xai":          "xai",
-	"fireworks-ai": "fireworks",
+	"cohere":           "cohere",
+	"baseten":          "baseten",
+	"cerebras":         "cerebras",
+	"deepinfra":        "deepinfra",
+	"deepseek":         "deepseek",
+	"groq":             "groq",
+	"huggingface":      "huggingface",
+	"mistral":          "mistral",
+	"openrouter":       "openrouter",
+	"togetherai":       "togetherai",
+	"xai":              "xai",
+	"fireworks-ai":     "fireworks",
+	"meta":             "meta",
+	"perplexity-agent": "perplexity",
+	"nebius":           "nebius",
+}
+
+// modelsDevTypeEndpoints maps a models.dev model type to the client endpoints serving it.
+var modelsDevTypeEndpoints = map[string][]string{
+	"embedding":     {"/embeddings"},
+	"reranking":     {"/rerank"},
+	"image":         {"/images/generations", "/images/edits"},
+	"speech":        {"/audio/speech"},
+	"transcription": {"/audio/transcriptions"},
 }
 
 type modelsDevProvider struct {
@@ -57,10 +70,39 @@ type modelsDevProvider struct {
 }
 
 type modelsDevModel struct {
-	ID     string         `json:"id"`
-	Name   string         `json:"name"`
-	Status string         `json:"status"`
-	Cost   *modelsDevCost `json:"cost"`
+	ID               string                     `json:"id"`
+	Name             string                     `json:"name"`
+	Family           string                     `json:"family"`
+	Type             string                     `json:"type"`
+	Status           string                     `json:"status"`
+	ReleaseDate      string                     `json:"release_date"`
+	Cost             *modelsDevCost             `json:"cost"`
+	Reasoning        *bool                      `json:"reasoning"`
+	ReasoningOptions []modelsDevReasoningOption `json:"reasoning_options"`
+	ToolCall         *bool                      `json:"tool_call"`
+	StructuredOutput *bool                      `json:"structured_output"`
+	Temperature      *bool                      `json:"temperature"`
+	Limit            Limits                     `json:"limit"`
+	Modalities       Modalities                 `json:"modalities"`
+	Experimental     struct {
+		Modes map[string]modelsDevMode `json:"modes"`
+	} `json:"experimental"`
+}
+
+type modelsDevReasoningOption struct {
+	Type   string    `json:"type"`
+	Values []*string `json:"values"`
+	Min    *int64    `json:"min"`
+	Max    *int64    `json:"max"`
+}
+
+type modelsDevMode struct {
+	Cost     *modelsDevRates `json:"cost"`
+	Provider struct {
+		Body struct {
+			ServiceTier string `json:"service_tier"`
+		} `json:"body"`
+	} `json:"provider"`
 }
 
 type modelsDevRates struct {
@@ -89,7 +131,7 @@ type modelsDevTierKind struct {
 }
 
 func modelsDevFetchAPI(ctx context.Context) (map[string]modelsDevProvider, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://models.dev/api.json", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://models.dev/api.json?type=all", nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request for models.dev api.json: %w", err)
 	}
@@ -105,13 +147,23 @@ func modelsDevFetchAPI(ctx context.Context) (map[string]modelsDevProvider, error
 	return modelsDevDecodeAPI(io.LimitReader(resp.Body, 64<<20))
 }
 
-func modelsDevSelectProviders(api map[string]modelsDevProvider, requested []string) []string {
-	if len(requested) > 0 {
-		return requested
+func modelsDevSelectProviders(api map[string]modelsDevProvider, requested, excluded []string) []string {
+	selected := requested
+	if len(selected) == 0 {
+		selected = make([]string, 0, len(modelsDevProviderIDs))
+		for id := range modelsDevProviderIDs {
+			if _, ok := api[id]; ok {
+				selected = append(selected, id)
+			}
+		}
 	}
-	ids := make([]string, 0, len(modelsDevProviderIDs))
-	for id := range modelsDevProviderIDs {
-		if _, ok := api[id]; ok {
+	omit := make(map[string]struct{}, len(excluded))
+	for _, id := range excluded {
+		omit[id] = struct{}{}
+	}
+	ids := make([]string, 0, len(selected))
+	for _, id := range selected {
+		if _, ok := omit[id]; !ok {
 			ids = append(ids, id)
 		}
 	}
@@ -159,7 +211,8 @@ func modelsDevTransform(api map[string]modelsDevProvider, providers []string, le
 			if err != nil {
 				return nil, warns, fmt.Errorf("%s/%s: %w", gwID, modelID, err)
 			}
-			if entry.IsZero() {
+			// Metadata alone does not earn a catalog entry; require pricing or tags.
+			if entry.Rates.IsZero() && len(entry.Tiers) == 0 && len(entry.Tags) == 0 {
 				continue
 			}
 			models[modelID] = entry
@@ -186,7 +239,67 @@ func modelsDevTransform(api map[string]modelsDevProvider, providers []string, le
 
 func modelsDevBuildModel(provider, model string, m modelsDevModel, warn func(format string, args ...any)) (Model, error) {
 	label := provider + "/" + model
-	var entry Model
+	entry := Model{
+		Name:     m.Name,
+		Status:   m.Status,
+		Released: m.ReleaseDate,
+		Limits:   m.Limit,
+		Capabilities: Capabilities{
+			Reasoning:        m.Reasoning,
+			StructuredOutput: m.StructuredOutput,
+			ToolCall:         m.ToolCall,
+			Temperature:      m.Temperature,
+		},
+		Modalities: m.Modalities,
+	}
+	if m.Type != "" && m.Type != "chat" {
+		// Types without a served endpoint, such as video, list none.
+		entry.Endpoints = modelsDevTypeEndpoints[m.Type]
+		if entry.Endpoints == nil {
+			entry.Endpoints = []string{}
+		}
+	}
+	for _, option := range m.ReasoningOptions {
+		switch option.Type {
+		case "toggle":
+			entry.Reasoning.Toggle = new(true)
+		case "effort":
+			for _, v := range option.Values {
+				if v != nil {
+					entry.Reasoning.Effort = append(entry.Reasoning.Effort, *v)
+				}
+			}
+		case "budget_tokens":
+			budget := &BudgetTokens{}
+			// Some sources use -1 as a sentinel for a dynamic budget; treat it as unset.
+			if option.Min != nil && *option.Min >= 0 {
+				budget.Min = new(uint64(*option.Min))
+			}
+			if option.Max != nil && *option.Max >= 0 {
+				budget.Max = new(uint64(*option.Max))
+			}
+			entry.Reasoning.BudgetTokens = budget
+		default:
+			warn("%s: skipping unsupported reasoning option %q", label, option.Type)
+		}
+	}
+	claude := strings.HasPrefix(m.Family, "claude-")
+	if claude {
+		var effort, budgetTokens bool
+		for _, option := range m.ReasoningOptions {
+			switch option.Type {
+			case "effort":
+				effort = true
+			case "budget_tokens":
+				budgetTokens = true
+			}
+		}
+		if budgetTokens {
+			entry.Tags = append(entry.Tags, "legacy_thinking")
+		} else if effort {
+			entry.Tags = append(entry.Tags, "adaptive_thinking")
+		}
+	}
 
 	if m.Cost != nil {
 		rates, err := modelsDevBuildRates(&m.Cost.modelsDevRates, label)
@@ -202,7 +315,61 @@ func modelsDevBuildModel(provider, model string, m modelsDevModel, warn func(for
 		entry.Tiers = tiers
 	}
 
+	// Only modes selected by an OpenAI-style service_tier map onto our service tiers.
+	for _, name := range slices.Sorted(maps.Keys(m.Experimental.Modes)) {
+		mode := m.Experimental.Modes[name]
+		serviceTier := mode.Provider.Body.ServiceTier
+		if mode.Cost == nil || (serviceTier != "priority" && serviceTier != "flex" && serviceTier != "ultrafast") {
+			continue
+		}
+		rates, err := modelsDevBuildRates(mode.Cost, label+" "+name+" mode")
+		if err != nil {
+			return Model{}, err
+		}
+		entry.Tiers = append(entry.Tiers, Tier{ServiceTier: serviceTier, Rates: rates})
+	}
+
+	// models.dev does not publish extended-TTL cache write rates, so derive them from input.
+	derive := func(r *Rates) {
+		ttl, multiplier := "", ""
+		switch {
+		case claude:
+			// Anthropic bills 1h writes at 2x input.
+			ttl, multiplier = "1h", "2"
+		case provider == "openai":
+			// OpenAI bills 12h writes at 2.5x input.
+			ttl, multiplier = "12h", "2.5"
+		default:
+			return
+		}
+		if rate := deriveCacheWrite(r, multiplier); rate != "" {
+			r.CacheWriteDetails = map[string]Money{ttl: rate}
+		}
+	}
+	derive(&entry.Rates)
+	for i := range entry.Tiers {
+		derive(&entry.Tiers[i].Rates)
+	}
+
 	return entry, nil
+}
+
+// deriveCacheWrite scales input by multiplier. Anthropic and OpenAI both price default-TTL writes at
+// 1.25x input; only derive when cacheWrite follows that rule, so a source with a different pricing
+// scheme is left to fall back to cacheWrite.
+func deriveCacheWrite(r *Rates, multiplier string) Money {
+	if r.CacheWrite == "" {
+		return ""
+	}
+	input, err := r.Input.Decimal()
+	if err != nil {
+		return ""
+	}
+	cacheWrite, err := r.CacheWrite.Decimal()
+	if err != nil || !cacheWrite.Equal(input.Mul(decimal.RequireFromString("1.25"))) {
+		return ""
+	}
+	return Money(input.Mul(decimal.RequireFromString(multiplier)).String())
 }
 
 func modelsDevBuildTiers(src []modelsDevTier, label string, warn func(format string, args ...any)) ([]Tier, error) {

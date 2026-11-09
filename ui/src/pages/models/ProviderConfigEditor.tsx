@@ -2,6 +2,7 @@ import { Eye, EyeOff } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
 import { CloudRegionCombobox } from '@/components/CloudRegionCombobox';
+import { UnsupportedInForm } from '@/components/EditorContracts';
 import { EnumSelector } from '@/components/EnumSelector';
 import { Dropdown, Field, FieldGroup } from '@/components/Primitives';
 import { ProviderIcon } from '@/components/ProviderIcon';
@@ -12,6 +13,7 @@ import {
 	visibleProviderNames
 } from '@/config';
 import { CustomFormats } from '@/pages/models/CustomFormats';
+import { cleanEmpty, isRecord } from '@/policies/policyUtils';
 import type { SchemaHelp } from '@/schemaHelp';
 import type {
 	CanonicalProviderAuth,
@@ -86,9 +88,9 @@ export function ProviderConfigEditor(props: {
 
 	useEffect(() => {
 		if (provider === 'azure' && !props.params?.azureResourceType) {
-			patchParams({ azureResourceType: 'openAI' });
+			props.onParamsChange({ ...(props.params ?? {}), azureResourceType: 'openAI' });
 		}
-	}, [provider, props.params?.azureResourceType]);
+	}, [props.onParamsChange, props.params, provider]);
 
 	function setProviderChoice(value: string) {
 		if (value.startsWith('provider:')) {
@@ -107,6 +109,7 @@ export function ProviderConfigEditor(props: {
 		<>
 			<FieldGroup
 				label="Provider"
+				path="provider"
 				tooltip={props.help.field<LlmModel>('LocalLLMModels', 'provider')}
 			>
 				<Dropdown
@@ -134,7 +137,7 @@ export function ProviderConfigEditor(props: {
 							onApiKeyChange={apiKey => patchParams({ apiKey })}
 						/>
 					) : (
-						<Field
+						<FieldGroup
 							label="Provider API key"
 							tooltip={props.help.field<LlmParams>('LocalLLMParams', 'apiKey')}
 							className={props.apiKeyError ? 'invalid' : undefined}
@@ -144,7 +147,7 @@ export function ProviderConfigEditor(props: {
 								value={props.params?.apiKey}
 								onChange={apiKey => patchParams({ apiKey })}
 							/>
-						</Field>
+						</FieldGroup>
 					)}
 
 					{provider === 'vertex' ? (
@@ -198,6 +201,28 @@ export function ProviderConfigEditor(props: {
 								placeholder="us-west-2"
 							/>
 						</Field>
+					) : null}
+					{provider === 'bedrock' ? (
+						<FieldGroup
+							label="Bedrock endpoint"
+							tooltip="Mantle supports native Anthropic and OpenAI APIs, including supported server-side tools and background requests. It requires Mantle-specific AWS permissions. Choose Runtime for existing Bedrock deployments, inline Bedrock guardrails, cross-region inference, or Claude structured outputs. Bedrock guardrails configured on the Guardrails page work with either endpoint. Prefer modes automatically select the other endpoint for models the catalog lists as available only there; unknown models use your preference. Inline guardrails prevent fallback to Mantle and cannot be combined with either Mantle mode. Only modes force the selected endpoint for chat, so unsupported models fail. Neither mode retries failed requests on the other endpoint. Embeddings and reranking are unaffected."
+						>
+							<EnumSelector<NonNullable<LlmParams['bedrockEndpointPreference']>>
+								ariaLabel="Bedrock endpoint"
+								value={props.params?.bedrockEndpointPreference ?? 'runtimePreferred'}
+								onChange={bedrockEndpointPreference => patchParams({ bedrockEndpointPreference })}
+								options={[
+									{ value: 'runtimePreferred', label: 'Prefer Runtime' },
+									{ value: 'mantlePreferred', label: 'Prefer Mantle' },
+									{ value: 'mantleOnly', label: 'Mantle only (advanced)' },
+									{ value: 'runtimeOnly', label: 'Runtime only (advanced)' }
+								]}
+								schema={props.help.fieldNode<LlmParams>(
+									'LocalLLMParams',
+									'bedrockEndpointPreference'
+								)}
+							/>
+						</FieldGroup>
 					) : null}
 					{provider === 'ollama' ? (
 						<Field
@@ -394,7 +419,19 @@ function AwsCredentials(props: {
 
 	function setAmbient() {
 		setMode('ambient');
-		props.onChange?.(null);
+		// Ambient credentials keep the region, service, and assumed role.
+		const implicit = aws
+			? cleanEmpty({
+					region: aws.region,
+					serviceName: aws.serviceName,
+					assumeRole: 'assumeRole' in aws ? aws.assumeRole : undefined
+				})
+			: undefined;
+		props.onChange?.(
+			isRecord(implicit) && Object.keys(implicit).length
+				? ({ aws: implicit } as CanonicalProviderAuth)
+				: null
+		);
 	}
 
 	function saveStatic(next: {
@@ -415,9 +452,9 @@ function AwsCredentials(props: {
 			aws: {
 				accessKeyId: merged.accessKeyId ?? '',
 				secretAccessKey: merged.secretAccessKey ?? '',
-				region: null,
+				region: aws?.region ?? null,
 				sessionToken: merged.sessionToken || null,
-				serviceName: null
+				serviceName: aws?.serviceName ?? null
 			}
 		});
 	}
@@ -496,11 +533,20 @@ function GcpCredentials(props: {
 			? gcp.credential.file
 			: '';
 	const [mode, setMode] = useState<GcpCredentialMode>(file ? 'file' : 'ambient');
+	if (gcp?.credential && !file) {
+		return <UnsupportedInForm supports="Google credentials from ADC or a file" />;
+	}
+
+	// Keeps the token type and audience, which the form does not show.
+	function setCredential(credential: { file: string } | null) {
+		const next = cleanEmpty({ ...gcp, credential });
+		props.onChange?.(
+			isRecord(next) && Object.keys(next).length ? ({ gcp: next } as CanonicalProviderAuth) : null
+		);
+	}
 
 	function setFile(path: string) {
-		props.onChange?.({
-			gcp: { credential: path.trim() ? { file: path } : null }
-		});
+		setCredential(path.trim() ? { file: path } : null);
 	}
 
 	return (
@@ -515,7 +561,7 @@ function GcpCredentials(props: {
 						type="button"
 						onClick={() => {
 							setMode('ambient');
-							props.onChange?.(null);
+							setCredential(null);
 						}}
 					>
 						ADC
@@ -551,13 +597,22 @@ function AzureCredentials(props: {
 }) {
 	const azure = canonicalAuth(props.auth, 'azure')?.azure ?? null;
 	const managed =
-		azure && 'explicitConfig' in azure && 'managedIdentity' in azure.explicitConfig
+		azure &&
+		'explicitConfig' in azure &&
+		typeof azure.explicitConfig === 'object' &&
+		azure.explicitConfig !== null &&
+		'managedIdentity' in azure.explicitConfig
 			? azure.explicitConfig.managedIdentity
 			: null;
 	const [mode, setMode] = useState<AzureCredentialMode>(
 		props.apiKey ? 'apiKey' : managed ? 'managedIdentity' : 'default'
 	);
 	const [clientId, setClientId] = useState(azureManagedIdentityClientId(managed));
+	if (azure && ('developerImplicit' in azure || ('explicitConfig' in azure && !managed))) {
+		return (
+			<UnsupportedInForm supports="default, managed identity, and API key Azure credentials" />
+		);
+	}
 
 	function setDefault() {
 		setMode('default');

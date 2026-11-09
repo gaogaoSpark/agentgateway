@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"istio.io/istio/pkg/ptr"
 	corev1 "k8s.io/api/core/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -21,11 +20,11 @@ func TestResolveEndpoint(t *testing.T) {
 	serviceRemote := remoteProvider(
 		"/org-one/keys",
 		gwv1.BackendObjectReference{
-			Group:     ptr.Of(gwv1.Group("")),
-			Kind:      ptr.Of(gwv1.Kind("Service")),
+			Group:     new(gwv1.Group("")),
+			Kind:      new(gwv1.Kind("Service")),
 			Name:      gwv1.ObjectName("dummy-idp"),
-			Namespace: ptr.Of(gwv1.Namespace("default")),
-			Port:      ptr.Of(gwv1.PortNumber(8443)),
+			Namespace: new(gwv1.Namespace("default")),
+			Port:      new(gwv1.PortNumber(8443)),
 		},
 	)
 	backendRemote := remoteProvider(
@@ -34,7 +33,7 @@ func TestResolveEndpoint(t *testing.T) {
 			Group: new(gwv1.Group(wellknown.AgentgatewayBackendGVK.Group)),
 			Kind:  new(gwv1.Kind(wellknown.AgentgatewayBackendGVK.Kind)),
 			Name:  gwv1.ObjectName("dummy-idp"),
-			Port:  ptr.Of(gwv1.PortNumber(8443)),
+			Port:  new(gwv1.PortNumber(8443)),
 		},
 	)
 
@@ -60,7 +59,7 @@ func TestResolveEndpoint(t *testing.T) {
 				testCAConfigMap(),
 				attachedBackendPolicy(gwv1.Group(""), gwv1.Kind("Service"), "dummy-idp", &agentgateway.BackendTLS{
 					CACertificateRefs: []agentgateway.LocalCACertificateRef{{Name: "ca"}},
-					Sni:               ptr.Of(agentgateway.SNI("test.testns")),
+					Sni:               new(agentgateway.SNI("test.testns")),
 					AlpnProtocols:     new([]agentgateway.TinyString{"test1", "test2"}),
 				}),
 			},
@@ -84,7 +83,7 @@ func TestResolveEndpoint(t *testing.T) {
 					"dummy-idp",
 					&agentgateway.BackendTLS{
 						CACertificateRefs: []agentgateway.LocalCACertificateRef{{Name: "ca"}},
-						Sni:               ptr.Of(agentgateway.SNI("test.testns")),
+						Sni:               new(agentgateway.SNI("test.testns")),
 						AlpnProtocols:     new([]agentgateway.TinyString{"test1", "test2"}),
 					},
 				),
@@ -103,7 +102,7 @@ func TestResolveEndpoint(t *testing.T) {
 				gatewayJWTPolicy(backendRemote),
 			},
 			remoteProvider: backendRemote,
-			expectedError:  "backend default/dummy-idp not found, policy default/gw-policy",
+			expectedError:  "backend default/dummy-idp not found, referenced by AgentgatewayPolicy default/gw-policy",
 		},
 		{
 			name: "returns resolver error for non-static backend",
@@ -114,7 +113,7 @@ func TestResolveEndpoint(t *testing.T) {
 				},
 			},
 			remoteProvider: backendRemote,
-			expectedError:  "only static backends are supported; backend: default/dummy-idp, policy: default/gw-policy",
+			expectedError:  "only static backends are supported; backend: default/dummy-idp, referenced by AgentgatewayPolicy default/gw-policy",
 		},
 	}
 
@@ -126,7 +125,7 @@ func TestResolveEndpoint(t *testing.T) {
 				resolver = testutils.BuildRemoteHTTPResolver(ctx.Collections)
 			}
 
-			endpoint, err := jwks.ResolveEndpoint(ctx.Krt, resolver, "gw-policy", "default", tt.remoteProvider)
+			endpoint, err := jwks.ResolveEndpoint(ctx.Krt, resolver, jwks.OwnerKindPolicy, "gw-policy", "default", tt.remoteProvider)
 			if tt.expectedError != "" {
 				require.EqualError(t, err, tt.expectedError)
 				require.Nil(t, endpoint)

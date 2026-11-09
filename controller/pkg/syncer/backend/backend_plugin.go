@@ -10,10 +10,12 @@ import (
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/ptr"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwxv1a1 "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 
 	"github.com/agentgateway/agentgateway/api"
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
@@ -32,36 +34,48 @@ var logger = logging.New("agentgateway/backend")
 
 // NewBackendPlugin creates a new plugin for AgentgatewayBackends
 func NewBackendPlugin(agw *plugins.AgwCollections, resolver remotehttp.Resolver, jwksLookup jwks.Lookup, credentialResolver kubeutils.CredentialResolver) plugins.AgwPlugin {
-	return plugins.AgwPlugin{
-		ContributesBackends: map[schema.GroupKind]plugins.BackendPlugin{
-			wellknown.AgentgatewayBackendGVK.GroupKind(): {
-				BuildReferences: func() krt.Collection[*plugins.PolicyAttachment] {
-					return krt.NewManyCollection(agw.Backends, func(ctx krt.HandlerContext, backend *agentgateway.AgentgatewayBackend) []*plugins.PolicyAttachment {
-						return BuildAgwBackendReferences(backend)
-					}, agw.KrtOpts.ToOptions("references/AgentgatewayBackendPolicyAttachments")...)
-				},
-				Build: func(input plugins.PolicyPluginInput) (krt.StatusCollection[controllers.Object, any], krt.Collection[agwir.AgwResource]) {
-					status, col := krt.NewStatusManyCollection(agw.Backends, func(ctx krt.HandlerContext, backend *agentgateway.AgentgatewayBackend) (
-						*agentgateway.AgentgatewayBackendStatus,
-						[]agwir.AgwResource,
-					) {
-						pc := plugins.PolicyCtx{
-							Krt:                ctx,
-							Collections:        agw,
-							References:         input.References,
-							Grants:             input.Grants,
-							SourceGVK:          wellknown.AgentgatewayBackendGVK,
-							Resolver:           resolver,
-							JWKSLookup:         jwksLookup,
-							CredentialResolver: credentialResolver,
-						}
-						return TranslateAgwBackend(pc, backend, input.References)
-					}, agw.KrtOpts.ToOptions("backends/Agentgateway")...)
-					return plugins.ConvertStatusCollection(status, agw.KrtOpts.ToOptions, "backends/Agentgateway"), col
-				},
+	backends := map[schema.GroupKind]plugins.BackendPlugin{
+		wellknown.AgentgatewayBackendGVK.GroupKind(): {
+			BuildReferences: func() krt.Collection[*plugins.PolicyAttachment] {
+				return krt.NewManyCollection(agw.Backends, func(ctx krt.HandlerContext, backend *agentgateway.AgentgatewayBackend) []*plugins.PolicyAttachment {
+					return BuildAgwBackendReferences(backend)
+				}, agw.KrtOpts.ToOptions("references/AgentgatewayBackendPolicyAttachments")...)
+			},
+			Build: func(input plugins.PolicyPluginInput) (krt.StatusCollection[controllers.Object, any], krt.Collection[agwir.AgwResource]) {
+				status, col := krt.NewStatusManyCollection(agw.Backends, func(ctx krt.HandlerContext, backend *agentgateway.AgentgatewayBackend) (
+					*agentgateway.AgentgatewayBackendStatus,
+					[]agwir.AgwResource,
+				) {
+					pc := plugins.PolicyCtx{
+						Krt:                ctx,
+						Collections:        agw,
+						References:         input.References,
+						Grants:             input.Grants,
+						SourceGVK:          wellknown.AgentgatewayBackendGVK,
+						Resolver:           resolver,
+						JWKSLookup:         jwksLookup,
+						CredentialResolver: credentialResolver,
+					}
+					return TranslateAgwBackend(pc, backend, input.References)
+				}, agw.KrtOpts.ToOptions("backends/Agentgateway")...)
+				return plugins.ConvertStatusCollection(status, agw.KrtOpts.ToOptions, "backends/Agentgateway"), col
 			},
 		},
 	}
+	if agw.Settings.EnableXBackend {
+		backends[wellknown.XBackendGVK.GroupKind()] = plugins.BackendPlugin{
+			Build: func(input plugins.PolicyPluginInput) (krt.StatusCollection[controllers.Object, any], krt.Collection[agwir.AgwResource]) {
+				status, col := krt.NewStatusManyCollection(agw.XBackends, func(ctx krt.HandlerContext, backend *gwxv1a1.XBackend) (
+					*gwxv1a1.BackendStatus,
+					[]agwir.AgwResource,
+				) {
+					return TranslateXBackend(ctx, agw, backend, input.References, input.Grants)
+				}, agw.KrtOpts.ToOptions("backends/XBackend")...)
+				return plugins.ConvertStatusCollection(status, agw.KrtOpts.ToOptions, "backends/XBackend"), col
+			},
+		}
+	}
+	return plugins.AgwPlugin{ContributesBackends: backends}
 }
 
 func BuildAgwBackendReferences(
@@ -139,6 +153,9 @@ func BuildAgwBackend(
 	backend *agentgateway.AgentgatewayBackend,
 ) ([]*api.Backend, error) {
 	errs := []error{}
+	if owners := jwks.OwnersFromBackend(backend); len(owners) > 0 {
+		ctx.JWKSOwner = &owners[0]
+	}
 	pols, err := TranslateBackendPolicies(ctx, backend.Namespace, backend.Spec.Policies)
 	if err != nil {
 		errs = append(errs, err)
@@ -218,18 +235,27 @@ func TranslateAgwBackend(
 ) (*agentgateway.AgentgatewayBackendStatus, []agwir.AgwResource) {
 	var results []agwir.AgwResource
 	backends, err := BuildAgwBackend(ctx, backend)
+	condition := metav1.Condition{
+		Type:               "Accepted",
+		Status:             metav1.ConditionTrue,
+		Reason:             "Accepted",
+		Message:            "Backend successfully accepted",
+		ObservedGeneration: backend.Generation,
+		LastTransitionTime: metav1.Now(),
+	}
 	if err != nil {
 		logger.Error("failed to translate backend", "backend", backend.Name, "namespace", backend.Namespace, "err", err)
-		return &agentgateway.AgentgatewayBackendStatus{
-			Conditions: kstatus.UpdateConditionIfChanged(backend.Status.Conditions, metav1.Condition{
-				Type:               "Accepted",
-				Status:             metav1.ConditionFalse,
-				Reason:             "TranslationError",
-				Message:            fmt.Sprintf("failed to translate backend: %v", err),
-				ObservedGeneration: backend.Generation,
-				LastTransitionTime: metav1.Now(),
-			}),
-		}, results
+		condition.Message = fmt.Sprintf("failed to translate backend: %v", err)
+		condition.Reason = "PartiallyValid"
+		// Policy translation can return usable output alongside diagnostics. Preserve
+		// that output, including policies that enforce failure in the data plane.
+		if len(backends) == 0 {
+			condition.Status = metav1.ConditionFalse
+			condition.Reason = "TranslationError"
+			return &agentgateway.AgentgatewayBackendStatus{
+				Conditions: kstatus.UpdateConditionIfChanged(backend.Status.Conditions, condition),
+			}, results
+		}
 	}
 
 	gtws := references.LookupGatewaysForBackend(ctx.Krt, utils.TypedNamespacedName{
@@ -250,15 +276,21 @@ func TranslateAgwBackend(
 	}
 
 	return &agentgateway.AgentgatewayBackendStatus{
-		Conditions: kstatus.UpdateConditionIfChanged(backend.Status.Conditions, metav1.Condition{
-			Type:               "Accepted",
-			Status:             metav1.ConditionTrue,
-			Reason:             "Accepted",
-			Message:            "Backend successfully accepted",
-			ObservedGeneration: backend.Generation,
-			LastTransitionTime: metav1.Now(),
-		}),
+		Conditions: kstatus.UpdateConditionIfChanged(backend.Status.Conditions, condition),
 	}, results
+}
+
+func applyMCPTargetCondition(targets []*api.MCPTarget, condition *agentgateway.CELExpression) error {
+	if condition == nil {
+		return nil
+	}
+	for _, t := range targets {
+		t.Condition = new(string(*condition))
+	}
+	if !plugins.IsValidCELExpression(*condition) {
+		return fmt.Errorf("MCP target condition is not a valid CEL expression: %s", *condition)
+	}
+	return nil
 }
 
 func TranslateMCPBackends(ctx plugins.PolicyCtx, be *agentgateway.AgentgatewayBackend, inlinePolicies []*api.BackendPolicySpec) ([]*api.Backend, error) {
@@ -266,7 +298,9 @@ func TranslateMCPBackends(ctx plugins.PolicyCtx, be *agentgateway.AgentgatewayBa
 	var mcpTargets []*api.MCPTarget
 	var backends []*api.Backend
 	var errs []error
+	serviceTargets := map[*api.MCPTarget]*corev1.Service{}
 	for _, target := range mcp.Targets {
+		start := len(mcpTargets)
 		if s := target.Static; s != nil {
 			if s.BackendRef != nil {
 				serviceHostname, err := ResolveMCPBackendRefHost(ctx, be.Namespace, s.BackendRef)
@@ -295,6 +329,9 @@ func TranslateMCPBackends(ctx plugins.PolicyCtx, be *agentgateway.AgentgatewayBa
 				}
 
 				mcpTargets = append(mcpTargets, mcpTarget)
+				if err := applyMCPTargetCondition(mcpTargets[start:], target.Condition); err != nil {
+					errs = append(errs, err)
+				}
 				continue
 			}
 
@@ -346,9 +383,17 @@ func TranslateMCPBackends(ctx plugins.PolicyCtx, be *agentgateway.AgentgatewayBa
 			if err != nil {
 				return nil, err
 			}
-			mcpTargets = append(mcpTargets, targets...)
+			for _, t := range targets {
+				serviceTargets[t.target] = t.service
+				mcpTargets = append(mcpTargets, t.target)
+			}
+		}
+		if err := applyMCPTargetCondition(mcpTargets[start:], target.Condition); err != nil {
+			errs = append(errs, err)
 		}
 	}
+	mcpTargets, dedupeErrs := dedupeMCPTargets(be.Namespace, mcpTargets, serviceTargets)
+	errs = append(errs, dedupeErrs...)
 	// defaults to stateful session routing
 	sessionRouting := api.MCPBackend_STATEFUL
 	if mcp.SessionRouting == agentgateway.Stateless {
@@ -453,6 +498,7 @@ func translateAIBackendPolicies(
 	}
 	return TranslateBackendPolicies(ctx, namespace, &agentgateway.BackendFull{
 		BackendSimple:  policies.BackendSimple,
+		Authorization:  policies.Authorization,
 		AI:             policies.AI,
 		Transformation: policies.Transformation,
 		Health:         policies.Health,
@@ -490,6 +536,10 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 				Model:      llm.OpenAI.Model,
 				Moderation: moderation,
 			},
+		}
+	} else if llm.Copilot != nil {
+		provider.Provider = &api.AIBackend_Provider_Copilot{
+			Copilot: &api.AIBackend_Copilot{Model: llm.Copilot.Model},
 		}
 	} else if llm.AzureOpenAI != nil {
 		resourceName, resourceType := parseAzureEndpoint(llm.AzureOpenAI.Endpoint)
@@ -531,17 +581,27 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 		// TODO: publisher?
 		provider.Provider = &api.AIBackend_Provider_Vertex{
 			Vertex: &api.AIBackend_Vertex{
-				Region:    llm.VertexAI.Region,
+				Region:    ptr.NonEmptyOrDefault(llm.VertexAI.Region, "global"),
 				Model:     llm.VertexAI.Model,
 				ProjectId: llm.VertexAI.ProjectId,
 			},
 		}
 	} else if llm.Bedrock != nil {
-		region := llm.Bedrock.Region
+		region := ptr.NonEmptyOrDefault(llm.Bedrock.Region, "us-east-1")
 		var guardrailIdentifier, guardrailVersion *string
 		if llm.Bedrock.Guardrail != nil {
 			guardrailIdentifier = &llm.Bedrock.Guardrail.GuardrailIdentifier
 			guardrailVersion = &llm.Bedrock.Guardrail.GuardrailVersion
+		}
+
+		endpointPreference := api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_PREFERRED
+		switch llm.Bedrock.EndpointPreference {
+		case agentgateway.BedrockEndpointPreferenceMantlePreferred:
+			endpointPreference = api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_MANTLE_PREFERRED
+		case agentgateway.BedrockEndpointPreferenceMantleOnly:
+			endpointPreference = api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_MANTLE_ONLY
+		case agentgateway.BedrockEndpointPreferenceRuntimeOnly:
+			endpointPreference = api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_ONLY
 		}
 
 		provider.Provider = &api.AIBackend_Provider_Bedrock{
@@ -550,6 +610,7 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 				Region:              region,
 				GuardrailIdentifier: guardrailIdentifier,
 				GuardrailVersion:    guardrailVersion,
+				EndpointPreference:  endpointPreference,
 			},
 		}
 	} else if llm.Custom != nil {

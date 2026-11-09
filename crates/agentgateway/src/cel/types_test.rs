@@ -5,6 +5,50 @@ use serde_json::json;
 use super::*;
 use crate::http::Body;
 
+#[tokio::test]
+async fn policy_snapshots_ignore_recording_but_logs_use_completed_output() {
+	use http_body_util::BodyExt;
+	let mut req = ::http::Request::new(Body::from_stream(futures_util::stream::iter([Ok::<
+		_,
+		std::io::Error,
+	>(
+		Bytes::from_static(b"hello"),
+	)])));
+	let _ = req.body_mut().inspect(2).await.unwrap();
+	req.body_mut().record(100);
+	let snapshot = snapshot_request(&mut req, false);
+	while req.body_mut().frame().await.is_some() {}
+	let policy = Executor::new_request_snapshot(Some(&snapshot));
+	assert!(policy.request.as_ref().unwrap().body.bytes().is_none());
+	assert_eq!(
+		policy
+			.request
+			.as_ref()
+			.unwrap()
+			.body_prefix
+			.0
+			.prefix_bytes()
+			.unwrap(),
+		"he"
+	);
+	let logger = Executor::new_logger(Some(&snapshot), None, None, None, None, None, None);
+	assert_eq!(
+		logger.request.as_ref().unwrap().body.bytes().unwrap(),
+		"hello"
+	);
+	assert_eq!(
+		logger
+			.request
+			.as_ref()
+			.unwrap()
+			.body_prefix
+			.0
+			.prefix_bytes()
+			.unwrap(),
+		"hello"
+	);
+}
+
 /// Helper to build a test request with various fields populated
 fn build_test_request() -> crate::http::Request {
 	let mut req = ::http::Request::builder()
@@ -41,11 +85,13 @@ fn build_test_request() -> crate::http::Request {
 	// Add backend context
 	let backend = BackendContext {
 		name: "test-backend".into(),
+		endpoint: Some("example.com:443".into()),
 		backend_type: BackendType::Service,
 		protocol: BackendProtocol::http,
 	};
 	req.extensions_mut().insert(backend);
 	req.extensions_mut().insert(ProxyContext {
+		error: None,
 		bind: Some("bind".into()),
 		gateway: Some(ProxyGatewayContext {
 			namespace: "default".into(),
@@ -72,6 +118,7 @@ fn build_test_request() -> crate::http::Request {
 	let llm = LLMContext {
 		streaming: false,
 		request_model: "gpt-4".into(),
+		original_model: "gpt-4".into(),
 		response_model: Some("gpt-4-turbo".into()),
 		provider: "openai".into(),
 		input_tokens: Some(100),
@@ -79,6 +126,7 @@ fn build_test_request() -> crate::http::Request {
 		input_image_tokens: None,
 		input_text_tokens: None,
 		input_audio_tokens: None,
+		audio_seconds: None,
 		output_tokens: Some(50),
 		output_image_tokens: None,
 		output_text_tokens: None,
@@ -87,6 +135,7 @@ fn build_test_request() -> crate::http::Request {
 		provider_total_tokens: Some(150),
 		service_tier: None,
 		first_token: None,
+		inter_chunk_latencies: crate::llm::TokenGapSummary::default(),
 		time_to_first_token: Some(chrono::Duration::milliseconds(123).into()),
 		time_per_output_token: Some(chrono::Duration::milliseconds(7).into()),
 		count_tokens: None,
@@ -100,6 +149,7 @@ fn build_test_request() -> crate::http::Request {
 		cost: None,
 		cost_rates: None,
 		cost_status: None,
+		model: None,
 	};
 	req.extensions_mut().insert(llm);
 
@@ -116,6 +166,7 @@ fn llm_context_with_usage(
 		input_format: llm::InputFormat::Completions,
 		cache_convention,
 		request_model: "model".into(),
+		original_model: None,
 		provider: "provider".into(),
 		streaming: false,
 		params: llm::LLMRequestParams::default(),
@@ -295,15 +346,44 @@ fn llm_cost_is_exposed_to_cel_as_floats() {
 		output: dec("0.025"),
 		cache_read: dec("0"),
 		cache_write: dec("0"),
+		cache_write_1h: dec("0"),
+		cache_write_12h: dec("0.01"),
 		reasoning: dec("0"),
 		input_audio: dec("0"),
 		output_audio: dec("0"),
+		pages: dec("0.02"),
+		audio_duration: dec("0"),
+	});
+	// Cost per page
+	req
+		.extensions_mut()
+		.get_mut::<LLMContext>()
+		.unwrap()
+		.cost_rates = Some(llm::catalog::CostRates {
+		input: Some(3.0),
+		per_page: Some(0.005),
+		cache_write_details: llm::catalog::CacheWriteRates {
+			ttl_12h: Some(2.5),
+			..Default::default()
+		},
+		..Default::default()
 	});
 	let executor = Executor::new_request(&req);
 
-	assert!(executor.eval_bool(&Expression::new_strict("llm.cost.total == 0.525").unwrap()));
+	assert!(executor.eval_bool(&Expression::new_strict("llm.cost.total == 0.555").unwrap()));
 	assert!(executor.eval_bool(&Expression::new_strict("llm.cost.input == 0.5").unwrap()));
+	assert!(executor.eval_bool(&Expression::new_strict("llm.cost.pages == 0.02").unwrap()));
 	assert!(executor.eval_bool(&Expression::new_strict("llm.cost.cacheRead == 0.0").unwrap()));
+	assert!(
+		executor
+			.eval_bool(&Expression::new_strict("llm.cost.cacheWriteDetails['12h'] == 0.01").unwrap())
+	);
+	assert!(
+		executor
+			.eval_bool(&Expression::new_strict("llm.costRates.cacheWriteDetails['12h'] == 2.5").unwrap())
+	);
+	assert!(executor.eval_bool(&Expression::new_strict("llm.costRates.input == 3.0").unwrap()));
+	assert!(executor.eval_bool(&Expression::new_strict("llm.costRates.perPage == 0.005").unwrap()));
 }
 
 #[test]
@@ -328,6 +408,7 @@ fn test_route_metadata_context() {
 #[test]
 fn test_proxy_timing_is_native_duration() {
 	let proxy = ProxyContext {
+		error: None,
 		bind: None,
 		gateway: None,
 		listener: None,
@@ -467,6 +548,7 @@ fn test_executor_snapshot_json_to_cel() {
 		},
 		"backend": {
 			"name": "my-backend",
+			"endpoint": "example.com:443",
 			"type": "service",
 			"protocol": "http"
 		},
@@ -512,6 +594,7 @@ fn test_executor_snapshot_json_to_cel() {
 	assert_eq!(cel_json["request"]["path"], "/test");
 	assert_eq!(cel_json["source"]["address"], "10.0.0.1");
 	assert_eq!(cel_json["backend"]["name"], "my-backend");
+	assert_eq!(cel_json["backend"]["endpoint"], "example.com:443");
 	assert_eq!(cel_json["proxy"]["listener"]["name"], "http");
 	assert_eq!(cel_json["proxy"]["route"]["rule"], "rule");
 	assert_eq!(cel_json["jwt"]["sub"], "test-user");

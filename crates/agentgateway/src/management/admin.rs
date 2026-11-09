@@ -11,6 +11,7 @@ use std::time::Duration;
 use agent_core::drain::DrainWatcher;
 use agent_core::version::BuildInfo;
 use agent_core::{signal, telemetry};
+use agent_http::{Body, RawBody};
 use axum::Router;
 use axum::extract::State as AxumState;
 use axum::response::IntoResponse;
@@ -27,9 +28,14 @@ use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use tracing_subscriber::filter;
 
-use super::hyper_helpers::{Server, plaintext_response};
+use super::hyper_helpers::Server;
 use crate::Config;
-use crate::http::{Request, Response};
+type Request = ::http::Request<RawBody>;
+type Response = ::http::Response<RawBody>;
+
+fn plaintext_response(code: hyper::StatusCode, body: String) -> Response {
+	super::hyper_helpers::plaintext_response(code, body).map(Body::into_boxed)
+}
 #[cfg(test)]
 #[path = "admin_tests.rs"]
 mod tests;
@@ -112,15 +118,6 @@ pub struct CertDump {
 	expiration_time: String,
 }
 
-#[derive(serde::Serialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct CertsDump {
-	identity: String,
-	state: String,
-	cert_chain: Vec<CertDump>,
-	root_certs: Vec<CertDump>,
-}
-
 impl Service {
 	#[allow(clippy::too_many_arguments)]
 	pub async fn new(
@@ -132,6 +129,7 @@ impl Service {
 		shutdown_trigger: signal::ShutdownTrigger,
 		drain_rx: DrainWatcher,
 		dataplane_handle: Handle,
+		ui_assets: &'static include_dir::Dir<'static>,
 	) -> anyhow::Result<Self> {
 		let state = Arc::new(AdminState {
 			config,
@@ -143,7 +141,7 @@ impl Service {
 			dataplane_handle,
 		});
 		let service = AdminService {
-			router: admin_router(state.clone()),
+			router: admin_router(state.clone(), ui_assets),
 		};
 		Server::<AdminService>::bind(
 			"admin",
@@ -165,7 +163,7 @@ impl Service {
 
 	pub fn spawn(self) {
 		self.s.spawn(move |service, req| async move {
-			Ok(service.handle(req.map(crate::http::Body::new)).await)
+			Ok(service.handle(req.map(agent_http::Body::new)).await)
 		})
 	}
 }
@@ -177,12 +175,18 @@ impl fmt::Debug for AdminService {
 }
 
 impl AdminService {
-	pub async fn handle(&self, req: Request) -> Response {
-		self.router.clone().oneshot(req).await.unwrap()
+	pub async fn handle(&self, req: agent_http::Request) -> agent_http::Response {
+		self
+			.router
+			.clone()
+			.oneshot(req.map(Body::into_boxed))
+			.await
+			.unwrap_or_else(|never| match never {})
+			.map(Body::new)
 	}
 }
 
-fn admin_router(state: Arc<AdminState>) -> Router {
+fn admin_router(state: Arc<AdminState>, ui_assets: &'static include_dir::Dir<'static>) -> Router {
 	let router = Router::new();
 	#[cfg(target_os = "linux")]
 	let router = router.route("/debug/pprof/profile", get(handle_pprof));
@@ -196,16 +200,13 @@ fn admin_router(state: Arc<AdminState>) -> Router {
 		.route("/logging", post(handle_logging))
 		.with_state(state.clone());
 
-	let router = if cfg!(feature = "ui") {
-		router.merge(crate::ui::router(
-			state.config.clone(),
-			state.model_catalog.clone(),
-			state.config_resource_store.clone(),
-			state.resource_manager.clone(),
-		))
-	} else {
-		router.route("/", get(handle_dashboard))
-	};
+	let router = router.merge(crate::ui::router(
+		state.config.clone(),
+		state.model_catalog.clone(),
+		state.config_resource_store.clone(),
+		state.resource_manager.clone(),
+		ui_assets,
+	));
 
 	router.layer(add_cors_layer())
 }
@@ -240,7 +241,7 @@ fn add_cors_layer() -> CorsLayer {
 		.max_age(Duration::from_secs(3600))
 }
 
-async fn handle_dashboard(_req: Request) -> Response {
+pub(crate) async fn handle_dashboard(_req: Request) -> Response {
 	let apis = &[
 		(
 			"debug/pprof/profile",
@@ -385,10 +386,8 @@ pub async fn handle_debug_trace(req: Request) -> Response {
 	};
 	let sse_stream = trace_sse_stream(rx);
 	let body = match max_duration {
-		Some(max_duration) => {
-			crate::http::Body::from_stream(sse_stream.take_until(time::sleep(max_duration)))
-		},
-		None => crate::http::Body::from_stream(sse_stream),
+		Some(max_duration) => RawBody::from_stream(sse_stream.take_until(time::sleep(max_duration))),
+		None => RawBody::from_stream(sse_stream),
 	};
 	::http::Response::builder()
 		.status(hyper::StatusCode::OK)

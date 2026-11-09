@@ -23,8 +23,35 @@
       "content": [
         {
           "type": "output_text",
-          "annotations": [],
-          "logprobs": [],
+          "annotations": [
+            {
+              "type": "url_citation",
+              "start_index": 0,
+              "end_index": 5,
+              "title": "Example",
+              "url": "https://example.com"
+            },
+            {
+              "type": "file_citation",
+              "file_id": "file_example",
+              "filename": "example.txt",
+              "index": 0
+            }
+          ],
+          "logprobs": [
+            {
+              "token": "Hello",
+              "logprob": -0.1,
+              "bytes": [
+                72,
+                101,
+                108,
+                108,
+                111
+              ],
+              "top_logprobs": []
+            }
+          ],
           "text": "Hello! How can I assist you today?"
         }
       ],
@@ -58,7 +85,12 @@
   "usage": {
     "input_tokens": 10,
     "input_tokens_details": {
-      "cached_tokens": 0
+      "cached_tokens": 0,
+      "cache_write_tokens": 6,
+      "cache_write_tokens_details": {
+        "ttl_30m_tokens": 4,
+        "ttl_12h_tokens": 2
+      }
     },
     "output_tokens": 10,
     "output_tokens_details": {

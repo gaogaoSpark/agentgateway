@@ -8,18 +8,34 @@ pub mod from_responses {
 
 	use crate::{AIError, json, types};
 
-	/// Translate an OpenAI Responses request into an OpenAI-compatible chat completions request.
-	pub fn translate(req: &types::responses::Request) -> Result<Vec<u8>, AIError> {
-		let xlated = translate_request(req)?;
-		serde_json::to_vec(&xlated).map_err(AIError::RequestMarshal)
+	pub struct TranslatedRequest {
+		pub request: completions::Request,
+		pub namespaces: crate::conversion::namespace_tools::NamespaceToolMap,
 	}
 
-	pub fn translate_request(
-		req: &types::responses::Request,
-	) -> Result<types::completions::typed::Request, AIError> {
-		let typed =
-			json::convert::<_, responses::CreateResponse>(req).map_err(AIError::RequestMarshal)?;
-		Ok(translate_internal(typed))
+	/// Translate an OpenAI Responses request into an OpenAI-compatible chat completions request.
+	pub fn translate(req: &types::responses::Request) -> Result<Vec<u8>, AIError> {
+		let translated = translate_request(req)?;
+		serde_json::to_vec(&translated.request).map_err(AIError::RequestMarshal)
+	}
+
+	pub fn translate_request(req: &types::responses::Request) -> Result<TranslatedRequest, AIError> {
+		let mut typed = json::convert::<_, responses::CreateResponse>(req)
+			.map_err(|err| AIError::RequestParsing(crate::InputFormat::Responses, err))?;
+		let namespaces =
+			crate::conversion::namespace_tools::NamespaceToolMap::rewrite_request(&mut typed)?;
+		Ok(TranslatedRequest {
+			request: translate_internal(typed),
+			namespaces,
+		})
+	}
+
+	fn cache_breakpoint(
+		breakpoint: Option<responses::PromptCacheBreakpointConfig>,
+	) -> Option<completions::PromptCacheBreakpointParam> {
+		breakpoint.map(|_| completions::PromptCacheBreakpointParam {
+			mode: completions::PromptCacheBreakpointParamMode::Explicit,
+		})
 	}
 
 	fn translate_internal(req: responses::CreateResponse) -> completions::Request {
@@ -30,6 +46,7 @@ pub mod from_responses {
 		};
 
 		let mut messages: Vec<completions::RequestMessage> = Vec::new();
+		let mut gemini_signatures = std::collections::HashMap::new();
 
 		if let Some(instructions) = &req.instructions {
 			messages.push(completions::RequestMessage::Developer(
@@ -67,7 +84,7 @@ pub mod from_responses {
 												Some(completions::RequestUserMessageContentPart::Text(
 													completions::RequestMessageContentPartText {
 														text: text.text,
-														prompt_cache_breakpoint: text.prompt_cache_breakpoint,
+														prompt_cache_breakpoint: cache_breakpoint(text.prompt_cache_breakpoint),
 													},
 												))
 											},
@@ -98,7 +115,7 @@ pub mod from_responses {
 												Some(completions::RequestAssistantMessageContentPart::Text(
 													completions::RequestMessageContentPartText {
 														text: text.text,
-														prompt_cache_breakpoint: text.prompt_cache_breakpoint,
+														prompt_cache_breakpoint: cache_breakpoint(text.prompt_cache_breakpoint),
 													},
 												))
 											},
@@ -129,7 +146,7 @@ pub mod from_responses {
 												Some(completions::RequestDeveloperMessageContentPart::Text(
 													completions::RequestMessageContentPartText {
 														text: text.text,
-														prompt_cache_breakpoint: text.prompt_cache_breakpoint,
+														prompt_cache_breakpoint: cache_breakpoint(text.prompt_cache_breakpoint),
 													},
 												))
 											},
@@ -155,6 +172,15 @@ pub mod from_responses {
 					continue;
 				},
 				InputItem::Item(item) => match item {
+					Item::Reasoning(reasoning) => {
+						if let Some(value) = reasoning
+							.encrypted_content
+							.as_deref()
+							.and_then(crate::conversion::GeminiThoughtSignature::decode)
+						{
+							gemini_signatures.insert(value.call_id, value.signature);
+						}
+					},
 					Item::Message(msg_item) => match msg_item {
 						MessageItem::Input(msg) => match msg.role {
 							InputRole::User => {
@@ -169,7 +195,9 @@ pub mod from_responses {
 														Some(completions::RequestUserMessageContentPart::Text(
 															completions::RequestMessageContentPartText {
 																text: text.text,
-																prompt_cache_breakpoint: text.prompt_cache_breakpoint,
+																prompt_cache_breakpoint: cache_breakpoint(
+																	text.prompt_cache_breakpoint,
+																),
 															},
 														))
 													},
@@ -193,7 +221,9 @@ pub mod from_responses {
 														Some(completions::RequestSystemMessageContentPart::Text(
 															completions::RequestMessageContentPartText {
 																text: text.text,
-																prompt_cache_breakpoint: text.prompt_cache_breakpoint,
+																prompt_cache_breakpoint: cache_breakpoint(
+																	text.prompt_cache_breakpoint,
+																),
 															},
 														))
 													},
@@ -217,7 +247,9 @@ pub mod from_responses {
 														Some(completions::RequestDeveloperMessageContentPart::Text(
 															completions::RequestMessageContentPartText {
 																text: text.text,
-																prompt_cache_breakpoint: text.prompt_cache_breakpoint,
+																prompt_cache_breakpoint: cache_breakpoint(
+																	text.prompt_cache_breakpoint,
+																),
 															},
 														))
 													},
@@ -254,13 +286,18 @@ pub mod from_responses {
 						},
 					},
 					Item::FunctionCall(call) => {
-						let tool_call = completions::MessageToolCalls::Function(completions::MessageToolCall {
+						let mut function_call = completions::MessageToolCall {
 							id: call.call_id.clone(),
 							function: completions::FunctionCall {
 								name: call.name.clone(),
 								arguments: call.arguments.clone(),
 							},
-						});
+							extra_content: None,
+						};
+						if let Some(signature) = gemini_signatures.remove(&call.call_id) {
+							function_call.set_thought_signature(signature);
+						}
+						let tool_call = completions::MessageToolCalls::Function(function_call);
 						if let Some(completions::RequestMessage::Assistant(message)) = messages.last_mut()
 							&& let Some(tool_calls) = &mut message.tool_calls
 						{
@@ -275,6 +312,9 @@ pub mod from_responses {
 						}
 					},
 					Item::FunctionCallOutput(output) => {
+						let Some(call_id) = output.call_id.filter(|call_id| !call_id.is_empty()) else {
+							continue;
+						};
 						let output_text = match output.output {
 							responses::FunctionCallOutput::Text(text) => text,
 							responses::FunctionCallOutput::Content(parts) => parts
@@ -289,7 +329,7 @@ pub mod from_responses {
 						messages.push(completions::RequestMessage::Tool(
 							completions::RequestToolMessage {
 								content: completions::RequestToolMessageContent::Text(output_text),
-								tool_call_id: output.call_id,
+								tool_call_id: call_id,
 							},
 						));
 					},
@@ -301,6 +341,7 @@ pub mod from_responses {
 								name: call.name.clone(),
 								arguments,
 							},
+							extra_content: None,
 						});
 						if let Some(completions::RequestMessage::Assistant(message)) = messages.last_mut()
 							&& let Some(tool_calls) = &mut message.tool_calls
@@ -354,13 +395,13 @@ pub mod from_responses {
 		let tool_choice = req.tool_choice.as_ref().and_then(|tc| {
 			use responses::{ToolChoiceFunction, ToolChoiceOptions, ToolChoiceParam};
 			match tc {
-				ToolChoiceParam::Mode(ToolChoiceOptions::Auto) => Some(
+				ToolChoiceParam::Option(ToolChoiceOptions::Auto) => Some(
 					completions::ToolChoiceOption::Mode(completions::ToolChoiceOptions::Auto),
 				),
-				ToolChoiceParam::Mode(ToolChoiceOptions::Required) => Some(
+				ToolChoiceParam::Option(ToolChoiceOptions::Required) => Some(
 					completions::ToolChoiceOption::Mode(completions::ToolChoiceOptions::Required),
 				),
-				ToolChoiceParam::Mode(ToolChoiceOptions::None) => Some(
+				ToolChoiceParam::Option(ToolChoiceOptions::None) => Some(
 					completions::ToolChoiceOption::Mode(completions::ToolChoiceOptions::None),
 				),
 				ToolChoiceParam::Function(ToolChoiceFunction { name }) => Some(
@@ -368,11 +409,11 @@ pub mod from_responses {
 						function: completions::FunctionName { name: name.clone() },
 					}),
 				),
-				ToolChoiceParam::Hosted(_)
+				ToolChoiceParam::BuiltIn(_)
 				| ToolChoiceParam::AllowedTools(_)
 				| ToolChoiceParam::Mcp(_)
 				| ToolChoiceParam::Custom(_)
-				| ToolChoiceParam::ProgrammaticToolCalling(_)
+				| ToolChoiceParam::ProgrammaticToolCalling
 				| ToolChoiceParam::ApplyPatch
 				| ToolChoiceParam::Shell => {
 					tracing::warn!(
@@ -465,7 +506,7 @@ pub mod to_responses {
 	use std::time::Instant;
 
 	use agent_core::strng;
-	use axum_core::body::Body;
+	use agent_http::Body;
 	use bytes::Bytes;
 	use rand::RngExt;
 	use types::completions::typed as completions;
@@ -479,10 +520,17 @@ pub mod to_responses {
 	type LoggedToolCalls = HashMap<u32, LoggedToolCall>;
 
 	/// Translate an OpenAI-compatible chat completions response into an OpenAI Responses response.
-	pub fn translate_response(bytes: &Bytes, model: &str) -> Result<Box<dyn ResponseType>, AIError> {
+	pub fn translate_response(
+		bytes: &Bytes,
+		model: &str,
+		namespaces: Option<&crate::conversion::namespace_tools::NamespaceToolMap>,
+	) -> Result<Box<dyn ResponseType>, AIError> {
 		let resp = serde_json::from_slice::<completions::Response>(bytes)
 			.map_err(logged_response_parsing(bytes))?;
-		let typed = translate_response_internal(resp, model);
+		let mut typed = translate_response_internal(resp, model);
+		if let Some(namespaces) = namespaces {
+			namespaces.restore_response(&mut typed);
+		}
 		let passthrough =
 			json::convert::<_, types::responses::Response>(&typed).map_err(AIError::ResponseParsing)?;
 		Ok(Box::new(passthrough))
@@ -499,6 +547,19 @@ pub mod to_responses {
 		let mut tool_calls: Vec<responses::OutputItem> = Vec::new();
 
 		if let Some(choice) = &choice {
+			if let Some(text) = choice.message.reasoning() {
+				outputs.push(responses::OutputItem::Reasoning(responses::ReasoningItem {
+					id: Some(format!("rs_{:016x}", rand::rng().random::<u64>())),
+					summary: vec![],
+					content: Some(vec![responses::ReasoningItemContent::ReasoningText(
+						responses::ReasoningTextContent {
+							text: text.to_string(),
+						},
+					)]),
+					encrypted_content: None,
+					status: Some(responses::OutputStatus::Completed),
+				}));
+			}
 			if let Some(content) = &choice.message.content {
 				text_parts.push(responses::OutputMessageContent::OutputText(
 					responses::OutputTextContent {
@@ -513,6 +574,17 @@ pub mod to_responses {
 				for tc in tcs {
 					match tc {
 						completions::MessageToolCalls::Function(f) => {
+							if let Some(signature) = f.thought_signature() {
+								tool_calls.push(responses::OutputItem::Reasoning(responses::ReasoningItem {
+									id: Some(format!("rs_{:016x}", rand::rng().random::<u64>())),
+									summary: vec![],
+									content: None,
+									encrypted_content: Some(crate::conversion::GeminiThoughtSignature::encode(
+										&f.id, signature,
+									)),
+									status: Some(responses::OutputStatus::Completed),
+								}));
+							}
 							tool_calls.push(responses::OutputItem::FunctionCall(
 								responses::FunctionToolCall {
 									arguments: f.function.arguments.clone(),
@@ -522,6 +594,7 @@ pub mod to_responses {
 									id: Some(f.id.clone()),
 									status: Some(responses::OutputStatus::Completed),
 									namespace: None,
+									r#async: None,
 								},
 							));
 						},
@@ -560,16 +633,17 @@ pub mod to_responses {
 		};
 
 		let error = match finish_reason {
-			Some(completions::FinishReason::ContentFilter) => Some(responses::ErrorObject {
-				code: "content_filter".to_string(),
+			Some(completions::FinishReason::ContentFilter) => Some(responses::ResponseError {
+				code: responses::ResponseErrorCode::Other("content_filter".to_string()),
 				message: "Content filtered".to_string(),
+				misalignment: None,
 			}),
 			_ => None,
 		};
 
 		let usage = resp.usage.map(|u| responses::ResponseUsage {
 			input_tokens: u.prompt_tokens,
-			output_tokens: usage_output_tokens(&u),
+			output_tokens: u.output_tokens(),
 			total_tokens: u.total_tokens,
 			input_tokens_details: responses::InputTokenDetails {
 				cached_tokens: u
@@ -582,7 +656,8 @@ pub mod to_responses {
 					.as_ref()
 					.and_then(|d| d.cache_write_tokens)
 					.or(u.cache_creation_input_tokens)
-					.map(|tokens| tokens as u32),
+					.map(|tokens| tokens as i64),
+				cache_write_tokens_details: None,
 			},
 			output_tokens_details: responses::OutputTokenDetails {
 				reasoning_tokens: u
@@ -603,14 +678,16 @@ pub mod to_responses {
 		buffer_limit: usize,
 		log: StreamingUsageGuard,
 		log_content: crate::LogContentFields,
+		namespaces: Option<std::sync::Arc<crate::conversion::namespace_tools::NamespaceToolMap>>,
 	) -> Body {
 		use responses::{
-			AssistantRole, FunctionToolCall, OutputContent, OutputItem, OutputMessage, OutputStatus,
-			OutputTextContent, ResponseContentPartAddedEvent, ResponseFunctionCallArgumentsDeltaEvent,
-			ResponseOutputItemAddedEvent, ResponseStreamEvent, ResponseTextDeltaEvent,
+			FunctionToolCall, OutputContent, OutputItem, OutputStatus, OutputTextContent, ReasoningItem,
+			ResponseContentPartAddedEvent, ResponseFunctionCallArgumentsDeltaEvent,
+			ResponseOutputItemAddedEvent, ResponseReasoningTextDeltaEvent, ResponseStreamEvent,
+			ResponseTextDeltaEvent,
 		};
 
-		let mut saw_token = false;
+		let mut last_token_at: Option<Instant> = None;
 		let mut sent_created = false;
 		let mut sent_content_part = false;
 		let mut flushed = false;
@@ -618,12 +695,20 @@ pub mod to_responses {
 		let mut sequence_number: u64 = 0;
 		let response_id = format!("resp_{:016x}", rand::rng().random::<u64>());
 		let message_item_id = format!("msg_{:016x}", rand::rng().random::<u64>());
-		let model_holder: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+		let mut response_builder: Option<types::responses::ResponseBuilder> = None;
 
-		let mut next_output_index: u32 = 1;
+		// Output indexes follow arrival order. The message opens lazily so reasoning, which streams
+		// first, takes index 0 as it does in the Responses API.
+		let mut next_output_index: u32 = 0;
+		let mut message_output_index: Option<u32> = None;
+		// (item_id, output_index, text)
+		let mut reasoning: Option<(String, u32, String)> = None;
 		let mut tool_calls: HashMap<u32, (String, String, String, u32)> = HashMap::new();
 		let mut logged_tool_calls: Option<LoggedToolCalls> = log_content.tool_calls.then(HashMap::new);
 		let mut completion = log_content.completion.then(String::new);
+		// The full text, for `output_text.done` and the finished items: clients
+		// (the SDKs' `get_final_response()`) read those, not the deltas.
+		let mut text = String::new();
 		let mut pending_stop_reason: Option<completions::FinishReason> = None;
 		let mut pending_usage: Option<completions::Usage> = None;
 
@@ -636,24 +721,30 @@ pub mod to_responses {
 				match evt {
 					SseJsonEvent::Eof | SseJsonEvent::Error => return events,
 					SseJsonEvent::Done => {
+						// Fall through to namespace restoration for the terminal events too.
 						if !flushed {
 							flushed = true;
+							let response_builder = response_builder.get_or_insert_with(|| {
+								types::responses::ResponseBuilder::new(response_id.clone(), String::new())
+							});
 							flush_end(
 								&mut events,
 								&mut sequence_number,
 								&mut tool_calls,
+								&mut reasoning,
 								&mut pending_stop_reason,
 								&mut pending_usage,
 								&message_item_id,
+								&mut message_output_index,
+								&mut next_output_index,
 								&sent_content_part,
+								&text,
 								&log,
-								&response_id,
-								&model_holder.borrow(),
+								response_builder,
 								&mut completion,
 								&mut logged_tool_calls,
 							);
 						}
-						return events;
 					},
 					SseJsonEvent::Data(Err(e)) => {
 						tracing::warn!(
@@ -665,27 +756,25 @@ pub mod to_responses {
 					SseJsonEvent::Data(Ok(chunk)) => {
 						if !sent_created {
 							sent_created = true;
-							*model_holder.borrow_mut() = chunk.model.clone();
-
-							let response_builder =
-								types::responses::ResponseBuilder::new(response_id.clone(), chunk.model.clone());
+							let response_builder = response_builder.insert(
+								types::responses::ResponseBuilder::new(response_id.clone(), chunk.model.clone()),
+							);
 
 							sequence_number += 1;
 							events.push(("event", response_builder.created_event(sequence_number)));
 
+							// `response.in_progress` follows `response.created` in the API's event order.
 							sequence_number += 1;
 							events.push((
 								"event",
-								ResponseStreamEvent::ResponseOutputItemAdded(ResponseOutputItemAddedEvent {
+								ResponseStreamEvent::ResponseInProgress(responses::ResponseInProgressEvent {
 									sequence_number,
-									output_index: 0,
-									item: OutputItem::Message(OutputMessage {
-										content: Vec::new(),
-										id: message_item_id.clone(),
-										role: AssistantRole::Assistant,
-										phase: None,
-										status: OutputStatus::InProgress,
-									}),
+									response: response_builder.response(
+										responses::Status::InProgress,
+										None,
+										None,
+										None,
+									),
 								}),
 							));
 
@@ -702,10 +791,59 @@ pub mod to_responses {
 						}
 
 						if let Some(choice) = chunk.choices.first() {
-							if let Some(content) = &choice.delta.content {
+							if let Some(delta) = choice.delta.reasoning() {
+								let (item_id, output_index, reasoning_text) = reasoning.get_or_insert_with(|| {
+									let item_id = format!("rs_{:016x}", rand::rng().random::<u64>());
+									let output_index = next_output_index;
+									next_output_index += 1;
+									sequence_number += 1;
+									events.push((
+										"event",
+										ResponseStreamEvent::ResponseOutputItemAdded(ResponseOutputItemAddedEvent {
+											sequence_number,
+											output_index,
+											item: OutputItem::Reasoning(ReasoningItem {
+												id: Some(item_id.clone()),
+												summary: vec![],
+												content: None,
+												encrypted_content: None,
+												status: Some(OutputStatus::InProgress),
+											}),
+										}),
+									));
+									(item_id, output_index, String::new())
+								});
+								reasoning_text.push_str(delta);
+
+								record_token(&mut last_token_at, &log);
+
+								sequence_number += 1;
+								events.push((
+									"event",
+									ResponseStreamEvent::ResponseReasoningTextDelta(
+										ResponseReasoningTextDeltaEvent {
+											sequence_number,
+											item_id: item_id.clone(),
+											output_index: *output_index,
+											content_index: 0,
+											delta: delta.to_string(),
+										},
+									),
+								));
+							}
+
+							if let Some(content) = choice.delta.content.as_ref().filter(|c| !c.is_empty()) {
 								if let Some(completion) = completion.as_mut() {
 									completion.push_str(content);
 								}
+								text.push_str(content);
+								let message_output_index = open_message(
+									&mut events,
+									&mut sequence_number,
+									&mut message_output_index,
+									&mut next_output_index,
+									&message_item_id,
+								);
 								if !sent_content_part {
 									sent_content_part = true;
 									sequence_number += 1;
@@ -714,7 +852,7 @@ pub mod to_responses {
 										ResponseStreamEvent::ResponseContentPartAdded(ResponseContentPartAddedEvent {
 											sequence_number,
 											item_id: message_item_id.clone(),
-											output_index: 0,
+											output_index: message_output_index,
 											content_index: 0,
 											part: OutputContent::OutputText(OutputTextContent {
 												text: String::new(),
@@ -725,12 +863,7 @@ pub mod to_responses {
 									));
 								}
 
-								if !saw_token {
-									saw_token = true;
-									log.update(|r| {
-										r.response.first_token = Some(Instant::now());
-									});
-								}
+								record_token(&mut last_token_at, &log);
 
 								sequence_number += 1;
 								events.push((
@@ -738,7 +871,7 @@ pub mod to_responses {
 									ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
 										sequence_number,
 										item_id: message_item_id.clone(),
-										output_index: 0,
+										output_index: message_output_index,
 										content_index: 0,
 										delta: content.clone(),
 										logprobs: None,
@@ -747,6 +880,14 @@ pub mod to_responses {
 							}
 
 							if let Some(tcs) = &choice.delta.tool_calls {
+								// The message keeps its place ahead of the tool calls.
+								open_message(
+									&mut events,
+									&mut sequence_number,
+									&mut message_output_index,
+									&mut next_output_index,
+									&message_item_id,
+								);
 								for tc in tcs {
 									let tool_index = tc.index;
 									if let Some(logged_tool_calls) = logged_tool_calls.as_mut() {
@@ -783,12 +924,7 @@ pub mod to_responses {
 									}
 
 									if is_new {
-										if !saw_token {
-											saw_token = true;
-											log.update(|r| {
-												r.response.first_token = Some(Instant::now());
-											});
-										}
+										record_token(&mut last_token_at, &log);
 
 										sequence_number += 1;
 										events.push((
@@ -804,6 +940,7 @@ pub mod to_responses {
 													caller: None,
 													id: Some(entry.0.clone()),
 													status: Some(OutputStatus::InProgress),
+													r#async: None,
 												}),
 											}),
 										));
@@ -836,17 +973,23 @@ pub mod to_responses {
 
 						if !flushed && pending_stop_reason.is_some() && pending_usage.is_some() {
 							flushed = true;
+							let response_builder = response_builder
+								.as_ref()
+								.expect("response builder is set after the first chunk");
 							flush_end(
 								&mut events,
 								&mut sequence_number,
 								&mut tool_calls,
+								&mut reasoning,
 								&mut pending_stop_reason,
 								&mut pending_usage,
 								&message_item_id,
+								&mut message_output_index,
+								&mut next_output_index,
 								&sent_content_part,
+								&text,
 								&log,
-								&response_id,
-								&model_holder.borrow(),
+								response_builder,
 								&mut completion,
 								&mut logged_tool_calls,
 							);
@@ -854,16 +997,58 @@ pub mod to_responses {
 					},
 				}
 
+				if let Some(namespaces) = &namespaces {
+					for (_, event) in &mut events {
+						namespaces.restore_event(event);
+					}
+				}
 				events
 			},
 		)
 	}
 
-	fn usage_output_tokens(usage: &completions::Usage) -> u32 {
-		if usage.completion_tokens == 0 && usage.total_tokens > 0 {
-			return usage.total_tokens.saturating_sub(usage.prompt_tokens);
+	/// Records the first token time, or the gap since the previous token.
+	fn record_token(last_token_at: &mut Option<Instant>, log: &StreamingUsageGuard) {
+		let now = Instant::now();
+		match last_token_at.replace(now) {
+			None => log.update(|r| r.response.first_token = Some(now)),
+			Some(prev) => {
+				let gap = now.duration_since(prev);
+				log.update(|r| r.response.inter_chunk_latencies.record(gap));
+			},
 		}
-		usage.completion_tokens
+	}
+
+	/// Emits the message's `output_item.added` the first time it is needed and returns its index.
+	fn open_message(
+		events: &mut Vec<(&'static str, responses::ResponseStreamEvent)>,
+		sequence_number: &mut u64,
+		message_output_index: &mut Option<u32>,
+		next_output_index: &mut u32,
+		message_item_id: &str,
+	) -> u32 {
+		*message_output_index.get_or_insert_with(|| {
+			let output_index = *next_output_index;
+			*next_output_index += 1;
+			*sequence_number += 1;
+			events.push((
+				"event",
+				responses::ResponseStreamEvent::ResponseOutputItemAdded(
+					responses::ResponseOutputItemAddedEvent {
+						sequence_number: *sequence_number,
+						output_index,
+						item: responses::OutputItem::Message(responses::OutputMessage {
+							content: Vec::new(),
+							id: message_item_id.to_string(),
+							role: responses::AssistantRole::Assistant,
+							phase: None,
+							status: responses::OutputStatus::InProgress,
+						}),
+					},
+				),
+			));
+			output_index
+		})
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -871,21 +1056,26 @@ pub mod to_responses {
 		events: &mut Vec<(&'static str, responses::ResponseStreamEvent)>,
 		sequence_number: &mut u64,
 		tool_calls: &mut HashMap<u32, (String, String, String, u32)>,
+		reasoning: &mut Option<(String, u32, String)>,
 		pending_stop_reason: &mut Option<completions::FinishReason>,
 		pending_usage: &mut Option<completions::Usage>,
 		message_item_id: &str,
+		message_output_index: &mut Option<u32>,
+		next_output_index: &mut u32,
 		sent_content_part: &bool,
+		text: &str,
 		log: &StreamingUsageGuard,
-		response_id: &str,
-		model: &str,
+		response_builder: &types::responses::ResponseBuilder,
 		completion: &mut Option<String>,
 		logged_tool_calls: &mut Option<LoggedToolCalls>,
 	) {
 		use responses::{
-			AssistantRole, ErrorObject, FunctionToolCall, IncompleteDetails, InputTokenDetails,
-			OutputContent, OutputItem, OutputMessage, OutputStatus, OutputTextContent,
-			OutputTokenDetails, ResponseContentPartDoneEvent, ResponseFunctionCallArgumentsDoneEvent,
-			ResponseOutputItemDoneEvent, ResponseStreamEvent, ResponseUsage,
+			AssistantRole, FunctionToolCall, IncompleteDetails, InputTokenDetails, OutputContent,
+			OutputItem, OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent,
+			OutputTokenDetails, ReasoningItem, ReasoningItemContent, ReasoningTextContent,
+			ResponseContentPartDoneEvent, ResponseError, ResponseFunctionCallArgumentsDoneEvent,
+			ResponseOutputItemDoneEvent, ResponseReasoningTextDoneEvent, ResponseStreamEvent,
+			ResponseTextDoneEvent, ResponseUsage,
 		};
 
 		let stop_reason = pending_stop_reason.take();
@@ -919,6 +1109,50 @@ pub mod to_responses {
 			);
 		});
 
+		// Finished items, sorted into output order below — what `response.completed` carries.
+		let mut output: Vec<(u32, OutputItem)> = Vec::new();
+
+		if let Some((item_id, output_index, text)) = reasoning.take() {
+			*sequence_number += 1;
+			events.push((
+				"event",
+				ResponseStreamEvent::ResponseReasoningTextDone(ResponseReasoningTextDoneEvent {
+					sequence_number: *sequence_number,
+					item_id: item_id.clone(),
+					output_index,
+					content_index: 0,
+					text: text.clone(),
+				}),
+			));
+			let item = OutputItem::Reasoning(ReasoningItem {
+				id: Some(item_id),
+				summary: vec![],
+				content: Some(vec![ReasoningItemContent::ReasoningText(
+					ReasoningTextContent { text },
+				)]),
+				encrypted_content: None,
+				status: Some(OutputStatus::Completed),
+			});
+			*sequence_number += 1;
+			events.push((
+				"event",
+				ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+					sequence_number: *sequence_number,
+					output_index,
+					item: item.clone(),
+				}),
+			));
+			output.push((output_index, item));
+		}
+
+		let message_output_index = open_message(
+			events,
+			sequence_number,
+			message_output_index,
+			next_output_index,
+			message_item_id,
+		);
+
 		let mut sorted_tools: Vec<_> = tool_calls.drain().collect();
 		sorted_tools.sort_by_key(|(_, (_, _, _, output_index))| *output_index);
 
@@ -937,63 +1171,88 @@ pub mod to_responses {
 				),
 			));
 
+			let item = OutputItem::FunctionCall(FunctionToolCall {
+				arguments: buffer,
+				call_id: item_id.clone(),
+				namespace: None,
+				name,
+				caller: None,
+				id: Some(item_id),
+				status: Some(OutputStatus::Completed),
+				r#async: None,
+			});
 			*sequence_number += 1;
 			events.push((
 				"event",
 				ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
 					sequence_number: *sequence_number,
 					output_index,
-					item: OutputItem::FunctionCall(FunctionToolCall {
-						arguments: buffer,
-						call_id: item_id.clone(),
-						namespace: None,
-						name,
-						caller: None,
-						id: Some(item_id),
-						status: Some(OutputStatus::Completed),
-					}),
+					item: item.clone(),
 				}),
 			));
+			output.push((output_index, item));
 		}
 
+		let mut content = Vec::new();
 		if *sent_content_part {
+			*sequence_number += 1;
+			events.push((
+				"event",
+				ResponseStreamEvent::ResponseOutputTextDone(ResponseTextDoneEvent {
+					sequence_number: *sequence_number,
+					item_id: message_item_id.to_string(),
+					output_index: message_output_index,
+					content_index: 0,
+					text: text.to_string(),
+					logprobs: None,
+				}),
+			));
 			*sequence_number += 1;
 			events.push((
 				"event",
 				ResponseStreamEvent::ResponseContentPartDone(ResponseContentPartDoneEvent {
 					sequence_number: *sequence_number,
 					item_id: message_item_id.to_string(),
-					output_index: 0,
+					output_index: message_output_index,
 					content_index: 0,
 					part: OutputContent::OutputText(OutputTextContent {
 						annotations: Vec::new(),
 						logprobs: None,
-						text: String::new(),
+						text: text.to_string(),
 					}),
 				}),
 			));
+			content.push(OutputMessageContent::OutputText(OutputTextContent {
+				annotations: Vec::new(),
+				logprobs: None,
+				text: text.to_string(),
+			}));
 		}
 
+		let message = OutputItem::Message(OutputMessage {
+			content,
+			id: message_item_id.to_string(),
+			role: AssistantRole::Assistant,
+			phase: None,
+			status: OutputStatus::Completed,
+		});
 		*sequence_number += 1;
 		events.push((
 			"event",
 			ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
 				sequence_number: *sequence_number,
-				output_index: 0,
-				item: OutputItem::Message(OutputMessage {
-					content: Vec::new(),
-					id: message_item_id.to_string(),
-					role: AssistantRole::Assistant,
-					phase: None,
-					status: OutputStatus::Completed,
-				}),
+				output_index: message_output_index,
+				item: message.clone(),
 			}),
 		));
+		output.push((message_output_index, message));
+		output.sort_by_key(|(output_index, _)| *output_index);
+		let output: Vec<OutputItem> = output.into_iter().map(|(_, item)| item).collect();
 
 		if let Some(ref u) = usage {
 			log.update(|r| {
 				r.response.input_tokens = Some(u.prompt_tokens as u64);
-				r.response.output_tokens = Some(usage_output_tokens(u) as u64);
+				r.response.output_tokens = Some(u.output_tokens() as u64);
 				r.response.total_tokens = Some(u.total_tokens as u64);
 				r.response.cached_input_tokens = u
 					.prompt_tokens_details
@@ -1013,7 +1272,7 @@ pub mod to_responses {
 
 		let usage_obj = usage.map(|u| ResponseUsage {
 			input_tokens: u.prompt_tokens,
-			output_tokens: usage_output_tokens(&u),
+			output_tokens: u.output_tokens(),
 			total_tokens: u.total_tokens,
 			input_tokens_details: InputTokenDetails {
 				cached_tokens: u
@@ -1026,7 +1285,8 @@ pub mod to_responses {
 					.as_ref()
 					.and_then(|d| d.cache_write_tokens)
 					.or(u.cache_creation_input_tokens)
-					.map(|tokens| tokens as u32),
+					.map(|tokens| tokens as i64),
+				cache_write_tokens_details: None,
 			},
 			output_tokens_details: OutputTokenDetails {
 				reasoning_tokens: u
@@ -1037,11 +1297,8 @@ pub mod to_responses {
 			},
 		});
 
-		let response_builder =
-			types::responses::ResponseBuilder::new(response_id.to_string(), model.to_string());
-
 		*sequence_number += 1;
-		let done_event = match stop_reason {
+		let mut done_event = match stop_reason {
 			Some(completions::FinishReason::Stop)
 			| Some(completions::FinishReason::ToolCalls)
 			| Some(completions::FinishReason::FunctionCall)
@@ -1056,12 +1313,20 @@ pub mod to_responses {
 			Some(completions::FinishReason::ContentFilter) => response_builder.failed_event(
 				*sequence_number,
 				usage_obj,
-				ErrorObject {
-					code: "content_filter".to_string(),
+				ResponseError {
+					code: responses::ResponseErrorCode::Other("content_filter".to_string()),
 					message: "Content filtered".to_string(),
+					misalignment: None,
 				},
 			),
 		};
+
+		match &mut done_event {
+			ResponseStreamEvent::ResponseCompleted(e) => e.response.output = output,
+			ResponseStreamEvent::ResponseIncomplete(e) => e.response.output = output,
+			ResponseStreamEvent::ResponseFailed(e) => e.response.output = output,
+			_ => {},
+		}
 
 		events.push(("event", done_event));
 	}

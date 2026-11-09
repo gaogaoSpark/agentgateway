@@ -1,7 +1,9 @@
 pub mod log;
 pub mod log_store;
 pub mod metrics;
+pub(crate) mod semconv;
 pub mod trc;
+pub mod upstream;
 
 /// Moves potentially blocking destruction off the calling thread.
 #[derive(Debug)]

@@ -41,7 +41,10 @@ export const mcpSettingsFields = [
 	'port',
 	'statefulMode',
 	'prefixMode',
-	'failureMode'
+	'failureMode',
+	'sseKeepAlive',
+	'dnsRebindingProtection',
+	'server'
 ] as const;
 
 export const providerNames: ProviderName[] = [
@@ -52,6 +55,7 @@ export const providerNames: ProviderName[] = [
 	'bedrock',
 	'azure',
 	'copilot',
+	'typesafe',
 	'cohere',
 	'ollama',
 	'baseten',
@@ -65,6 +69,9 @@ export const providerNames: ProviderName[] = [
 	'togetherai',
 	'xai',
 	'fireworks',
+	'meta',
+	'perplexity',
+	'nebius',
 	'custom'
 ];
 
@@ -76,6 +83,7 @@ export const coreProviderNames = new Set<ProviderName>([
 	'bedrock',
 	'azure',
 	'copilot',
+	'typesafe',
 	'custom'
 ]);
 
@@ -98,10 +106,11 @@ export function providerDisplayName(provider: ProviderName | string): string {
 		openAI: 'OpenAI',
 		anthropic: 'Anthropic',
 		gemini: 'Gemini',
-		vertex: 'Vertex AI',
+		vertex: 'Gemini Enterprise (GCP Vertex)',
 		bedrock: 'Amazon Bedrock',
 		azure: 'Azure',
 		copilot: 'GitHub Copilot',
+		typesafe: 'TypeSafe',
 		cohere: 'Cohere',
 		ollama: 'Ollama',
 		baseten: 'Baseten',
@@ -113,8 +122,11 @@ export function providerDisplayName(provider: ProviderName | string): string {
 		mistral: 'Mistral AI',
 		openrouter: 'OpenRouter',
 		togetherai: 'Together AI',
-		xai: 'xAI',
+		xai: 'xAI (Grok)',
 		fireworks: 'Fireworks AI',
+		meta: 'Meta',
+		perplexity: 'Perplexity',
+		nebius: 'Nebius Token Factory',
 		custom: 'Custom'
 	};
 	return names[provider] ?? provider;
@@ -141,23 +153,8 @@ export function cloneConfig(config: GatewayConfig): GatewayConfig {
 }
 
 export function ensureLlm(config: GatewayConfig): LlmConfig {
-	if (!config.llm) {
-		config.llm = { models: [] };
-		ensureLlmFrontendDefaults(config);
-	}
+	config.llm ??= { models: [] };
 	return config.llm;
-}
-
-export function ensureLlmFrontendDefaults(config: GatewayConfig) {
-	config.frontendPolicies ??= {};
-	if (!config.frontendPolicies.http) {
-		config.frontendPolicies.http = {
-			// Raise the global body-buffer cap above the 2Mi default so the LLM filter
-			// can read ~800k-1M-token request bodies (about 3-4 MB JSON) without rejecting
-			// them as AIError::RequestTooLarge.
-			maxBufferSize: 33554432
-		};
-	}
 }
 
 export function ensureMcp(config: GatewayConfig): McpConfig {
@@ -170,38 +167,40 @@ export function ensureMcp(config: GatewayConfig): McpConfig {
 	return config.mcp;
 }
 
-export function startupLlmConfig(config: GatewayConfig, port: number): LlmConfig {
-	const gateways = config.ui?.gateways;
-	if (gateways) {
-		return {
-			gateways,
-			models: [],
-			providers: [],
-			virtualModels: []
-		};
-	}
-	return {
-		port,
-		models: [],
-		providers: [],
-		virtualModels: []
-	};
-}
-
-export function startupMcpConfig(config: GatewayConfig, port: number): McpConfig {
-	const gateways = config.ui?.gateways;
-	if (gateways) {
-		return {
-			gateways,
-			targets: []
-		};
-	}
-	return { port, targets: [] };
-}
-
-export function usesUiGateways(config: GatewayConfig | undefined) {
+export function startupGatewayRefs(config: GatewayConfig | undefined): string | string[] {
 	const gateways = config?.ui?.gateways;
-	return Array.isArray(gateways) ? gateways.length > 0 : Boolean(gateways);
+	if (gateways && (!Array.isArray(gateways) || gateways.length > 0)) return gateways;
+	if (config?.gateways?.default) return 'default';
+	return Object.keys(config?.gateways ?? {})[0] ?? 'default';
+}
+
+function ensureStartupGateway(config: GatewayConfig, gateways: string | string[]) {
+	if (Object.keys(config.gateways ?? {}).length) return;
+	const occupiedPorts = new Set([
+		...(config.binds ?? []).map(bind => bind.port),
+		config.llm ? (config.llm.port ?? 4000) : undefined,
+		config.mcp ? (config.mcp.port ?? 3000) : undefined
+	]);
+	let port = 4000;
+	while (occupiedPorts.has(port)) port++;
+	const name = (Array.isArray(gateways) ? gateways[0] : gateways).split('/')[0];
+	config.gateways = { [name]: { port } };
+}
+
+export function startupLlmConfig(
+	config: GatewayConfig,
+	gateways = startupGatewayRefs(config)
+): LlmConfig {
+	ensureStartupGateway(config, gateways);
+	return { gateways };
+}
+
+export function startupMcpConfig(
+	config: GatewayConfig,
+	gateways = startupGatewayRefs(config)
+): McpConfig {
+	ensureStartupGateway(config, gateways);
+	return { gateways };
 }
 
 export function upsertModel(config: GatewayConfig, model: LlmModel, previousId?: string) {
@@ -267,9 +266,7 @@ export function fileOwnedMcpSettingFields(
 ): ReadonlySet<string> {
 	if (!hybrid) return new Set();
 	const mcp = config?.mcp;
-	return new Set(
-		mcpSettingsFields.filter(field => Object.prototype.hasOwnProperty.call(mcp ?? {}, field))
-	);
+	return new Set(mcpSettingsFields.filter(field => Object.hasOwn(mcp ?? {}, field)));
 }
 
 type LlmPolicyWithGuardrails = NonNullable<LlmConfig['policies']> & {
@@ -290,6 +287,7 @@ export function setLlmGuardrails(config: GatewayConfig, guardrails: LlmGuardrail
 
 export function upsertMcpTarget(config: GatewayConfig, target: McpTarget, previousName?: string) {
 	const mcp = ensureMcp(config);
+	mcp.targets ??= [];
 	const index = mcp.targets.findIndex(item => item.name === (previousName ?? target.name));
 	if (index >= 0) {
 		mcp.targets[index] = target;
@@ -392,14 +390,6 @@ export function modelWarnings(model: LlmModel): string[] {
 	if (provider === 'azure' && !model.params?.azureResourceName) {
 		warnings.push('Azure models should set a resource name.');
 	}
-	if (
-		provider === 'custom' &&
-		typeof model.provider !== 'string' &&
-		'custom' in model.provider &&
-		!model.provider.custom.formats.length
-	) {
-		warnings.push('Custom providers need at least one supported format.');
-	}
 	return warnings;
 }
 
@@ -462,12 +452,12 @@ export function makeEmptyModel(): LlmModel {
 	} as unknown as LlmModel;
 }
 
-export function makeEmptyVirtualModel(): LlmVirtualModel {
+export function makeEmptyVirtualModel(model = ''): LlmVirtualModel {
 	return {
 		name: '',
 		routing: {
 			weighted: {
-				targets: [{ model: '', weight: 1 }]
+				targets: [{ model, weight: 1 }]
 			}
 		}
 	};

@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+frontendPolicies:
+  tracing:
+    host: localhost:4318
+    protocol: http
+    randomSampling: true
+    attributes:
+      env: '"datadog-dev"'
+llm:
+  port: 3000
+  models:
+  - name: homehub-support
+    provider: openAI
+    params:
+      baseUrl: http://localhost:18080/v1

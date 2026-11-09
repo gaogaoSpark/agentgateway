@@ -95,6 +95,9 @@ pub struct BilledUnits {
 }
 
 impl RequestType for Request {
+	fn input_format() -> crate::InputFormat {
+		crate::InputFormat::Rerank
+	}
 	fn body_is_json(&self) -> bool {
 		true
 	}
@@ -117,6 +120,7 @@ impl RequestType for Request {
 			input_format: InputFormat::Rerank,
 			cache_convention: crate::CacheTokenConvention::pending(),
 			request_model: model,
+			original_model: None,
 			provider,
 			streaming: false,
 			params: LLMRequestParams::default(),
@@ -176,7 +180,7 @@ impl crate::types::ResponseType for Response {
 		serde_json::to_vec(self)
 	}
 
-	fn visit_text_mut(&mut self, _f: &mut dyn FnMut(&mut String)) {}
+	fn visit_text_mut(&mut self, _f: &mut dyn FnMut(crate::types::ResponseText, &mut String)) {}
 }
 
 /// Parse a rerank response, accepting either Cohere's `results` or Voyage's `data` key.

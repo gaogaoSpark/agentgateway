@@ -7,6 +7,7 @@ import type { PolicyResourceKind } from '@/api/configResourcesApi';
 import { PageHeader, Panel, StatusBanner, YamlBlock } from '@/components/Primitives';
 import { ensureLlm, ensureMcp } from '@/config';
 import {
+	resetFinishedSaves,
 	useDeleteConfigResource,
 	useEffectiveGatewayConfig,
 	useRawGatewayConfig,
@@ -167,7 +168,7 @@ export function PolicyCatalogPage(props: {
 	}, [help, props.policyKeys, props.schemaRoot]);
 	const selectedMeta = policyCatalog.find(policy => policy.key === selected);
 	const selectedFileOwned = Boolean(
-		selected && filePolicies && Object.prototype.hasOwnProperty.call(filePolicies, selected)
+		selected && filePolicies && Object.hasOwn(filePolicies, selected)
 	);
 	const saving = upsertPolicy.isPending || deleteResource.isPending;
 	const saveError = upsertPolicy.error?.message ?? deleteResource.error?.message ?? null;
@@ -205,8 +206,7 @@ export function PolicyCatalogPage(props: {
 
 	useEffect(() => {
 		function syncSelectedFromUrl() {
-			upsertPolicy.reset();
-			deleteResource.reset();
+			resetFinishedSaves(upsertPolicy, deleteResource);
 			setSelected(policyKeyFromHash());
 		}
 		window.addEventListener('hashchange', syncSelectedFromUrl);
@@ -218,6 +218,7 @@ export function PolicyCatalogPage(props: {
 	}, [deleteResource, upsertPolicy]);
 
 	useLayoutEffect(() => {
+		if (selected !== null) return;
 		const scroll = pendingScrollRestore.current;
 		if (!scroll) return;
 		pendingScrollRestore.current = null;
@@ -225,15 +226,13 @@ export function PolicyCatalogPage(props: {
 	}, [selected]);
 
 	function openPolicy(policyKey: PolicyKey) {
-		upsertPolicy.reset();
-		deleteResource.reset();
+		resetFinishedSaves(upsertPolicy, deleteResource);
 		setSelected(policyKey);
 		setPolicyHash(policyKey, 'push');
 	}
 
 	function closePolicy() {
-		upsertPolicy.reset();
-		deleteResource.reset();
+		resetFinishedSaves(upsertPolicy, deleteResource);
 		pendingScrollRestore.current = { x: window.scrollX, y: window.scrollY };
 		setSelected(null);
 		setPolicyHash(null, 'replace');

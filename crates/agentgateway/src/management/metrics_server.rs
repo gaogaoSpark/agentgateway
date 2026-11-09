@@ -4,9 +4,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use agent_core::drain::DrainWatcher;
+use agent_http::Response;
 use anyhow::{Context, Result};
-use headers::Header;
-use headers_accept::Accept;
 use hyper::body::Incoming;
 use hyper::{Request, StatusCode, header};
 use mediatype::{MediaType, ReadParams, WriteParams};
@@ -14,17 +13,20 @@ use prometheus_client::encoding::prometheus_protobuf;
 use prometheus_client::encoding::text::encode as encode_openmetrics;
 use prometheus_client::registry::Registry;
 
+use super::accept::Accept;
 use super::hyper_helpers;
 use crate::Address;
-use crate::http::Response;
 
 pub struct Server {
-	s: hyper_helpers::Server<Registry>,
+	s: hyper_helpers::Server<MetricsService>,
 }
 
 impl Server {
 	pub async fn new(addr: Address, drain_rx: DrainWatcher, registry: Registry) -> Result<Self> {
-		hyper_helpers::Server::<Registry>::bind("stats", addr, drain_rx, registry)
+		let service = MetricsService {
+			registry: Arc::new(registry),
+		};
+		hyper_helpers::Server::<MetricsService>::bind("stats", addr, drain_rx, service)
 			.await
 			.map(|s| Server { s })
 	}
@@ -33,13 +35,52 @@ impl Server {
 		self.s.address()
 	}
 
+	pub fn service(&self) -> MetricsService {
+		self.s.state().clone()
+	}
+
 	pub fn spawn(self) {
-		self.s.spawn(|registry, req| async move {
-			match req.uri().path() {
-				"/metrics" | "/stats/prometheus" => handle_metrics(registry, req).await,
-				_ => Ok(hyper_helpers::empty_response(hyper::StatusCode::NOT_FOUND)),
-			}
-		})
+		self
+			.s
+			.spawn(|service, req| async move { service.handle(req).await })
+	}
+}
+
+#[derive(Clone, Debug)]
+pub struct MetricsService {
+	registry: Arc<Registry>,
+}
+
+impl MetricsService {
+	pub async fn handle(&self, req: Request<Incoming>) -> Result<Response> {
+		match req.uri().path() {
+			"/metrics" | "/stats/prometheus" => handle_metrics(self.registry.clone(), req).await,
+			_ => Ok(hyper_helpers::empty_response(hyper::StatusCode::NOT_FOUND)),
+		}
+	}
+
+	/// Serves HTTP/1 on an already established connection, such as an HBONE tunnel.
+	pub async fn serve_connection<IO>(self, io: IO) -> Result<()>
+	where
+		IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+	{
+		hyper_helpers::http1_server()
+			.half_close(true)
+			.header_read_timeout(std::time::Duration::from_secs(2))
+			.max_buf_size(8 * 1024)
+			.serve_connection(
+				hyper_util::rt::TokioIo::new(io),
+				hyper::service::service_fn(move |req| {
+					let service = self.clone();
+					async move {
+						Ok::<_, std::convert::Infallible>(service.handle(req).await.unwrap_or_else(|err| {
+							hyper_helpers::plaintext_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+						}))
+					}
+				}),
+			)
+			.await?;
+		Ok(())
 	}
 }
 
@@ -61,8 +102,8 @@ async fn handle_metrics(reg: Arc<Registry>, req: Request<Incoming>) -> Result<Re
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum MetricsFormat {
-	#[default]
 	PlainText,
+	#[default]
 	OpenMetricsText,
 	PrometheusProtobuf,
 }
@@ -94,11 +135,19 @@ impl MetricsFormat {
 
 fn negotiate_format<T>(req: &Request<T>) -> Option<MetricsFormat> {
 	use mediatype::Name;
-	use mediatype::names::{APPLICATION, PLAIN, Q, TEXT};
+	use mediatype::names::{APPLICATION, HTML, Q, TEXT};
 
 	let mut values = req.headers().get_all(http::header::ACCEPT).iter();
-	Accept::decode(&mut values)
-		.ok()?
+	let accept = Accept::decode(&mut values).ok()?;
+	// Browsers download application/openmetrics-text rather than displaying it, so label the
+	// (OpenMetrics) body as text/plain for them.
+	if accept
+		.media_types()
+		.any(|media_type| media_type.ty() == TEXT && media_type.subty() == HTML)
+	{
+		return Some(MetricsFormat::PlainText);
+	}
+	accept
 		.media_types()
 		.map(|media_type| {
 			let mut normalized = media_type.essence();
@@ -109,7 +158,6 @@ fn negotiate_format<T>(req: &Request<T>) -> Option<MetricsFormat> {
 		})
 		.collect::<Accept>()
 		.negotiate(&[
-			MediaType::new(TEXT, PLAIN),
 			MediaType::new(APPLICATION, Name::new_unchecked("openmetrics-text")),
 			MediaType::new(APPLICATION, Name::new_unchecked("vnd.google.protobuf")),
 			MediaType::new(APPLICATION, Name::new_unchecked("protobuf")),
@@ -117,8 +165,7 @@ fn negotiate_format<T>(req: &Request<T>) -> Option<MetricsFormat> {
 		])
 		.map(|media_type| match media_type.subty.as_str() {
 			"openmetrics-text" => MetricsFormat::OpenMetricsText,
-			"vnd.google.protobuf" | "protobuf" | "x-protobuf" => MetricsFormat::PrometheusProtobuf,
-			_ => MetricsFormat::PlainText,
+			_ => MetricsFormat::PrometheusProtobuf,
 		})
 }
 
@@ -136,13 +183,17 @@ mod tests {
 	use crate::Address;
 
 	#[rstest]
-	#[case::no_accept(None, MetricsFormat::PlainText)]
-	#[case::wildcard(Some("*/*"), MetricsFormat::PlainText)]
+	#[case::no_accept(None, MetricsFormat::OpenMetricsText)]
+	#[case::wildcard(Some("*/*"), MetricsFormat::OpenMetricsText)]
 	#[case::openmetrics(
 		Some("application/openmetrics-text;version=1.0.0"),
 		MetricsFormat::OpenMetricsText
 	)]
-	#[case::plain_text(Some("text/plain;version=0.0.4"), MetricsFormat::PlainText)]
+	#[case::plain_text(Some("text/plain;version=0.0.4"), MetricsFormat::OpenMetricsText)]
+	#[case::browser(
+		Some("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+		MetricsFormat::PlainText
+	)]
 	#[case::canonical_protobuf(
 		Some(
 			"APPLICATION/VND.GOOGLE.PROTOBUF;PROTO=io.prometheus.client.MetricFamily;ENCODING=delimited"
@@ -198,7 +249,7 @@ mod tests {
 		"application/vnd.google.protobuf;q=0.9,text/plain;q=0.8",
 		MetricsFormat::PrometheusProtobuf
 	)]
-	#[case::wildcard_parameter("*/*;unknown=parameter", MetricsFormat::PlainText)]
+	#[case::wildcard_parameter("*/*;unknown=parameter", MetricsFormat::OpenMetricsText)]
 	#[case::quoted_openmetrics_parameters(
 		"application/openmetrics-text;version=\"1.0.0\";escaping=\"allow-utf-8\"",
 		MetricsFormat::OpenMetricsText
@@ -260,7 +311,7 @@ mod tests {
 
 		let plain_text = client
 			.get(&url)
-			.header("accept", "text/plain;version=0.0.4")
+			.header("accept", "text/html,*/*;q=0.8")
 			.send()
 			.await
 			.unwrap();

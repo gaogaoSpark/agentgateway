@@ -8,15 +8,17 @@ import {
 	KeyRound,
 	Pencil,
 	Plus,
+	RefreshCw,
 	SlidersHorizontal,
 	Tags,
 	Trash2,
 	X
 } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import type { BudgetStatus, BudgetStatusResponse } from '@/api/budgetsApi';
 import { ConfigDiffSaveActions } from '@/components/ConfigDiffDrawer';
+import { LostFieldsWarning, useMergedEdits } from '@/components/EditorContracts';
 import { EnumSelector } from '@/components/EnumSelector';
 import {
 	ConfirmDialog,
@@ -34,7 +36,7 @@ import {
 	Tooltip
 } from '@/components/Primitives';
 import { getApiKeyPolicy, isDatabaseConfigResource, upsertVirtualKey } from '@/config';
-import { hasKeyValue, keyValue, maskKey } from '@/credentialDisplay';
+import { hasKeyValue, keyDisplay, keyHintMetadata, keyValue } from '@/credentialDisplay';
 import { useStickyQueryParam } from '@/drawerRouteState';
 import {
 	useBudgetStatus,
@@ -58,6 +60,7 @@ const fileOwnedPolicyMessage =
 	'This API key policy is file-owned and cannot be modified in hybrid mode.';
 const managedMetadataPrefix = 'agentgateway.dev/';
 const apiKeyIdMetadata = 'agentgateway.dev/id';
+const keyHashSupported = Boolean(globalThis.crypto?.subtle);
 
 export function KeysPage() {
 	const {
@@ -79,8 +82,7 @@ export function KeysPage() {
 	const help = useSchemaHelp();
 	const policy = (policies.apiKey ?? null) as LlmApiKeyPolicy | null;
 	const filePolicyOwned = Boolean(
-		rawConfig.data?.llm?.policies &&
-			Object.prototype.hasOwnProperty.call(rawConfig.data.llm.policies, 'apiKey')
+		rawConfig.data?.llm?.policies && Object.hasOwn(rawConfig.data.llm.policies, 'apiKey')
 	);
 	const policyReadOnly = hybrid && filePolicyOwned;
 	const [editing, setEditing] = useState<{
@@ -88,6 +90,7 @@ export function KeysPage() {
 		key: VirtualApiKey;
 	} | null>(null);
 	const [deleteKey, setDeleteKey] = useState<VirtualApiKey | null>(null);
+	const [createdKey, setCreatedKey] = useState<string | null>(null);
 	const [disablePolicyOpen, setDisablePolicyOpen] = useState(false);
 	const [keyDrawer, setKeyDrawer] = useStickyQueryParam('key');
 	const linkedKey = linkedVirtualKey(keyDrawer, keys);
@@ -112,7 +115,7 @@ export function KeysPage() {
 		return hybrid && id && isDatabaseConfigResource(resources, 'llm.apiKey', id) ? id : undefined;
 	}
 
-	function saveKey(key: VirtualApiKey, previousKey?: string) {
+	function saveKey(key: VirtualApiKey, previousKey?: string, createdRawKey?: string) {
 		const previous = previousKey ? keys.find(item => keyValue(item) === previousKey) : undefined;
 		const previousIndex = previous ? keys.indexOf(previous) : -1;
 		const previousId = previous ? keyId(previous) || `@index:${previousIndex}` : undefined;
@@ -120,7 +123,15 @@ export function KeysPage() {
 		if (value.metadata && typeof value.metadata === 'object') {
 			value.metadata = withoutServerMetadata(metadataObject(value.metadata));
 		}
-		upsertResource.mutate({ kind: 'llm.apiKey', value, previousId }, { onSuccess: closeKeyDrawer });
+		upsertResource.mutate(
+			{ kind: 'llm.apiKey', value, previousId },
+			{
+				onSuccess: () => {
+					closeKeyDrawer();
+					if (createdRawKey) setCreatedKey(createdRawKey);
+				}
+			}
+		);
 	}
 
 	function removeKey(key: VirtualApiKey) {
@@ -163,7 +174,7 @@ export function KeysPage() {
 		<div className="page-stack">
 			<PageHeader
 				title="Virtual API Keys"
-				description="Provision incoming credentials and metadata for callers."
+				description="Issue API keys that callers use to authenticate to the gateway."
 				actions={
 					<div className="button-row">
 						{policy ? (
@@ -202,13 +213,13 @@ export function KeysPage() {
 				}
 			/>
 
-			{saveError ? (
+			{saveError && !activeEditing && !advancedOpen ? (
 				<StatusBanner state="bad" title="Save failed">
 					{saveError}
 				</StatusBanner>
 			) : null}
-			{policy?.mode && policy.mode !== 'strict' ? (
-				<StatusBanner state="warn" title={`Policy mode is ${modeLabel(policy.mode)}`}>
+			{policy && (policy.mode ?? 'optional') !== 'strict' ? (
+				<StatusBanner state="warn" title={`Policy mode is ${modeLabel(policy.mode ?? 'optional')}`}>
 					Use strict mode when keys should be mandatory.
 				</StatusBanner>
 			) : null}
@@ -287,7 +298,7 @@ export function KeysPage() {
 											{keyName(item) || <span className="muted">Unnamed key</span>}
 										</td>
 										<td className="key-cell">
-											<VirtualKeyValue value={keyValue(item)} />
+											<VirtualKeyValue apiKey={item} />
 										</td>
 										<td>
 											<AllowedModelsSummary value={item.allowedModels} />
@@ -376,6 +387,18 @@ export function KeysPage() {
 					</p>
 				</ConfirmDialog>
 			) : null}
+			{createdKey ? (
+				<ConfirmDialog
+					title="Copy your new API key"
+					confirmLabel="Done"
+					cancelLabel={null}
+					onCancel={() => {}}
+					onConfirm={() => setCreatedKey(null)}
+				>
+					<p>This key will not be shown again. Copy it now.</p>
+					<VirtualKeyValue apiKey={{ key: createdKey }} revealed />
+				</ConfirmDialog>
+			) : null}
 			{disablePolicyOpen ? (
 				<ConfirmDialog
 					title="Disable API key policy?"
@@ -434,7 +457,11 @@ function AdvancedSettingsDrawer(props: {
 	onSave: (policy: Partial<LlmApiKeyPolicy>) => void;
 }) {
 	return (
-		<Drawer title={props.policy ? 'Settings' : 'Enable API key auth'} onClose={props.onClose}>
+		<Drawer
+			title={props.policy ? 'Settings' : 'Enable API key auth'}
+			onClose={props.onClose}
+			error={props.saveError}
+		>
 			<PolicyControls
 				policy={props.policy}
 				databaseBacked={props.databaseBacked}
@@ -446,11 +473,6 @@ function AdvancedSettingsDrawer(props: {
 				onDisable={props.onDisable}
 				onSave={props.onSave}
 			/>
-			{props.saveError ? (
-				<StatusBanner state="bad" title="Save failed">
-					{props.saveError}
-				</StatusBanner>
-			) : null}
 		</Drawer>
 	);
 }
@@ -466,7 +488,7 @@ function PolicyControls(props: {
 	onDisable: () => void;
 	onSave: (policy: Partial<LlmApiKeyPolicy>) => void;
 }) {
-	const [mode, setMode] = useState(props.policy?.mode ?? 'strict');
+	const [mode, setMode] = useState(props.policy?.mode ?? 'optional');
 	const [location, setLocation] = useState(() => authorizationLocationFrom(props.policy?.location));
 	const patch: Partial<LlmApiKeyPolicy> = {
 		mode,
@@ -485,11 +507,8 @@ function PolicyControls(props: {
 				<EnumSelector
 					ariaLabel="Validation mode"
 					value={mode}
-					options={[
-						{ value: 'strict', label: 'Strict' },
-						{ value: 'optional', label: 'Optional' },
-						{ value: 'permissive', label: 'Permissive' }
-					]}
+					schema={props.help.fieldNode<LlmApiKeyPolicy>('LocalAPIKeys', 'mode')}
+					labels={{ strict: 'Strict', optional: 'Optional', permissive: 'Permissive' }}
 					onChange={value => setMode(value as 'strict' | 'optional' | 'permissive')}
 				/>
 			</FieldGroup>
@@ -561,6 +580,33 @@ function apiKeyPolicyResourceValue(policy: LlmApiKeyPolicy) {
 	return value;
 }
 
+type KeyFields = ReturnType<typeof keyFieldsFrom>;
+
+// The gateway's format for `keyHash` (see APIKeyHash::parse).
+function keyHashError(key: VirtualApiKey) {
+	if (!('keyHash' in key) || typeof key.keyHash !== 'string' || !key.keyHash) return null;
+	return /^sha256:[0-9a-fA-F]{64}$/.test(key.keyHash)
+		? null
+		: 'Use sha256: followed by the 64 hex digit SHA-256 of the key.';
+}
+
+// The form fields for a key, other than the key itself.
+function keyFieldsFrom(key: VirtualApiKey) {
+	const metadata = metadataObject(key.metadata);
+	const allowedModels = key.allowedModels ?? undefined;
+	return {
+		name: String(metadata.name ?? ''),
+		metadataValues: stringMetadata(withoutManagedMetadata(metadata)),
+		modelAccess: (allowedModels === undefined
+			? 'unrestricted'
+			: allowedModels.length === 0
+				? 'deny'
+				: 'restricted') as 'unrestricted' | 'deny' | 'restricted',
+		allowedModels: allowedModels ?? [],
+		budgets: structuredClone(key.budgets ?? []) as VirtualApiKeyBudget[]
+	};
+}
+
 function KeyEditor(props: {
 	initial: VirtualApiKey;
 	config?: GatewayConfig | null;
@@ -571,36 +617,39 @@ function KeyEditor(props: {
 	saving: boolean;
 	saveError?: string | null;
 	onCancel: () => void;
-	onSave: (key: VirtualApiKey, previousKey?: string) => void;
+	onSave: (key: VirtualApiKey, previousKey?: string, createdRawKey?: string) => void;
 }) {
 	const isNew = !props.previousKey;
 	const initialMetadata = metadataObject(props.initial.metadata);
-	const [name, setName] = useState(String(initialMetadata.name ?? ''));
+	const [fields, setFields] = useState(() => keyFieldsFrom(props.initial));
+	const { name, metadataValues, modelAccess, allowedModels, budgets } = fields;
 	const [keyMode, setKeyMode] = useState<'auto' | 'custom'>(isNew ? 'auto' : 'custom');
 	const [key, setKey] = useState(isNew || !hasKeyValue(props.initial) ? '' : props.initial.key);
 	const [replaceKey, setReplaceKey] = useState(false);
-	const [metadataValues, setMetadataValues] = useState(() =>
-		stringMetadata(withoutManagedMetadata(initialMetadata))
-	);
-	const initialAllowedModels = props.initial.allowedModels ?? undefined;
-	const [modelAccess, setModelAccess] = useState<'unrestricted' | 'deny' | 'restricted'>(() =>
-		initialAllowedModels === undefined
-			? 'unrestricted'
-			: initialAllowedModels.length === 0
-				? 'deny'
-				: 'restricted'
-	);
-	const [allowedModels, setAllowedModels] = useState(initialAllowedModels ?? []);
-	const [budgets, setBudgets] = useState<VirtualApiKeyBudget[]>(() =>
-		structuredClone(props.initial.budgets ?? [])
-	);
+	const [storeRaw, setStoreRaw] = useState(!keyHashSupported);
+	const [generatedKey] = useState(newGeneratedKey);
+	const [hashed, setHashed] = useState<{ key: string; hash: string } | null>(null);
 	const [submitted, setSubmitted] = useState(false);
-	const generatedKey = useRef<string | null>(null);
+	const replacing = isNew || replaceKey;
+	const generatedFormat = !isNew && keyDisplay(props.initial).startsWith('agw_sk_');
+	const rawKey = isNew && keyMode === 'auto' ? generatedKey : key;
+	const hashPending = replacing && !storeRaw && hashed?.key !== rawKey;
+	useEffect(() => {
+		if (storeRaw || !rawKey) return;
+		let current = true;
+		void sha256KeyHash(rawKey).then(hash => {
+			if (current) setHashed({ key: rawKey, hash });
+		});
+		return () => {
+			current = false;
+		};
+	}, [storeRaw, rawKey]);
 	const draft = JSON.stringify({
 		name,
 		keyMode,
 		key,
 		replaceKey,
+		storeRaw,
 		metadataValues,
 		modelAccess,
 		allowedModels,
@@ -634,7 +683,7 @@ function KeyEditor(props: {
 		budgets.some(
 			budget =>
 				!budget.name.trim() ||
-				!budget.window.rolling?.trim() ||
+				(budget.window && !budget.window.rolling.trim()) ||
 				!Number.isFinite(budget.limit.amount) ||
 				budget.limit.amount < 0 ||
 				(budget.limit.unit === 'Tokens' && !Number.isInteger(budget.limit.amount))
@@ -643,21 +692,30 @@ function KeyEditor(props: {
 		...(props.config?.llm?.models ?? []).map(model => model.name),
 		...(props.config?.llm?.virtualModels ?? []).map(model => model.name)
 	].filter((name): name is string => typeof name === 'string');
+	const merged = useMergedEdits(props.previousKey ? props.initial : undefined, virtualKey(), [
+		'$defs',
+		'LocalAPIKey'
+	]);
 
 	function virtualKey() {
-		const metadata = {
+		const metadata: Record<string, unknown> = {
 			...metadataValues,
 			...(name.trim() ? { name: name.trim() } : {})
 		};
-		const nextKey = isNew
-			? keyMode === 'auto'
-				? (generatedKey.current ??= `agw_sk_${randomKey(32)}`)
-				: key
-			: replaceKey
-				? key
-				: '';
-		const value: VirtualApiKey =
-			isNew || replaceKey ? { key: nextKey, metadata } : { ...props.initial, metadata };
+		let value: VirtualApiKey;
+		if (!replacing) {
+			if (initialMetadata[keyHintMetadata] !== undefined) {
+				metadata[keyHintMetadata] = initialMetadata[keyHintMetadata];
+			}
+			value = { ...props.initial, metadata };
+		} else if (storeRaw) {
+			value = { key: rawKey, metadata };
+		} else {
+			if (rawKey.length >= 20) {
+				metadata[keyHintMetadata] = `${rawKey.slice(0, 7)}...${rawKey.slice(-4)}`;
+			}
+			value = { keyHash: hashed?.hash ?? '', metadata };
+		}
 		if (modelAccess === 'unrestricted') delete value.allowedModels;
 		else value.allowedModels = modelAccess === 'deny' ? [] : allowedModels;
 		if (budgets.length) value.budgets = budgets;
@@ -665,23 +723,67 @@ function KeyEditor(props: {
 		return value;
 	}
 
+	// Checked on the saved value, which raw edits can change.
+	const hashError = keyHashError(merged.value);
+
 	function nextVirtualKey() {
 		setSubmitted(true);
-		return nameRequired || modelError || invalidBudgets ? null : virtualKey();
+		return nameRequired || modelError || invalidBudgets || hashError ? null : merged.value;
+	}
+
+	function update(patch: Partial<KeyFields>) {
+		setFields(current => ({ ...current, ...patch }));
 	}
 
 	function save() {
 		const virtualKey = nextVirtualKey();
 		if (!virtualKey) return;
-		props.onSave(virtualKey, props.previousKey);
+		// Only a key whose hash was saved unchanged (e.g. not edited as raw YAML)
+		// is shown to the user.
+		const created =
+			replacing && !storeRaw && 'keyHash' in virtualKey && virtualKey.keyHash === hashed?.hash
+				? rawKey
+				: undefined;
+		props.onSave(virtualKey, props.previousKey, created);
 	}
+
+	const keyInput = (
+		<input
+			value={key}
+			type="text"
+			className="masked-secret-input"
+			autoComplete="off"
+			autoCorrect="off"
+			autoCapitalize="none"
+			data-1p-ignore="true"
+			data-lpignore="true"
+			data-form-type="other"
+			name="agw-virtual-api-key"
+			spellCheck={false}
+			onChange={event => setKey(event.target.value)}
+			placeholder="agw_sk_..."
+		/>
+	);
 
 	return (
 		<Drawer
 			title={props.previousKey ? 'Edit virtual key' : 'Create virtual key'}
 			onClose={props.onCancel}
+			error={props.saveError}
 			dirty={draft !== initialDraft}
 			saving={props.saving}
+			raw={{
+				schemaPath: ['$defs', 'LocalAPIKey'],
+				value: () => merged.value,
+				// The key or its hash stays as edited here: the form only replaces
+				// it when asked to.
+				onChange: value => {
+					const next = value as VirtualApiKey;
+					setFields(keyFieldsFrom(next));
+					if (replacing) setStoreRaw(hasKeyValue(next) || !keyHashSupported);
+					merged.reset(value);
+				}
+			}}
 			footer={requestClose => (
 				<ConfigDiffSaveActions
 					config={props.config}
@@ -689,7 +791,7 @@ function KeyEditor(props: {
 						props.databaseBacked
 							? {
 									original: props.previousKey ? keyResourceForDisplay(props.initial) : {},
-									modified: keyResourceForDisplay(virtualKey())
+									modified: keyResourceForDisplay(merged.value)
 								}
 							: undefined
 					}
@@ -698,7 +800,7 @@ function KeyEditor(props: {
 					}
 					saveLabel="Save key"
 					saving={props.saving}
-					saveDisabled={keyMode === 'custom' && !key.trim()}
+					saveDisabled={hashPending}
 					onCancel={requestClose}
 					onSave={save}
 					beforeDiff={() => Boolean(nextVirtualKey())}
@@ -711,13 +813,19 @@ function KeyEditor(props: {
 				/>
 			)}
 		>
+			<LostFieldsWarning lost={merged.lost} />
 			<Field label="Name">
 				<input
 					value={name}
-					onChange={event => setName(event.target.value)}
+					onChange={event => update({ name: event.target.value })}
 					placeholder="Platform team"
 				/>
 			</Field>
+			{submitted && hashError ? (
+				<StatusBanner state="bad" title="Invalid key hash">
+					{hashError}
+				</StatusBanner>
+			) : null}
 			{submitted && nameRequired ? (
 				<StatusBanner state="bad" title="Name is required">
 					Add a metadata name before saving this virtual API key.
@@ -747,43 +855,72 @@ function KeyEditor(props: {
 			) : (
 				<FieldGroup
 					label="Key value"
+					missing={replaceKey ? !key.trim() : undefined}
 					tooltip={props.help.field<VirtualApiKey>('LocalAPIKey', 'key')}
 				>
 					<div className="key-editor-value-row">
-						<VirtualKeyValue value={keyValue(props.initial)} />
-						<button
-							className="button"
-							type="button"
-							onClick={() => setReplaceKey(current => !current)}
-						>
-							{replaceKey ? 'Keep existing' : 'Replace key'}
-						</button>
+						{generatedFormat ? (
+							<>
+								<VirtualKeyValue apiKey={replaceKey ? { key } : props.initial} />
+								<button
+									className="table-action"
+									type="button"
+									onClick={() => {
+										setKey(newGeneratedKey());
+										setReplaceKey(true);
+									}}
+								>
+									<RefreshCw size={14} />
+									Regenerate
+								</button>
+							</>
+						) : (
+							<>
+								{replaceKey ? keyInput : <VirtualKeyValue apiKey={props.initial} />}
+								<button
+									className="table-action"
+									type="button"
+									onClick={() => setReplaceKey(current => !current)}
+								>
+									{replaceKey ? <X size={14} /> : <Pencil size={14} />}
+									{replaceKey ? 'Keep existing' : 'Edit'}
+								</button>
+							</>
+						)}
 					</div>
 				</FieldGroup>
 			)}
-			{(isNew && keyMode === 'custom') || (!isNew && replaceKey) ? (
-				<Field label="Key value" tooltip={props.help.field<VirtualApiKey>('LocalAPIKey', 'key')}>
-					<input
-						value={key}
-						type="text"
-						className="masked-secret-input"
-						autoComplete="off"
-						autoCorrect="off"
-						autoCapitalize="none"
-						data-1p-ignore="true"
-						data-lpignore="true"
-						data-form-type="other"
-						name="agw-virtual-api-key"
-						spellCheck={false}
-						onChange={event => setKey(event.target.value)}
-						placeholder="agw_sk_..."
-					/>
+			{isNew && keyMode === 'custom' ? (
+				<Field
+					label="Key value"
+					missing={!key.trim()}
+					tooltip={props.help.field<VirtualApiKey>('LocalAPIKey', 'key')}
+				>
+					{keyInput}
 				</Field>
+			) : null}
+			{replacing ? (
+				<label className="config-option-row">
+					<input
+						type="checkbox"
+						checked={storeRaw}
+						disabled={!keyHashSupported}
+						onChange={event => setStoreRaw(event.target.checked)}
+					/>
+					<span>
+						<strong>Store raw key</strong>
+						<small>
+							{keyHashSupported
+								? 'If unchecked, the key will not be shown again after saving.'
+								: 'The raw key must be stored unless this page is served over HTTPS or localhost.'}
+						</small>
+					</span>
+				</label>
 			) : null}
 			<CollapsiblePolicySection
 				icon={<CircleDollarSign size={17} />}
 				title="Budgets"
-				description="Cap how much this key can spend or consume during each rolling window."
+				description="Cap how much this key can spend or consume, per rolling window or in total."
 				summary={
 					submitted && invalidBudgets ? (
 						<span className="badge bad">Invalid</span>
@@ -794,11 +931,19 @@ function KeyEditor(props: {
 					)
 				}
 			>
-				<BudgetEditor budgets={budgets} apiKeyName={keyName(props.initial)} onChange={setBudgets} />
+				{!props.config?.config?.database ? (
+					<StatusBanner state="warn" title="Database required">
+						API key budgets require <code>config.database</code> to be configured.
+					</StatusBanner>
+				) : null}
+				<BudgetEditor
+					budgets={budgets}
+					apiKeyName={keyName(props.initial)}
+					onChange={value => update({ budgets: value })}
+				/>
 				{submitted && invalidBudgets ? (
 					<StatusBanner state="bad" title="Invalid budgets">
-						Budget names must be present and unique, rolling windows are required, and amounts must
-						be non-negative whole numbers.
+						Budget names must be present and unique, and amounts must be non-negative whole numbers.
 					</StatusBanner>
 				) : null}
 			</CollapsiblePolicySection>
@@ -837,7 +982,7 @@ function KeyEditor(props: {
 							{ value: 'restricted', label: 'Selected models' },
 							{ value: 'deny', label: 'Deny all' }
 						]}
-						onChange={setModelAccess}
+						onChange={value => update({ modelAccess: value })}
 					/>
 				</FieldGroup>
 				{modelAccess === 'restricted' ? (
@@ -845,7 +990,7 @@ function KeyEditor(props: {
 						label="Allowed model patterns"
 						tooltip={props.help.field<VirtualApiKey>('LocalAPIKey', 'allowedModels')}
 						values={allowedModels}
-						onChange={setAllowedModels}
+						onChange={value => update({ allowedModels: value })}
 						placeholder="gpt-5.5 or openai/*"
 						emptyText="No model patterns configured."
 						suggestions={modelSuggestions}
@@ -875,14 +1020,9 @@ function KeyEditor(props: {
 					quickKeys={['user', 'group']}
 					keyPlaceholder="owner"
 					valuePlaceholder="platform"
-					onChange={setMetadataValues}
+					onChange={value => update({ metadataValues: value })}
 				/>
 			</CollapsiblePolicySection>
-			{props.saveError ? (
-				<StatusBanner state="bad" title="Save failed">
-					{props.saveError}
-				</StatusBanner>
-			) : null}
 		</Drawer>
 	);
 }
@@ -933,6 +1073,7 @@ function BudgetEditor(props: {
 							item => item.apiKeyName === props.apiKeyName && item.name === budget.name.trim()
 						);
 						return (
+							// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
 							<article className="api-key-budget-card" key={index}>
 								<header className="api-key-budget-card-header">
 									<div className="api-key-budget-card-title">
@@ -970,13 +1111,18 @@ function BudgetEditor(props: {
 												placeholder="monthly-spend"
 											/>
 										</Field>
-										<Field label="Rolling window" hint="Examples: 24h, 7d, or 30d.">
+										<Field
+											label="Rolling window"
+											hint="Examples: 24h, 7d, or 30d. Leave empty for a budget that never resets."
+										>
 											<input
-												value={budget.window.rolling ?? ''}
+												value={budget.window?.rolling ?? ''}
 												onChange={event =>
 													updateBudget(index, {
 														...budget,
-														window: { rolling: event.target.value }
+														window: event.target.value.trim()
+															? { rolling: event.target.value }
+															: undefined
 													})
 												}
 												placeholder="30d"
@@ -1073,10 +1219,14 @@ function BudgetUsage(props: {
 				</span>
 				<span>
 					{live
-						? `${Math.round(fraction * 100)}% · resets ${formatRelativeTime(
-								new Date(live.window.end).toISOString()
-							)}`
-						: `No usage recorded yet · ${budget.window.rolling || 'unset'} rolling window`}
+						? `${Math.round(fraction * 100)}% · ${
+								live.window.end === null
+									? 'never resets'
+									: `resets ${formatRelativeTime(new Date(live.window.end).toISOString())}`
+							}`
+						: `No usage recorded yet · ${
+								budget.window ? `${budget.window.rolling} rolling window` : 'never resets'
+							}`}
 				</span>
 			</div>
 			<div className="api-key-budget-meter">
@@ -1109,6 +1259,15 @@ function newVirtualKey(): VirtualApiKey {
 	};
 }
 
+async function sha256KeyHash(value: string) {
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+	return `sha256:${Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
+function newGeneratedKey() {
+	return `agw_sk_${randomKey(32)}`;
+}
+
 function randomKey(length: number) {
 	const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 	const bytes = new Uint8Array(length);
@@ -1132,7 +1291,7 @@ function keyName(key: VirtualApiKey) {
 
 function virtualKeyDeleteLabel(key: VirtualApiKey) {
 	const name = keyName(key).trim();
-	return name || maskKey(keyValue(key));
+	return name || keyDisplay(key);
 }
 
 function duplicateKeyName(name: string, keys: VirtualApiKey[]) {
@@ -1207,12 +1366,23 @@ async function copyVirtualKey(key: string): Promise<boolean> {
 	}
 }
 
-function VirtualKeyValue(props: { value: string }) {
-	const [shown, setShown] = useState(false);
+function VirtualKeyValue(props: { apiKey: VirtualApiKey; revealed?: boolean }) {
+	const [shown, setShown] = useState(props.revealed ?? false);
 	const [copied, setCopied] = useState(false);
+	if (!hasKeyValue(props.apiKey)) {
+		return (
+			<div className="virtual-key-value">
+				<code>{keyDisplay(props.apiKey)}</code>
+				<Tooltip content="This key cannot be shown again">
+					<span className="badge">hashed</span>
+				</Tooltip>
+			</div>
+		);
+	}
+	const value = props.apiKey.key;
 	return (
 		<div className="virtual-key-value">
-			<code>{shown ? props.value : maskKey(props.value)}</code>
+			<code>{shown ? value : keyDisplay(props.apiKey)}</code>
 			<div className="virtual-key-value-actions">
 				<Tooltip content={shown ? 'Hide full key' : 'Show full key'}>
 					<button
@@ -1231,7 +1401,7 @@ function VirtualKeyValue(props: { value: string }) {
 						type="button"
 						aria-label="Copy key"
 						onClick={() => {
-							void copyVirtualKey(props.value).then(success => {
+							void copyVirtualKey(value).then(success => {
 								if (success) {
 									setCopied(true);
 									window.setTimeout(() => setCopied(false), 1400);
@@ -1273,11 +1443,14 @@ function BudgetSummary(props: {
 				const { used, fraction, level } = budgetProgress(budget, live);
 				return (
 					<Tooltip
-						key={`${budget.name}:${index}`}
+						key={`${budget.name}:${
+							// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+							index
+						}`}
 						content={`${budgetAmountLabel(used, budget.limit.unit)} of ${budgetAmountLabel(
 							budget.limit.amount,
 							budget.limit.unit
-						)} per ${budget.window.rolling}`}
+						)} ${budget.window ? `per ${budget.window.rolling}` : 'total'}`}
 					>
 						<div className="key-budget-summary-row">
 							<span className="key-budget-summary-name">{budget.name}</span>
@@ -1318,20 +1491,22 @@ function metadataObject(value: unknown): Record<string, unknown> {
 function withoutManagedMetadata(value: Record<string, unknown>) {
 	const next = withoutServerMetadata(value);
 	delete next.name;
+	delete next[keyHintMetadata];
 	return next;
 }
 
 function withoutServerMetadata(value: Record<string, unknown>) {
 	return Object.fromEntries(
-		Object.entries(value).filter(([key]) => !key.startsWith(managedMetadataPrefix))
+		Object.entries(value).filter(
+			([key]) => key === keyHintMetadata || !key.startsWith(managedMetadataPrefix)
+		)
 	);
 }
 
+// The metadata the key/value editor can show. Other values are kept as they are
+// by the merge on save.
 function stringMetadata(value: Record<string, unknown>) {
 	return Object.fromEntries(
-		Object.entries(value).map(([key, item]) => [
-			key,
-			typeof item === 'string' ? item : String(item)
-		])
+		Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
 	);
 }

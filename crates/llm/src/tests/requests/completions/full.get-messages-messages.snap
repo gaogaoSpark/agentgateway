@@ -3,6 +3,7 @@ source: crates/llm/src/golden_tests.rs
 description: src/tests/requests/completions/full.json
 info:
   model: gpt-4-turbo-preview
+  service_tier: priority
   messages:
     - role: system
       content: You are a helpful assistant that specializes in technical documentation and code analysis.
@@ -19,7 +20,7 @@ info:
           text: "What's in this image?"
         - type: image_url
           image_url:
-            url: "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png"
+            url: "data:image/png;base64,iVBORw0KGgo="
   max_tokens: 1000
   temperature: 0.7
   top_p: 0.9

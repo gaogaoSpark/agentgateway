@@ -6,13 +6,13 @@ event: event
 data: {"type":"response.created","sequence_number":1,"response":{"created_at":123,"id":"","model":"gpt-5-nano-2025-08-07","object":"response","output":[],"status":"in_progress"}}
 
 event: event
-data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message","content":[],"id":"","role":"assistant","status":"in_progress"}}
+data: {"type":"response.in_progress","sequence_number":2,"response":{"created_at":123,"id":"","model":"gpt-5-nano-2025-08-07","object":"response","output":[],"status":"in_progress"}}
 
 event: event
-data: {"type":"response.content_part.added","sequence_number":3,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":null,"text":""}}
+data: {"type":"response.output_item.added","sequence_number":3,"output_index":0,"item":{"type":"message","content":[],"id":"","role":"assistant","status":"in_progress"}}
 
 event: event
-data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"","output_index":0,"content_index":0,"delta":""}
+data: {"type":"response.content_part.added","sequence_number":4,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":null,"text":""}}
 
 event: event
 data: {"type":"response.output_text.delta","sequence_number":5,"item_id":"","output_index":0,"content_index":0,"delta":"Hi"}
@@ -270,13 +270,16 @@ event: event
 data: {"type":"response.output_text.delta","sequence_number":89,"item_id":"","output_index":0,"content_index":0,"delta":"."}
 
 event: event
-data: {"type":"response.content_part.done","sequence_number":90,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":null,"text":""}}
+data: {"type":"response.output_text.done","sequence_number":90,"item_id":"","output_index":0,"content_index":0,"text":"Hi there! How can I help today? If you’re not sure where to start, I can:\n\n- Answer questions or explain concepts\n- Help with writing, editing, or brainstorming\n- Assist with coding, math, or data tasks\n- Plan something (a trip, a project, a study schedule)\n- Translate or practice a language\n\nTell me what you’re aiming for, and I’ll tailor my help.","logprobs":null}
 
 event: event
-data: {"type":"response.output_item.done","sequence_number":91,"output_index":0,"item":{"type":"message","content":[],"id":"","role":"assistant","status":"completed"}}
+data: {"type":"response.content_part.done","sequence_number":91,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":null,"text":"Hi there! How can I help today? If you’re not sure where to start, I can:\n\n- Answer questions or explain concepts\n- Help with writing, editing, or brainstorming\n- Assist with coding, math, or data tasks\n- Plan something (a trip, a project, a study schedule)\n- Translate or practice a language\n\nTell me what you’re aiming for, and I’ll tailor my help."}}
 
 event: event
-data: {"type":"response.completed","sequence_number":92,"response":{"created_at":123,"id":"","model":"gpt-5-nano-2025-08-07","object":"response","output":[],"status":"completed","usage":{"input_tokens":18,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":null},"output_tokens":286,"output_tokens_details":{"reasoning_tokens":192},"total_tokens":304}}}
+data: {"type":"response.output_item.done","sequence_number":92,"output_index":0,"item":{"type":"message","content":[{"type":"output_text","annotations":[],"logprobs":null,"text":"Hi there! How can I help today? If you’re not sure where to start, I can:\n\n- Answer questions or explain concepts\n- Help with writing, editing, or brainstorming\n- Assist with coding, math, or data tasks\n- Plan something (a trip, a project, a study schedule)\n- Translate or practice a language\n\nTell me what you’re aiming for, and I’ll tailor my help."}],"id":"","role":"assistant","status":"completed"}}
+
+event: event
+data: {"type":"response.completed","sequence_number":93,"response":{"created_at":123,"id":"","model":"gpt-5-nano-2025-08-07","object":"response","output":[{"type":"message","content":[{"type":"output_text","annotations":[],"logprobs":null,"text":"Hi there! How can I help today? If you’re not sure where to start, I can:\n\n- Answer questions or explain concepts\n- Help with writing, editing, or brainstorming\n- Assist with coding, math, or data tasks\n- Plan something (a trip, a project, a study schedule)\n- Translate or practice a language\n\nTell me what you’re aiming for, and I’ll tailor my help."}],"id":"","role":"assistant","status":"completed"}],"status":"completed","usage":{"input_tokens":18,"input_tokens_details":{"cached_tokens":0},"output_tokens":286,"output_tokens_details":{"reasoning_tokens":192},"total_tokens":304}}}
 
 
 

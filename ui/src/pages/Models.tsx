@@ -15,6 +15,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import { CatalogModelSelector } from '@/components/CatalogModelSelector';
 import { ConfigDiffSaveActions } from '@/components/ConfigDiffDrawer';
+import { LostFieldsWarning, UnsupportedInForm, useMergedEdits } from '@/components/EditorContracts';
 import { MiniMonacoEditor } from '@/components/MiniMonacoEditor';
 import {
 	ConfirmDialog,
@@ -26,10 +27,10 @@ import {
 	PageHeader,
 	Panel,
 	StatusBanner,
-	Tooltip,
-	YamlBlock
+	Tooltip
 } from '@/components/Primitives';
 import { ProviderIcon } from '@/components/ProviderIcon';
+import { WildcardModelSelector } from '@/components/WildcardModelSelector';
 import {
 	invalidProviderApiKey,
 	isDatabaseConfigResource,
@@ -50,15 +51,21 @@ import type {
 	LocalLLMParams,
 	LocalLLMWeightedRouting
 } from '@/gateway-config';
-import { useDeleteConfigResource, useLlmConfigData, useUpsertConfigResource } from '@/hooks';
+import {
+	resetFinishedSaves,
+	useConfigDumpMode,
+	useDeleteConfigResource,
+	useLlmConfigData,
+	useUpsertConfigResource
+} from '@/hooks';
+import { modelLabel, modelOptionValue, modelSubtitle } from '@/modelLabel';
 import {
 	concreteModelName,
 	isWildcardModelName,
 	resolvedProviderLabel,
-	selectedConfiguredModelName,
-	wildcardModelPrefix,
-	wildcardResolvedSuffix
+	selectedConfiguredModelName
 } from '@/modelResolution';
+import { DumpModelsView } from '@/pages/models/DumpModelsView';
 import { ModelMatchesEditor, normalizeMatches } from '@/pages/models/ModelMatchesEditor';
 import {
 	HeaderModifierEditor,
@@ -86,11 +93,11 @@ import {
 	virtualModelStrategy,
 	virtualModelSummary
 } from '@/pages/models/virtualModelUtils';
+import { ReadonlyModeBanner } from '@/pages/traffic/TrafficConfigDumpPanel';
 import { AuthorizationPolicyEditor } from '@/policies/AuthorizationPolicyEditor';
 import { KeyValueEditor } from '@/policies/PolicyFormControls';
 import { CollapsiblePolicySection } from '@/policies/PolicyLayout';
 import { cleanEmpty, parseYamlText, toYamlText } from '@/policies/policyUtils';
-import { ResultingYaml } from '@/policies/ResultingYaml';
 import type { AuthorizationDraft } from '@/policies/types';
 import { randomUuid } from '@/randomUuid';
 import { type SchemaHelp, useSchemaHelp } from '@/schemaHelp';
@@ -102,6 +109,36 @@ type ConditionalVirtualTarget = NonNullable<
 >['targets'][number];
 
 export function ModelsPage() {
+	const mode = useConfigDumpMode();
+	if (mode.isLoading) {
+		return (
+			<div className="page-stack">
+				<PageHeader
+					title="LLM Models"
+					description="Configure the models callers can request and the providers that serve them."
+				/>
+				<Panel>
+					<StatusBanner state="loading" title="Detecting model configuration mode" />
+				</Panel>
+			</div>
+		);
+	}
+	if (mode.data?.mode === 'dump') {
+		return (
+			<div className="page-stack">
+				<PageHeader
+					title="LLM Models"
+					description="Read-only model inventory from the active gateway dump."
+				/>
+				<ReadonlyModeBanner />
+				<DumpModelsView models={mode.data.dump.models ?? []} />
+			</div>
+		);
+	}
+	return <ModelsEditorPage />;
+}
+
+function ModelsEditorPage() {
 	const { config, hybrid, resources, models, virtualModels, providers, isLoading, error } =
 		useLlmConfigData();
 	const upsertResource = useUpsertConfigResource();
@@ -144,7 +181,7 @@ export function ModelsPage() {
 	const activeVirtualEditing =
 		editingVirtual ??
 		(modelHash?.kind === 'add' && modelHash.type === 'virtual'
-			? { model: makeEmptyVirtualModel() }
+			? { model: makeEmptyVirtualModel(defaultVirtualTargetModel(models)) }
 			: null);
 	const editingDatabaseModel = Boolean(
 		hybrid &&
@@ -168,8 +205,7 @@ export function ModelsPage() {
 
 	useEffect(() => {
 		function syncSelectedFromUrl() {
-			upsertResource.reset();
-			deleteResource.reset();
+			resetFinishedSaves(upsertResource, deleteResource);
 			setEditing(null);
 			setEditingVirtual(null);
 			setModelHashState(modelHashFromUrl());
@@ -230,8 +266,7 @@ export function ModelsPage() {
 	}
 
 	function resetSaves() {
-		upsertResource.reset();
-		deleteResource.reset();
+		resetFinishedSaves(upsertResource, deleteResource);
 	}
 
 	function saveModel(model: LlmModel, previousId?: string) {
@@ -271,7 +306,7 @@ export function ModelsPage() {
 		<div className="page-stack">
 			<PageHeader
 				title="LLM Models"
-				description="Onboard provider-backed models and configure model-specific behavior."
+				description="Configure the models callers can request and the providers that serve them."
 				actions={
 					<div className="button-row">
 						<button className="button" type="button" onClick={openNewVirtualModel}>
@@ -286,7 +321,7 @@ export function ModelsPage() {
 				}
 			/>
 
-			{saveError ? (
+			{saveError && !activeEditing && !activeVirtualEditing ? (
 				<StatusBanner state="bad" title="Save failed">
 					{saveError}
 				</StatusBanner>
@@ -410,6 +445,8 @@ export function ModelsPage() {
 										);
 									}
 									const model = row.model;
+									const optionValue = modelOptionValue(models, models.indexOf(model));
+									const subtitle = modelSubtitle(model);
 									const warnings = modelWarnings(model);
 									const databaseBacked = isDatabaseConfigResource(
 										resources,
@@ -417,8 +454,11 @@ export function ModelsPage() {
 										modelIdentity(model)
 									);
 									return (
-										<tr key={`model:${modelIdentity(model)}`}>
-											<td className="strong">{model.name}</td>
+										<tr key={`model:${model.id ?? optionValue}`}>
+											<td className="strong">
+												{modelLabel(model)}
+												{subtitle ? <div className="model-name-pattern">{subtitle}</div> : null}
+											</td>
 											{hybrid ? (
 												<td>
 													<span className="badge">{databaseBacked ? 'Database' : 'File'}</span>
@@ -437,7 +477,7 @@ export function ModelsPage() {
 														className="icon-button"
 														aria-label="Open in playground"
 														to="/llm/playground"
-														search={{ model: model.name }}
+														search={{ model: optionValue }}
 													>
 														<Play size={16} />
 													</Link>
@@ -500,7 +540,7 @@ export function ModelsPage() {
 					onSave={saveModel}
 				/>
 			) : null}
-			{activeVirtualEditing ? (
+			{activeVirtualEditing && !isLoading ? (
 				<VirtualModelEditor
 					key={activeVirtualEditing.previousName ?? 'new'}
 					previousName={activeVirtualEditing.previousName}
@@ -508,6 +548,7 @@ export function ModelsPage() {
 					config={config.data}
 					databaseBacked={editingDatabaseVirtualModel}
 					baseModels={models}
+					virtualModels={virtualModels}
 					providers={providers}
 					help={help}
 					saving={saving}
@@ -538,6 +579,34 @@ export function ModelsPage() {
 	);
 }
 
+type ModelForm = ReturnType<typeof modelFormFrom>;
+
+// The form state for a model: from the saved config, or from raw mode. A model
+// without a name matches its provider's default name until one is entered.
+function modelFormFrom(model: LlmModel) {
+	return {
+		// The model itself, for which policy sections start open.
+		source: model,
+		model:
+			model.name || !model.provider
+				? model
+				: { ...model, name: defaultIncomingModelMatch(model.provider) },
+		autoModelMatch: !model.name,
+		upstreamMode: initialUpstreamMode(model),
+		explicitModel: model.params?.model ?? '',
+		customModelExpression: model.transformation?.model ?? 'llmRequest.model',
+		transformation: expressionMap(model.transformation),
+		finalTransformation: expressionMap(model.finalTransformation),
+		health: model.health ?? null,
+		defaultsText: optionalMappingYamlText(model.defaults),
+		overridesText: optionalMappingYamlText(model.overrides),
+		requestHeaders: model.requestHeaders ?? null,
+		responseHeaders: model.responseHeaders ?? null,
+		promptCaching: model.promptCaching ?? null,
+		authorization: (model.authorization as AuthorizationDraft | null) ?? null
+	};
+}
+
 function ModelEditor(props: {
 	initial: LlmModel;
 	config?: GatewayConfig;
@@ -550,51 +619,11 @@ function ModelEditor(props: {
 	onCancel: () => void;
 	onSave: (model: LlmModel, previousId?: string) => void;
 }) {
-	const [model, setModel] = useState<LlmModel>(() => {
-		if (props.initial.name || !props.initial.provider) return props.initial;
-		return {
-			...props.initial,
-			name: defaultIncomingModelMatch(props.initial.provider)
-		};
-	});
-	const [autoModelMatch, setAutoModelMatch] = useState(() => !props.initial.name);
-	const [upstreamMode, setUpstreamMode] = useState<UpstreamModelMode>(() =>
-		initialUpstreamMode(props.initial)
-	);
-	const [explicitModel, setExplicitModel] = useState(props.initial.params?.model ?? '');
-	const [customModelExpression, setCustomModelExpression] = useState(
-		() => props.initial.transformation?.model ?? 'llmRequest.model'
-	);
-	const [transformation, setTransformation] = useState<Record<string, string>>(() =>
-		expressionMap(props.initial.transformation)
-	);
-	const [finalTransformation, setFinalTransformation] = useState<Record<string, string>>(() =>
-		expressionMap(props.initial.finalTransformation)
-	);
-	const [health, setHealth] = useState<LlmModel['health']>(() => props.initial.health ?? null);
-	const [defaultsText, setDefaultsText] = useState(() =>
-		optionalMappingYamlText(props.initial.defaults)
-	);
-	const [overridesText, setOverridesText] = useState(() =>
-		optionalMappingYamlText(props.initial.overrides)
-	);
-	const [requestHeaders, setRequestHeaders] = useState<LlmModel['requestHeaders']>(
-		() => props.initial.requestHeaders ?? null
-	);
-	const [responseHeaders, setResponseHeaders] = useState<LlmModel['responseHeaders']>(
-		() => props.initial.responseHeaders ?? null
-	);
-	const [promptCaching, setPromptCaching] = useState<LlmModel['promptCaching']>(
-		() => props.initial.promptCaching ?? null
-	);
-	const [authorization, setAuthorization] = useState<AuthorizationDraft | null>(
-		() => (props.initial.authorization as AuthorizationDraft | null) ?? null
-	);
-	const [policyError, setPolicyError] = useState<string | null>(null);
-	const [saveAttempted, setSaveAttempted] = useState(false);
-	const draft = JSON.stringify({
+	const [form, setForm] = useState(() => modelFormFrom(props.initial));
+	const [initialForm] = useState(form);
+	const {
+		source,
 		model,
-		autoModelMatch,
 		upstreamMode,
 		explicitModel,
 		customModelExpression,
@@ -607,8 +636,9 @@ function ModelEditor(props: {
 		responseHeaders,
 		promptCaching,
 		authorization
-	});
-	const [initialDraft] = useState(() => draft);
+	} = form;
+	const [policyError, setPolicyError] = useState<string | null>(null);
+	const [saveAttempted, setSaveAttempted] = useState(false);
 	const warnings = modelWarnings(model);
 	const invalidApiKey = invalidProviderApiKey(model.params?.apiKey);
 	const providerApiKeyError =
@@ -624,19 +654,33 @@ function ModelEditor(props: {
 		promptCaching,
 		authorization
 	});
-	const preview = cleanEmpty(
-		applyUpstreamMode(
-			{
-				...model,
-				...policyPatch.value,
-				matches: normalizeMatches(model.matches)
-			},
-			upstreamMode,
-			explicitModel,
-			customModelExpression
-		)
-	) as LlmModel | undefined;
+	// The gateway applies the transformation to a fixed model, which the form's
+	// single upstream model choice cannot show.
+	const fixedAndTransformed = Boolean(source.params?.model && source.transformation?.model);
+	const built = fixedAndTransformed
+		? source
+		: (cleanEmpty(
+				applyUpstreamMode(
+					{
+						...model,
+						...policyPatch.value,
+						matches: normalizeMatches(model.matches)
+					},
+					upstreamMode,
+					explicitModel,
+					customModelExpression
+				)
+			) as LlmModel | undefined);
+	const merged = useMergedEdits(props.previousId ? props.initial : undefined, built, [
+		'$defs',
+		'LocalLLMModels'
+	]);
+	const preview = merged.value;
 	const providerSelected = Boolean(model.provider);
+
+	function update(patch: Partial<ModelForm>) {
+		setForm(current => ({ ...current, ...patch }));
+	}
 
 	function save() {
 		setSaveAttempted(true);
@@ -666,8 +710,18 @@ function ModelEditor(props: {
 		<Drawer
 			title={props.previousId ? 'Edit model' : 'Add model'}
 			onClose={props.onCancel}
-			dirty={draft !== initialDraft}
+			dirty={JSON.stringify(form) !== JSON.stringify(initialForm)}
 			saving={props.saving}
+			error={props.saveError}
+			raw={{
+				schemaPath: ['$defs', 'LocalLLMModels'],
+				value: () => preview ?? model,
+				onChange: value => {
+					setForm(modelFormFrom(value as LlmModel));
+					merged.reset(value);
+				},
+				empty: makeEmptyModel()
+			}}
 			footer={requestClose => (
 				<ConfigDiffSaveActions
 					config={props.config}
@@ -682,7 +736,6 @@ function ModelEditor(props: {
 					diffTitle={props.databaseBacked ? 'Model resource diff' : 'Model config diff'}
 					saveLabel="Save model"
 					saving={props.saving}
-					saveDisabled={!model.name.trim() || !preview?.provider}
 					onCancel={requestClose}
 					onSave={save}
 					beforeDiff={validateBeforeDiff}
@@ -690,6 +743,10 @@ function ModelEditor(props: {
 				/>
 			)}
 		>
+			{fixedAndTransformed ? (
+				<UnsupportedInForm supports="either a fixed upstream model or a model transformation" />
+			) : null}
+			<LostFieldsWarning lost={merged.lost} />
 			<details className="schema-details model-help-details">
 				<summary>Help</summary>
 				<div className="model-help-copy">
@@ -717,6 +774,7 @@ function ModelEditor(props: {
 			<div className="form-grid">
 				<Field
 					label="Incoming model match"
+					path="name"
 					tooltip={props.help.field<LlmModel>(
 						'LocalLLMModels',
 						'name',
@@ -727,10 +785,29 @@ function ModelEditor(props: {
 						value={model.name}
 						onChange={event => {
 							const name = event.target.value;
-							setAutoModelMatch(!name.trim() || name === defaultIncomingModelMatch(model.provider));
-							setModel({ ...model, name });
+							update({
+								model: { ...model, name },
+								autoModelMatch: !name.trim() || name === defaultIncomingModelMatch(model.provider)
+							});
 						}}
 						placeholder={model.provider ? defaultIncomingModelMatch(model.provider) : 'openai/*'}
+					/>
+				</Field>
+				<Field
+					label="Display name"
+					path="displayName"
+					tooltip={props.help.field<LlmModel>(
+						'LocalLLMModels',
+						'displayName',
+						'Optional label for lists and pickers. Matching still uses the incoming model match.'
+					)}
+				>
+					<input
+						value={model.displayName ?? ''}
+						onChange={event =>
+							update({ model: { ...model, displayName: event.target.value || undefined } })
+						}
+						placeholder="Defaults to the model match"
 					/>
 				</Field>
 			</div>
@@ -743,24 +820,35 @@ function ModelEditor(props: {
 				help={props.help}
 				apiKeyError={providerApiKeyError}
 				onProviderChange={(provider, params) =>
-					setModel(current => {
-						const currentDefault = defaultIncomingModelMatch(current.provider);
+					setForm(current => {
+						const currentDefault = defaultIncomingModelMatch(current.model.provider);
 						const nextDefault = defaultIncomingModelMatch(provider);
 						const shouldUseDefault =
-							autoModelMatch || !current.name.trim() || current.name === currentDefault;
-						if (shouldUseDefault) setAutoModelMatch(true);
-						if (!props.previousId && shouldUseDefault && stripPrefixCandidate(nextDefault))
-							setUpstreamMode('strip');
+							current.autoModelMatch ||
+							!current.model.name.trim() ||
+							current.model.name === currentDefault;
 						return {
 							...current,
-							provider,
-							params,
-							name: shouldUseDefault ? nextDefault : current.name
+							autoModelMatch: current.autoModelMatch || shouldUseDefault,
+							upstreamMode:
+								!props.previousId && shouldUseDefault && stripPrefixCandidate(nextDefault)
+									? 'strip'
+									: current.upstreamMode,
+							model: {
+								...current.model,
+								provider,
+								params,
+								name: shouldUseDefault ? nextDefault : current.model.name
+							}
 						};
 					})
 				}
-				onParamsChange={params => setModel(current => ({ ...current, params }))}
-				onAuthChange={auth => setModel(current => ({ ...current, auth }))}
+				onParamsChange={params =>
+					setForm(current => ({ ...current, model: { ...current.model, params } }))
+				}
+				onAuthChange={auth =>
+					setForm(current => ({ ...current, model: { ...current.model, auth } }))
+				}
 			/>
 
 			{providerSelected ? (
@@ -774,9 +862,9 @@ function ModelEditor(props: {
 							model.provider ? resolvedProviderLabel(model.provider, props.providers) : null
 						}
 						help={props.help}
-						setMode={setUpstreamMode}
-						setExplicitModel={setExplicitModel}
-						setCustomModelExpression={setCustomModelExpression}
+						setMode={value => update({ upstreamMode: value })}
+						setExplicitModel={value => update({ explicitModel: value })}
+						setCustomModelExpression={value => update({ customModelExpression: value })}
 					/>
 
 					<CollapsiblePolicySection
@@ -787,11 +875,11 @@ function ModelEditor(props: {
 						<div className="policy-editor-stack">
 							<ModelMatchesEditor
 								matches={model.matches ?? []}
-								onChange={matches => setModel(current => ({ ...current, matches }))}
+								onChange={matches => update({ model: { ...model, matches } })}
 							/>
 
 							<ModelPoliciesInline
-								model={props.initial}
+								model={source}
 								help={props.help}
 								transformation={transformation}
 								finalTransformation={finalTransformation}
@@ -802,15 +890,15 @@ function ModelEditor(props: {
 								responseHeaders={responseHeaders}
 								promptCaching={promptCaching}
 								authorization={authorization}
-								setTransformation={setTransformation}
-								setFinalTransformation={setFinalTransformation}
-								setHealth={setHealth}
-								setDefaultsText={setDefaultsText}
-								setOverridesText={setOverridesText}
-								setRequestHeaders={setRequestHeaders}
-								setResponseHeaders={setResponseHeaders}
-								setPromptCaching={setPromptCaching}
-								setAuthorization={setAuthorization}
+								setTransformation={value => update({ transformation: value })}
+								setFinalTransformation={value => update({ finalTransformation: value })}
+								setHealth={value => update({ health: value })}
+								setDefaultsText={value => update({ defaultsText: value })}
+								setOverridesText={value => update({ overridesText: value })}
+								setRequestHeaders={value => update({ requestHeaders: value })}
+								setResponseHeaders={value => update({ responseHeaders: value })}
+								setPromptCaching={value => update({ promptCaching: value })}
+								setAuthorization={value => update({ authorization: value })}
 							/>
 						</div>
 					</CollapsiblePolicySection>
@@ -832,18 +920,6 @@ function ModelEditor(props: {
 				<StatusBanner state="bad" title="Invalid model policies">
 					{policyError}
 				</StatusBanner>
-			) : null}
-			{props.saveError ? (
-				<StatusBanner state="bad" title="Save failed">
-					{props.saveError}
-				</StatusBanner>
-			) : null}
-
-			{providerSelected ? (
-				<details>
-					<summary>Generated model config</summary>
-					<YamlBlock value={modelConfigForDisplay(preview)} />
-				</details>
 			) : null}
 		</Drawer>
 	);
@@ -1107,7 +1183,6 @@ function ModelPoliciesInline(props: {
 						onChange={props.setPromptCaching}
 					/>
 				</CollapsiblePolicySection>
-				<ResultingYaml value={patch.value} />
 			</div>
 		</CollapsiblePolicySection>
 	);
@@ -1193,6 +1268,7 @@ function VirtualModelEditor(props: {
 	databaseBacked: boolean;
 	previousName?: string;
 	baseModels: LlmModel[];
+	virtualModels: LlmVirtualModel[];
 	providers: LlmProvider[];
 	help: SchemaHelp;
 	saving: boolean;
@@ -1201,16 +1277,36 @@ function VirtualModelEditor(props: {
 	onSave: (model: LlmVirtualModel, previousName?: string) => void;
 }) {
 	const [model, setModel] = useState<LlmVirtualModel>(props.initial);
-	const strategy = model.routing.conditional
+	const strategy: VirtualRoutingStrategy | undefined = model.routing.conditional
 		? 'conditional'
 		: model.routing.failover
 			? 'failover'
-			: 'weighted';
+			: model.routing.weighted
+				? 'weighted'
+				: undefined;
 	const weightedTargets = model.routing.weighted?.targets ?? [];
 	const failoverTargets = model.routing.failover?.targets ?? [];
 	const conditionalTargets = model.routing.conditional?.targets ?? [];
 	const targetOptions = modelTargetOptions(props.baseModels, props.providers);
-	const preview = cleanEmpty(model) as LlmVirtualModel | undefined;
+	// Weighted and conditional targets may point at other virtual models; failover targets may not.
+	const nestedVirtualModels = props.virtualModels
+		.map(virtualModel => virtualModel.name)
+		.filter(name => name !== model.name && name !== props.previousName);
+	const nestedTargetOptions = [
+		...targetOptions,
+		...nestedVirtualModels.map(name => ({
+			value: name,
+			label: name,
+			icon: <GitBranch size={16} />,
+			searchText: `${name} virtual model`
+		}))
+	];
+	const merged = useMergedEdits(
+		props.previousName ? props.initial : undefined,
+		cleanEmpty(model) as LlmVirtualModel | undefined,
+		['$defs', 'LocalLLMVirtualModel']
+	);
+	const preview = merged.value;
 	const activeTargets =
 		strategy === 'weighted'
 			? weightedTargets
@@ -1218,7 +1314,10 @@ function VirtualModelEditor(props: {
 				? failoverTargets
 				: conditionalTargets;
 	const hasInvalidTarget = activeTargets.some(
-		target => !target.model.trim() || isIncompleteWildcardTarget(target.model, props.baseModels)
+		target =>
+			!target.model.trim() ||
+			((strategy === 'failover' || !nestedVirtualModels.includes(target.model)) &&
+				isIncompleteWildcardTarget(target.model, props.baseModels))
 	);
 	const hasInvalidConditionalFallback =
 		strategy === 'conditional' &&
@@ -1229,10 +1328,8 @@ function VirtualModelEditor(props: {
 	const defaultTarget = defaultVirtualTargetModel(props.baseModels);
 	const saveDisabled =
 		props.saving ||
-		!model.name.trim() ||
-		activeTargets.length === 0 ||
-		hasInvalidTarget ||
-		hasInvalidConditionalFallback;
+		(strategy !== undefined &&
+			(activeTargets.length === 0 || hasInvalidTarget || hasInvalidConditionalFallback));
 	const [initialDraft] = useState(() => JSON.stringify(model));
 
 	function setStrategy(next: VirtualRoutingStrategy) {
@@ -1323,6 +1420,16 @@ function VirtualModelEditor(props: {
 			onClose={props.onCancel}
 			dirty={JSON.stringify(model) !== initialDraft}
 			saving={props.saving}
+			error={props.saveError}
+			raw={{
+				schemaPath: ['$defs', 'LocalLLMVirtualModel'],
+				value: () => preview ?? model,
+				onChange: value => {
+					setModel(value as LlmVirtualModel);
+					merged.reset(value);
+				},
+				empty: makeEmptyVirtualModel(defaultTarget)
+			}}
 			footer={requestClose => (
 				<ConfigDiffSaveActions
 					config={props.config}
@@ -1346,8 +1453,13 @@ function VirtualModelEditor(props: {
 				/>
 			)}
 		>
+			{strategy ? null : (
+				<UnsupportedInForm supports="weighted, failover, and conditional routing" />
+			)}
+			<LostFieldsWarning lost={merged.lost} />
 			<Field
 				label="Virtual model name"
+				path="name"
 				tooltip={props.help.field<LlmVirtualModel>('LocalLLMVirtualModel', 'name')}
 			>
 				<input
@@ -1393,12 +1505,14 @@ function VirtualModelEditor(props: {
 				>
 					<div className="target-list">
 						{weightedTargets.map((target, index) => (
+							// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
 							<div className="target-row weighted" key={index}>
 								<VirtualTargetSelector
 									label="Model"
 									targetModel={target.model}
 									baseModels={props.baseModels}
-									options={targetOptions}
+									virtualModels={nestedVirtualModels}
+									options={nestedTargetOptions}
 									providers={props.providers}
 									onChange={value => updateWeighted(index, { model: value })}
 								/>
@@ -1466,6 +1580,7 @@ function VirtualModelEditor(props: {
 				>
 					<div className="failover-group-list">
 						{failoverGroups.map((group, groupIndex) => (
+							// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
 							<section className="match-card" key={groupIndex}>
 								<div className="match-card-header">
 									<strong>
@@ -1489,6 +1604,7 @@ function VirtualModelEditor(props: {
 								<div className="match-card-body">
 									<div className="target-list">
 										{group.map((target, targetIndex) => (
+											// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
 											<div className="target-row failover" key={targetIndex}>
 												<VirtualTargetSelector
 													label="Model"
@@ -1579,6 +1695,7 @@ function VirtualModelEditor(props: {
 						{conditionalTargets.map((target, index) => {
 							const isFallback = !target.when?.trim();
 							return (
+								// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
 								<div className="conditional-target-card" key={index}>
 									<div className="match-card-header">
 										<strong>{isFallback ? 'Fallback' : `Rule ${index + 1}`}</strong>
@@ -1631,7 +1748,8 @@ function VirtualModelEditor(props: {
 											label="Target model"
 											targetModel={target.model}
 											baseModels={props.baseModels}
-											options={targetOptions}
+											virtualModels={nestedVirtualModels}
+											options={nestedTargetOptions}
 											providers={props.providers}
 											onChange={value => updateConditional(index, { model: value })}
 										/>
@@ -1695,16 +1813,6 @@ function VirtualModelEditor(props: {
 					</div>
 				</FieldGroup>
 			)}
-
-			<details>
-				<summary>Generated virtual model config</summary>
-				<YamlBlock value={preview ?? {}} />
-			</details>
-			{props.saveError ? (
-				<StatusBanner state="bad" title="Save failed">
-					{props.saveError}
-				</StatusBanner>
-			) : null}
 		</Drawer>
 	);
 }
@@ -1713,6 +1821,7 @@ function VirtualTargetSelector(props: {
 	label: string;
 	targetModel: string;
 	baseModels: LlmModel[];
+	virtualModels?: string[];
 	options: Array<{
 		value: string;
 		label: ReactNode;
@@ -1722,13 +1831,13 @@ function VirtualTargetSelector(props: {
 	providers: LlmProvider[];
 	onChange: (model: string) => void;
 }) {
-	const selectedModelName = selectedConfiguredModelName(props.targetModel, props.baseModels);
-	const selectedModel = props.baseModels.find(model => model.name === selectedModelName);
-	const wildcard = Boolean(selectedModel && isWildcardModelName(selectedModel.name));
-	const wildcardPrefix = selectedModel ? wildcardModelPrefix(selectedModel.name) : '';
-	const resolvedSuffix = wildcard
-		? wildcardResolvedSuffix(props.targetModel, selectedModelName, wildcardPrefix)
-		: '';
+	const isVirtualTarget = props.virtualModels?.includes(props.targetModel) ?? false;
+	const selectedModelName = isVirtualTarget
+		? props.targetModel
+		: selectedConfiguredModelName(props.targetModel, props.baseModels);
+	const selectedModel = isVirtualTarget
+		? undefined
+		: props.baseModels.find(model => model.name === selectedModelName);
 	const provider = selectedModel
 		? resolvedProviderLabel(selectedModel.provider, props.providers)
 		: null;
@@ -1744,17 +1853,15 @@ function VirtualTargetSelector(props: {
 				placeholder="No configured models"
 				onChange={value => props.onChange(concreteModelName(value, ''))}
 			/>
-			{wildcard ? (
-				<div className="target-resolved-composite">
-					{wildcardPrefix ? <span className="target-prefix">{wildcardPrefix}</span> : null}
-					<CatalogModelSelector
-						ariaLabel="Specific model"
-						value={resolvedSuffix}
-						provider={provider}
-						onChange={value => props.onChange(concreteModelName(selectedModelName, value))}
-						placeholder="claude-haiku-4-5"
-					/>
-				</div>
+			{selectedModel && isWildcardModelName(selectedModel.name) ? (
+				<WildcardModelSelector
+					ariaLabel="Specific model"
+					model={selectedModel}
+					value={props.targetModel}
+					provider={provider}
+					onChange={props.onChange}
+					placeholder="claude-haiku-4-5"
+				/>
 			) : null}
 		</div>
 	);
@@ -1868,6 +1975,8 @@ function applyUpstreamMode(
 	customModelExpression: string
 ): LlmModel {
 	const next: LlmModel = structuredClone(model);
+	next.name = next.name.trim();
+	explicitModel = explicitModel.trim();
 	const transformation = { ...(next.transformation ?? {}) };
 	delete transformation.model;
 	const prefixExpression = stripPrefixExpression(stripPrefixCandidate(next.name));

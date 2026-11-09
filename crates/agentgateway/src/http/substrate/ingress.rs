@@ -1,14 +1,17 @@
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use ::http::StatusCode;
+use prometheus_client::metrics::gauge::Gauge;
 use quick_cache::sync::Cache;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tonic::Code;
+use tonic::{Code, Status};
+use tonic_types::{ErrorDetail, StatusExt};
 
+use super::ateattr::{ResumeDisposition, RouteOutcome};
 use super::{ActorRef, CACHE_CAPACITY, TRACE_POLICY_KIND, valid_resource_name};
 use crate::http::{PolicyResponse, Request, Response};
 use crate::proxy::dtrace::{Severity, pol_event};
@@ -20,7 +23,7 @@ use crate::telemetry::metrics::{OutboundCallKind, OutboundCallSubtype};
 use crate::types::agent::{SimpleBackendReferenceWithPolicies, Target};
 use crate::*;
 
-const ACTOR_DNS_SUFFIX: &str = ".actors.resources.substrate.ate.dev";
+const TARGET_ACTOR_HEADER: &str = "ate-target-actor";
 const RESUME_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_PARKING_BUDGET: Duration = Duration::from_secs(5);
 const DEFAULT_PARKING_MAX: usize = 1024;
@@ -30,11 +33,15 @@ const DEFAULT_ACTOR_PORT: u16 = 80;
 const DEFAULT_CONNECT_TARGET_PORT: NonZeroU16 = NonZeroU16::new(8443).unwrap();
 const TARGET_PORT_HEADER: &str = "x-ate-target-port";
 pub(crate) const STALE_ASSIGNMENT_HEADER: &str = "x-ate-assignment-stale";
+const ERROR_INFO_DOMAIN: &str = "ate.dev";
+const REASON_API_UNAVAILABLE: &str = "API_UNAVAILABLE";
+const REASON_LOT_FULL: &str = "LOT_FULL";
+const REASON_TERMINAL_STATE: &str = "TERMINAL_STATE";
 
 #[derive(Debug, Clone, thiserror::Error)]
 enum ResumeError {
-	#[error("{0:?}: {1}")]
-	Status(Code, String),
+	#[error("{0}")]
+	Status(Status),
 	#[error("{0}")]
 	InvalidResponse(String),
 	#[error("request parking capacity exhausted")]
@@ -43,46 +50,74 @@ enum ResumeError {
 
 impl ResumeError {
 	fn into_proxy_error(self, actor: &ActorRef) -> ProxyError {
-		let (status, body) = match self {
+		let (status, body, reason) = match self {
 			Self::ParkingFull => (
 				StatusCode::SERVICE_UNAVAILABLE,
 				format!("actor {:?} request parking capacity exhausted", actor.name),
+				Some(REASON_LOT_FULL.to_owned()),
 			),
-			Self::Status(Code::NotFound, _) => (
-				StatusCode::NOT_FOUND,
-				format!("actor {:?} not found", actor.name),
-			),
-			Self::Status(Code::FailedPrecondition, message) => (
-				StatusCode::SERVICE_UNAVAILABLE,
-				format!("actor {:?} unavailable: {message}", actor.name),
-			),
-			Self::Status(Code::Unavailable, _) => (
-				StatusCode::SERVICE_UNAVAILABLE,
-				format!("actor {:?} unavailable", actor.name),
-			),
-			Self::Status(Code::DeadlineExceeded, _) => (
-				StatusCode::GATEWAY_TIMEOUT,
-				format!("actor {:?} request timed out", actor.name),
-			),
-			Self::Status(Code::PermissionDenied, _) => (
-				StatusCode::FORBIDDEN,
-				format!("actor {:?} access denied", actor.name),
-			),
-			Self::Status(Code::Unauthenticated, _) => (
-				StatusCode::UNAUTHORIZED,
-				format!("actor {:?} authentication required", actor.name),
-			),
-			Self::Status(Code::ResourceExhausted, _) => (
-				StatusCode::TOO_MANY_REQUESTS,
-				format!("actor {:?} rate limited", actor.name),
-			),
-			Self::Status(_, _) | Self::InvalidResponse(_) => (
+			Self::Status(status) => {
+				let code = status.code();
+				let message = status.message();
+				if code == Code::ResourceExhausted && message == "no worker has room for the actor" {
+					return ProxyError::SubstrateIngressCapacityExhausted;
+				}
+				let reason = status_reason(&status)
+					.or_else(|| (code == Code::Unavailable).then(|| REASON_API_UNAVAILABLE.to_owned()));
+				let (http_status, body) = match code {
+					Code::NotFound => (
+						StatusCode::NOT_FOUND,
+						format!("actor {:?} not found", actor.name),
+					),
+					Code::FailedPrecondition | Code::Aborted | Code::ResourceExhausted => (
+						StatusCode::SERVICE_UNAVAILABLE,
+						format!("actor {:?} unavailable: {message}", actor.name),
+					),
+					Code::Unavailable => (
+						StatusCode::SERVICE_UNAVAILABLE,
+						format!("actor {:?} unavailable", actor.name),
+					),
+					Code::DeadlineExceeded => (
+						StatusCode::GATEWAY_TIMEOUT,
+						format!("actor {:?} request timed out", actor.name),
+					),
+					Code::PermissionDenied => (
+						StatusCode::FORBIDDEN,
+						format!("actor {:?} access denied", actor.name),
+					),
+					Code::Unauthenticated => (
+						StatusCode::UNAUTHORIZED,
+						format!("actor {:?} authentication required", actor.name),
+					),
+					_ => (
+						StatusCode::INTERNAL_SERVER_ERROR,
+						format!("error resuming actor {:?}", actor.name),
+					),
+				};
+				(http_status, body, reason)
+			},
+			Self::InvalidResponse(_) => (
 				StatusCode::INTERNAL_SERVER_ERROR,
 				format!("error resuming actor {:?}", actor.name),
+				None,
 			),
 		};
-		ProxyError::SubstrateIngressFailed(status, body)
+		ProxyError::SubstrateIngressFailed(status, body, reason)
 	}
+}
+
+fn status_reason(status: &Status) -> Option<String> {
+	status
+		.get_error_details_vec()
+		.into_iter()
+		.find_map(|detail| match detail {
+			ErrorDetail::ErrorInfo(info)
+				if info.domain == ERROR_INFO_DOMAIN && !info.reason.is_empty() =>
+			{
+				Some(info.reason)
+			},
+			_ => None,
+		})
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +125,8 @@ struct CachedAssignment {
 	target: SocketAddr,
 	expires_at: Instant,
 	generation: u64,
+	resumed: bool,
+	uid: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -113,8 +150,13 @@ impl ResolutionSource {
 	}
 }
 
-type ResolutionResult =
-	Result<(CachedAssignment, ResolutionSource), (ResumeError, ResolutionSource)>;
+struct Resolved {
+	assignment: CachedAssignment,
+	source: ResolutionSource,
+	resume: ResumeDisposition,
+}
+
+type ResolutionResult = Result<Resolved, (ResumeError, ResolutionSource)>;
 
 struct AssignmentCache {
 	entries: Cache<ActorRef, Result<CachedAssignment, ResumeError>>,
@@ -139,10 +181,13 @@ impl AssignmentCache {
 #[derive(Clone)]
 pub(crate) struct SubstrateRequestState {
 	actor: ActorRef,
-	actor_port: u16,
+	connect_authority: String,
 	ingress: SubstrateIngress,
 	client: PolicyClient,
-	current: Arc<Mutex<Option<CachedAssignment>>>,
+	current: Option<CachedAssignment>,
+	resume: ResumeDisposition,
+	route_duration: Duration,
+	route_outcome: Option<RouteOutcome>,
 }
 
 fn default_cache_ttl() -> Duration {
@@ -174,6 +219,16 @@ fn default_parking_retry_factor() -> f64 {
 
 fn default_connect_target_port() -> NonZeroU16 {
 	DEFAULT_CONNECT_TARGET_PORT
+}
+
+// Regular HTTP requests have no actor-port contract, so their frontend
+// authority must not leak a proxy or port-forward port into actor selection.
+fn actor_port(authority: &::http::uri::Authority, from_connect_tunnel: bool) -> u16 {
+	if from_connect_tunnel {
+		authority.port_u16().unwrap_or(DEFAULT_ACTOR_PORT)
+	} else {
+		DEFAULT_ACTOR_PORT
+	}
 }
 
 /// Bounds requests held while an actor is waiting for capacity to resume.
@@ -234,7 +289,7 @@ impl Default for RequestParking {
 	}
 }
 
-/// Resolves Substrate actor hostnames through the ate-api for dynamic route backends.
+/// Resolves Substrate actors through the ate-api for dynamic route backends.
 #[apply(schema!)]
 pub struct SubstrateIngress {
 	/// Backend that receives ResumeActor calls and policies used when connecting to it.
@@ -259,47 +314,82 @@ pub struct SubstrateIngress {
 	parking_slots: Arc<OnceLock<Arc<Semaphore>>>,
 }
 
+struct ParkingPermit {
+	_permit: OwnedSemaphorePermit,
+	active: Gauge,
+}
+
+impl Drop for ParkingPermit {
+	fn drop(&mut self) {
+		self.active.dec();
+	}
+}
+
 impl SubstrateIngress {
 	async fn resume_actor(
 		&self,
 		client: &PolicyClient,
 		actor: &ActorRef,
-	) -> Result<SocketAddr, ResumeError> {
+	) -> Result<(SocketAddr, bool, Option<String>), ResumeError> {
 		let budget = self.request_parking.budget();
 		let deadline = tokio::time::Instant::now() + budget;
 		let result = async {
-			let channel = self.target.grpc_channel(
-				client.with_outbound(OutboundCallKind::Policy, OutboundCallSubtype::Substrate),
-			);
+			let client = client.with_outbound(OutboundCallKind::Policy, OutboundCallSubtype::Substrate);
+			let channel = self.target.grpc_channel(client.clone());
 			let mut control = protos::ateapi::control_client::ControlClient::new(channel);
 			let message = protos::ateapi::ResumeActorRequest {
 				actor: Some(protos::ateapi::ObjectRef {
 					atespace: actor.atespace.clone(),
 					name: actor.name.clone(),
 				}),
-				boot: false,
 			};
 			let mut delay = self.request_parking.retry_interval();
+			let mut last_retry_status = None;
 			loop {
 				let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
 				if remaining.is_zero() {
-					return Err(ResumeError::Status(
-						Code::DeadlineExceeded,
-						format!("ResumeActor timed out after {budget:?}"),
-					));
+					return Err(ResumeError::Status(last_retry_status.unwrap_or_else(
+						|| Status::deadline_exceeded(format!("ResumeActor timed out after {budget:?}")),
+					)));
 				}
-				let response = dtrace::scope_future(
-					Some(TRACE_POLICY_KIND),
-					tokio::time::timeout(remaining, control.resume_actor(message.clone())),
-				)
-				.await;
+				let response = {
+					let mut request = tonic::Request::new(message.clone());
+					let mut span = client.start_grpc_span(
+						&mut request,
+						self.target.target.as_ref(),
+						"/substrate.ateapi.v1.Control/ResumeActor",
+					);
+					if let Some(span) = span.as_deref_mut() {
+						span.rename_span("substrate.ateapi.v1.Control/ResumeActor");
+					}
+					let response = dtrace::scope_future(
+						Some(TRACE_POLICY_KIND),
+						tokio::time::timeout(remaining, control.resume_actor(request)),
+					)
+					.await;
+					if let Some(span) = span.as_deref_mut() {
+						match &response {
+							Ok(result) => span.record_grpc_result(result),
+							Err(_) => {
+								span.record_grpc_error(&tonic::Status::deadline_exceeded("ResumeActor timed out"))
+							},
+						}
+					}
+					response
+				};
 				match response {
 					Ok(Ok(response)) => {
-						let actor = response.into_inner().actor.ok_or_else(|| {
+						let response = response.into_inner();
+						let resumed = response.resumed;
+						let actor = response.actor.ok_or_else(|| {
 							ResumeError::InvalidResponse(
 								"ResumeActor response did not include an actor".to_owned(),
 							)
 						})?;
+						let uid = actor
+							.metadata
+							.map(|metadata| metadata.uid)
+							.filter(|uid| !uid.is_empty());
 						let assignment = actor
 							.status
 							.and_then(|status| status.worker_assignment)
@@ -308,33 +398,35 @@ impl SubstrateIngress {
 									"ResumeActor response did not include a worker assignment".to_owned(),
 								)
 							})?;
-						let ip = assignment
-							.worker_pod_ip
-							.parse::<IpAddr>()
-							.map_err(|error| {
-								ResumeError::InvalidResponse(format!(
-									"invalid worker_assignment.worker_pod_ip {:?}: {error}",
-									assignment.worker_pod_ip
-								))
-							})?;
-						return Ok(SocketAddr::new(ip, self.connect_target_port.get()));
+						let worker_pod_ip = assignment.worker_pod_ips.first().ok_or_else(|| {
+							ResumeError::InvalidResponse(
+								"ResumeActor worker assignment did not include a pod IP".to_owned(),
+							)
+						})?;
+						let ip = worker_pod_ip.parse::<IpAddr>().map_err(|error| {
+							ResumeError::InvalidResponse(format!(
+								"invalid worker_assignment.worker_pod_ips[0] {worker_pod_ip:?}: {error}"
+							))
+						})?;
+						return Ok((
+							SocketAddr::new(ip, self.connect_target_port.get()),
+							resumed,
+							uid,
+						));
 					},
-					Ok(Err(status)) if self.retryable_while_parked(status.code()) => {
+					Ok(Err(status)) if self.retryable_while_parked(&status) => {
+						last_retry_status = Some(status);
 						let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
 						tokio::time::sleep(delay.min(remaining)).await;
 						delay = delay.mul_f64(self.request_parking.retry_factor.max(1.0));
 					},
 					Ok(Err(status)) => {
-						return Err(ResumeError::Status(
-							status.code(),
-							status.message().to_owned(),
-						));
+						return Err(ResumeError::Status(status));
 					},
 					Err(_) => {
-						return Err(ResumeError::Status(
-							Code::DeadlineExceeded,
-							format!("ResumeActor timed out after {budget:?}"),
-						));
+						return Err(ResumeError::Status(last_retry_status.unwrap_or_else(
+							|| Status::deadline_exceeded(format!("ResumeActor timed out after {budget:?}")),
+						)));
 					},
 				}
 			}
@@ -342,27 +434,31 @@ impl SubstrateIngress {
 		result.await
 	}
 
-	fn acquire_parking_slot(&self) -> Result<Option<OwnedSemaphorePermit>, ResumeError> {
+	fn acquire_parking_slot(&self, active: &Gauge) -> Result<Option<ParkingPermit>, ResumeError> {
 		if !self.request_parking.enabled() {
 			return Ok(None);
 		}
 		let slots = self
 			.parking_slots
 			.get_or_init(|| Arc::new(Semaphore::new(self.request_parking.max)));
-		slots
+		let permit = slots
 			.clone()
 			.try_acquire_owned()
-			.map(Some)
-			.map_err(|_| ResumeError::ParkingFull)
+			.map_err(|_| ResumeError::ParkingFull)?;
+		active.inc();
+		Ok(Some(ParkingPermit {
+			_permit: permit,
+			active: active.clone(),
+		}))
 	}
 
-	fn retryable_while_parked(&self, code: Code) -> bool {
-		matches!(code, Code::Aborted)
+	fn retryable_while_parked(&self, status: &Status) -> bool {
+		matches!(status.code(), Code::Aborted)
 			|| (self.request_parking.enabled()
 				&& matches!(
-					code,
+					status.code(),
 					Code::FailedPrecondition | Code::ResourceExhausted | Code::Unavailable
-				))
+				) && status_reason(status).as_deref() != Some(REASON_TERMINAL_STATE))
 	}
 
 	async fn resolve(&self, client: &PolicyClient, actor: ActorRef) -> ResolutionResult {
@@ -372,7 +468,11 @@ impl SubstrateIngress {
 		if let Some(cached) = self.cache.entries.get(&actor) {
 			match cached {
 				Ok(cached) if cached.expires_at > Instant::now() => {
-					return Ok((cached, ResolutionSource::Cache));
+					return Ok(Resolved {
+						assignment: cached,
+						source: ResolutionSource::Cache,
+						resume: ResumeDisposition::None,
+					});
 				},
 				Ok(expired) => self.cache.remove_generation(&actor, expired.generation),
 				Err(_) => {
@@ -381,12 +481,17 @@ impl SubstrateIngress {
 			}
 		}
 		let _parking_permit = self
-			.acquire_parking_slot()
+			.acquire_parking_slot(&client.inputs.metrics.substrate_request_parking_active)
 			.map_err(|error| (error, ResolutionSource::Request))?;
 		loop {
 			match self.cache.entries.get_value_or_guard_async(&actor).await {
 				Ok(Ok(cached)) if cached.expires_at > Instant::now() => {
-					return Ok((cached, ResolutionSource::Cache));
+					let resume = ResumeDisposition::for_resumed(cached.resumed, true);
+					return Ok(Resolved {
+						assignment: cached,
+						source: ResolutionSource::Cache,
+						resume,
+					});
 				},
 				Ok(Ok(expired)) => {
 					self.cache.remove_generation(&actor, expired.generation);
@@ -399,10 +504,12 @@ impl SubstrateIngress {
 					let result = self
 						.resume_actor(client, &actor)
 						.await
-						.map(|target| CachedAssignment {
+						.map(|(target, resumed, uid)| CachedAssignment {
 							target,
 							expires_at: Instant::now() + self.cache_ttl,
 							generation: self.cache.next_generation.fetch_add(1, Ordering::Relaxed),
+							resumed,
+							uid,
 						});
 					let _ = guard.insert(result.clone());
 					match &result {
@@ -415,7 +522,11 @@ impl SubstrateIngress {
 						Ok(_) => {},
 					}
 					return result
-						.map(|assignment| (assignment, ResolutionSource::AteApi))
+						.map(|assignment| Resolved {
+							resume: ResumeDisposition::for_resumed(assignment.resumed, false),
+							assignment,
+							source: ResolutionSource::AteApi,
+						})
 						.map_err(|error| (error, ResolutionSource::AteApi));
 				},
 			}
@@ -424,18 +535,40 @@ impl SubstrateIngress {
 }
 
 impl SubstrateRequestState {
-	/// The authority sent to atunnel when proxying a raw CONNECT tunnel. atunnel
-	/// authenticates the router connection and uses this stable actor DNS name
-	/// plus port to select the currently active actor process.
-	pub(crate) fn connect_authority(&self) -> String {
-		format!(
-			"{}.{}{}:{}",
-			self.actor.name, self.actor.atespace, ACTOR_DNS_SUFFIX, self.actor_port
-		)
+	pub(crate) fn resume(&self) -> ResumeDisposition {
+		self.resume
 	}
 
-	pub(crate) async fn resolve_target(&self) -> Result<Target, crate::proxy::ProxyResponse> {
-		if let Some(current) = self.current.lock().unwrap().as_ref() {
+	pub(crate) fn route_duration(&self) -> Duration {
+		self.route_duration
+	}
+
+	pub(crate) fn route_outcome(&self) -> Option<RouteOutcome> {
+		self.route_outcome
+	}
+
+	/// The authority sent to atunnel when proxying a raw CONNECT tunnel. Actor
+	/// selection is carried separately in `ate-target-actor`, so this preserves
+	/// the caller's target host and port as application metadata.
+	pub(crate) fn connect_authority(&self) -> String {
+		self.connect_authority.clone()
+	}
+
+	pub(crate) fn target_actor_header(&self) -> ::http::HeaderValue {
+		::http::HeaderValue::try_from(format!("{}/{}", self.actor.atespace, self.actor.name))
+			.expect("validated actor reference is a valid header value")
+	}
+
+	pub(crate) fn actor_uid(&self) -> Option<String> {
+		self
+			.current
+			.as_ref()
+			.and_then(|current| current.uid.clone())
+	}
+
+	pub(crate) async fn resolve_target(&mut self) -> Result<Target, ProxyError> {
+		if let Some(current) = self.current.as_ref() {
+			self.route_outcome = Some(RouteOutcome::Ok);
 			pol_event!(
 				TRACE_POLICY_KIND,
 				Severity::Info,
@@ -446,13 +579,22 @@ impl SubstrateRequestState {
 					"source": ResolutionSource::Request.name(),
 					"cached": true,
 					"lookedUp": false,
+					"resume": ResumeDisposition::None.as_str(),
 					"target": current.target.to_string(),
 				}),
 			);
 			return Ok(Target::Address(current.target));
 		}
-		match self.ingress.resolve(&self.client, self.actor.clone()).await {
-			Ok((assignment, source)) => {
+		let started = tokio::time::Instant::now();
+		let resolution = self.ingress.resolve(&self.client, self.actor.clone()).await;
+		self.route_duration = self.route_duration.saturating_add(started.elapsed());
+		match resolution {
+			Ok(Resolved {
+				assignment,
+				source,
+				resume,
+			}) => {
+				self.route_outcome = Some(RouteOutcome::Ok);
 				let target = assignment.target;
 				pol_event!(
 					TRACE_POLICY_KIND,
@@ -464,13 +606,18 @@ impl SubstrateRequestState {
 						"source": source.name(),
 						"cached": source.cached(),
 						"lookedUp": matches!(source, ResolutionSource::AteApi),
+						"resume": resume.as_str(),
 						"target": target.to_string(),
 					}),
 				);
-				*self.current.lock().unwrap() = Some(assignment);
+				// Policy events describe a single resolution attempt; this describes the request. A
+				// stale-assignment retry can therefore log `triggered` while its last event says `none`.
+				self.resume = self.resume.max(resume);
+				self.current = Some(assignment);
 				Ok(Target::Address(target))
 			},
 			Err((error, source)) => {
+				self.route_outcome = Some(RouteOutcome::ResumeError);
 				pol_event!(
 					TRACE_POLICY_KIND,
 					Severity::Error,
@@ -481,15 +628,16 @@ impl SubstrateRequestState {
 						"source": source.name(),
 						"cached": source.cached(),
 						"lookedUp": matches!(source, ResolutionSource::AteApi),
+						"resume": ResumeDisposition::None.as_str(),
 						"error": error.to_string(),
 					}),
 				);
 				match &error {
-					ResumeError::Status(code, message) => warn!(
+					ResumeError::Status(status) => warn!(
 						actor = self.actor.name,
 						atespace = self.actor.atespace,
-						grpc.code = ?code,
-						grpc.message = message,
+						grpc.code = ?status.code(),
+						grpc.message = status.message(),
 						"substrate ResumeActor failed"
 					),
 					ResumeError::InvalidResponse(message) => warn!(
@@ -504,13 +652,13 @@ impl SubstrateRequestState {
 						"substrate request parking capacity exhausted"
 					),
 				}
-				Err(error.into_proxy_error(&self.actor).into())
+				Err(error.into_proxy_error(&self.actor))
 			},
 		}
 	}
 
-	pub(crate) fn evict(&self) {
-		if let Some(current) = self.current.lock().unwrap().take() {
+	pub(crate) fn evict(&mut self) {
+		if let Some(current) = self.current.take() {
 			self
 				.ingress
 				.cache
@@ -540,18 +688,14 @@ impl RequestPolicyTrait for SubstrateIngress {
 		client: &PolicyClient,
 		log: &mut RequestLog,
 		req: &mut Request,
-	) -> Result<PolicyResponse, crate::proxy::ProxyResponse> {
+	) -> Result<PolicyResponse, ProxyError> {
 		let connect_authority = req
 			.extensions()
-			.get::<crate::cel::SourceContext>()
-			.and_then(|source| {
-				let mut values = source.connect_headers.get_all(::http::header::HOST).iter();
-				let authority = values.next()?.to_str().ok()?;
-				(values.next().is_none()).then_some(authority)
-			});
-		// CONNECT re-entry retains the outer authority in SourceContext. A direct
-		// CONNECT routed by AgentGateway has no such re-entry, so its request URI
-		// is the authoritative source (and preserves its non-default port).
+			.get::<crate::transport::stream::ConnectAuthority>()
+			.map(|authority| authority.0.as_str());
+		let from_connect_tunnel = connect_authority.is_some();
+		// The application request authority is forwarded unchanged. Its port only
+		// selects an actor port for CONNECT traffic; regular HTTP addresses port 80.
 		let authority = connect_authority
 			.map(ToOwned::to_owned)
 			.or_else(|| {
@@ -567,32 +711,38 @@ impl RequestPolicyTrait for SubstrateIngress {
 				ProxyError::SubstrateIngressFailed(
 					StatusCode::NOT_FOUND,
 					format!("invalid actor authority {authority:?}: {error}"),
+					None,
 				)
 			})?;
-		let host = authority.host();
-		let actor_port = authority.port_u16().unwrap_or(DEFAULT_ACTOR_PORT);
-		let host = host.strip_suffix('.').unwrap_or(host);
-		let parsed = host
-			.strip_suffix(ACTOR_DNS_SUFFIX)
-			.and_then(|prefix| prefix.split_once('.'))
-			.filter(|(_, atespace)| !atespace.contains('.'));
-		let Some((name, atespace)) =
-			parsed.filter(|(name, atespace)| valid_resource_name(name) && valid_resource_name(atespace))
+		let actor_port = actor_port(&authority, from_connect_tunnel);
+		let connect_authority = format!("{}:{actor_port}", authority.host());
+		let target_actor_headers = if let Some(source) = req
+			.extensions()
+			.get::<crate::cel::SourceContext>()
+			.filter(|source| source.connect_headers.contains_key(TARGET_ACTOR_HEADER))
+		{
+			&source.connect_headers
+		} else {
+			req.headers()
+		};
+		let target_actor = single_header(target_actor_headers, TARGET_ACTOR_HEADER);
+		let Some((atespace, name)) = target_actor
+			.and_then(|target| target.split_once('/'))
+			.filter(|(_, name)| !name.contains('/'))
+			.filter(|(atespace, name)| valid_resource_name(atespace) && valid_resource_name(name))
 		else {
-			return Err(
-				ProxyError::SubstrateIngressFailed(
-					StatusCode::NOT_FOUND,
-					format!("invalid host {host:?}: expected <actor>.<atespace>{ACTOR_DNS_SUFFIX}"),
-				)
-				.into(),
-			);
+			return Err(ProxyError::SubstrateIngressFailed(
+				StatusCode::NOT_FOUND,
+				format!("invalid {TARGET_ACTOR_HEADER:?}: expected <atespace>/<actor>"),
+				None,
+			));
 		};
 
 		let actor = ActorRef {
 			atespace: atespace.to_owned(),
 			name: name.to_owned(),
 		};
-		log.ate_actor_id = Some(actor.name.clone());
+		log.ate_actor_name = Some(actor.name.clone());
 		log.ate_atespace = Some(actor.atespace.clone());
 		// Ordinary atunnel ingress uses this header to select the actor port and
 		// strips it before forwarding. Raw CONNECT carries the port in its
@@ -605,33 +755,46 @@ impl RequestPolicyTrait for SubstrateIngress {
 		}
 		req.extensions_mut().insert(SubstrateRequestState {
 			actor,
-			actor_port,
+			connect_authority,
 			ingress: self.clone(),
 			client: client.clone(),
-			current: Arc::new(Mutex::new(None)),
+			current: None,
+			resume: ResumeDisposition::None,
+			route_duration: Duration::ZERO,
+			route_outcome: None,
 		});
 		Ok(PolicyResponse::default())
 	}
+}
+
+fn single_header<'a>(headers: &'a ::http::HeaderMap, name: &str) -> Option<&'a str> {
+	let mut values = headers.get_all(name).iter();
+	values
+		.next()
+		.filter(|_| values.next().is_none())
+		.and_then(|value| value.to_str().ok())
 }
 
 #[cfg(test)]
 mod tests {
 	use std::sync::Arc;
 	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::time::{Duration, Instant};
 
 	use ::http::Method;
 	use protos::ateapi::control_server::{Control, ControlServer};
 	use protos::ateapi::{
-		Actor, ActorStatus, GetActorRequest, ResumeActorRequest, ResumeActorResponse,
+		Actor, ActorStatus, EgressPolicy, GetActorEgressPolicyRequest, GetActorRequest,
+		ResumeActorRequest, ResumeActorResponse,
 	};
 	use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 	use wiremock::matchers::{header, method};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
-	use super::STALE_ASSIGNMENT_HEADER;
+	use super::{STALE_ASSIGNMENT_HEADER, TARGET_ACTOR_HEADER};
 	use crate::strng;
 	use crate::test_helpers::proxymock::{
-		basic_named_route, send_request, setup_proxy_test, simple_bind,
+		basic_named_route, send_request_headers, setup_proxy_test, simple_bind,
 	};
 	use crate::types::agent::{Backend, ResourceName};
 
@@ -640,10 +803,61 @@ mod tests {
 		assert_eq!(super::default_connect_target_port().get(), 8443);
 	}
 
+	#[tokio::test]
+	async fn capacity_error_preserves_client_message() {
+		for (status, expected) in [
+			(
+				Status::resource_exhausted("no worker has room for the actor"),
+				"no worker has room for the actor",
+			),
+			(
+				Status::resource_exhausted("secret backend detail"),
+				"ingress failed",
+			),
+			(
+				Status::unavailable("secret backend detail"),
+				"ingress failed",
+			),
+		] {
+			let error = super::ResumeError::Status(status).into_proxy_error(&super::ActorRef {
+				atespace: "my-space".to_owned(),
+				name: "my-actor".to_owned(),
+			});
+			let response = error.into_response_with_grpc(false);
+			assert_eq!(response.status(), ::http::StatusCode::SERVICE_UNAVAILABLE);
+			assert_eq!(
+				crate::http::read_resp_body(response)
+					.await
+					.unwrap()
+					.as_ref(),
+				expected.as_bytes()
+			);
+		}
+	}
+
+	#[test]
+	fn actor_port_uses_default_port_for_http_and_connect_port_for_tunnels() {
+		let authority = "application.example:43123"
+			.parse::<::http::uri::Authority>()
+			.unwrap();
+
+		assert_eq!(super::actor_port(&authority, false), 80);
+		assert_eq!(super::actor_port(&authority, true), 43123);
+	}
+
+	#[test]
+	fn duplicate_target_actor_headers_are_rejected() {
+		let mut headers = ::http::HeaderMap::new();
+		headers.append(TARGET_ACTOR_HEADER, "one/actor".parse().unwrap());
+		headers.append(TARGET_ACTOR_HEADER, "two/actor".parse().unwrap());
+		assert!(super::single_header(&headers, TARGET_ACTOR_HEADER).is_none());
+	}
+
 	#[derive(Clone)]
 	struct MockControl {
-		pod_ip: String,
+		pod_ips: Vec<String>,
 		calls: Arc<AtomicUsize>,
+		resumed: bool,
 	}
 
 	#[tonic::async_trait]
@@ -667,28 +881,41 @@ mod tests {
 			Ok(GrpcResponse::new(ResumeActorResponse {
 				actor: Some(Actor {
 					status: Some(ActorStatus {
+						state: 0,
 						worker_assignment: Some(protos::ateapi::WorkerAssignment {
-							worker_pod_ip: self.pod_ip.clone(),
+							worker_pod_ips: self.pod_ips.clone(),
 						}),
 					}),
 					..Default::default()
 				}),
+				resumed: self.resumed,
 			}))
+		}
+
+		async fn get_actor_egress_policy(
+			&self,
+			_request: GrpcRequest<GetActorEgressPolicyRequest>,
+		) -> Result<GrpcResponse<EgressPolicy>, Status> {
+			Err(Status::unimplemented("not used"))
+		}
+
+		async fn mint_actor_jwt(
+			&self,
+			_request: GrpcRequest<protos::ateapi::MintActorJwtRequest>,
+		) -> Result<GrpcResponse<protos::ateapi::MintActorJwtResponse>, Status> {
+			Err(Status::unimplemented("not used"))
 		}
 	}
 
 	#[tokio::test]
-	async fn stale_assignment_is_refreshed_then_cached() {
+	async fn stale_assignment_retries_wait_for_assignment_convergence() {
 		let actor = MockServer::start().await;
 		let actor_calls = Arc::new(AtomicUsize::new(0));
 		let responder_calls = actor_calls.clone();
 		Mock::given(method("GET"))
-			.and(header(
-				"host",
-				"my-actor.my-space.actors.resources.substrate.ate.dev",
-			))
+			.and(header("host", "application.example"))
 			.respond_with(move |_: &wiremock::Request| {
-				if responder_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+				if responder_calls.fetch_add(1, Ordering::Relaxed) < 2 {
 					ResponseTemplate::new(421).insert_header(STALE_ASSIGNMENT_HEADER, "true")
 				} else {
 					ResponseTemplate::new(200)
@@ -698,8 +925,9 @@ mod tests {
 			.await;
 		let control_calls = Arc::new(AtomicUsize::new(0));
 		let control = crate::test_helpers::spawn_service(ControlServer::new(MockControl {
-			pod_ip: actor.address().ip().to_string(),
+			pod_ips: vec![actor.address().ip().to_string(), "not-an-ip".to_owned()],
 			calls: control_calls.clone(),
+			resumed: true,
 		}))
 		.await;
 
@@ -720,17 +948,20 @@ mod tests {
 			.await;
 		let client = proxy.serve_http("bind".into());
 
+		let started = Instant::now();
 		for _ in 0..2 {
-			let response = send_request(
+			let response = send_request_headers(
 				client.clone(),
 				Method::GET,
-				"http://my-actor.my-space.actors.resources.substrate.ate.dev/",
+				"http://application.example/",
+				&[(TARGET_ACTOR_HEADER, "my-space/my-actor")],
 			)
 			.await;
 			assert_eq!(response.status(), ::http::StatusCode::OK);
 		}
-		assert_eq!(actor_calls.load(Ordering::Relaxed), 3);
-		assert_eq!(control_calls.load(Ordering::Relaxed), 2);
+		assert!(started.elapsed() >= Duration::from_millis(200));
+		assert_eq!(actor_calls.load(Ordering::Relaxed), 4);
+		assert_eq!(control_calls.load(Ordering::Relaxed), 3);
 	}
 
 	#[tokio::test]
@@ -745,8 +976,9 @@ mod tests {
 			.mount(&actor)
 			.await;
 		let control = crate::test_helpers::spawn_service(ControlServer::new(MockControl {
-			pod_ip: actor.address().ip().to_string(),
+			pod_ips: vec![actor.address().ip().to_string()],
 			calls: Arc::new(AtomicUsize::new(0)),
+			resumed: true,
 		}))
 		.await;
 
@@ -764,10 +996,11 @@ mod tests {
 				}
 			}))
 			.await;
-		let response = send_request(
+		let response = send_request_headers(
 			proxy.serve_http("bind".into()),
 			Method::GET,
 			"http://my-actor.my-space.actors.resources.substrate.ate.dev/",
+			&[(TARGET_ACTOR_HEADER, "my-space/my-actor")],
 		)
 		.await;
 

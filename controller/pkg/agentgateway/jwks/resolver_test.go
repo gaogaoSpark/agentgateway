@@ -5,7 +5,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"istio.io/istio/pkg/kube/krt"
-	"istio.io/istio/pkg/ptr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -14,9 +13,36 @@ import (
 	apisettings "github.com/agentgateway/agentgateway/controller/api/settings"
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/jwks"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/testutils"
 	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
+
+func TestResolverURLWithPolicyBackendGrants(t *testing.T) {
+	for _, kind := range []jwks.OwnerKind{jwks.OwnerKindPolicy, jwks.OwnerKindBackend} {
+		t.Run(string(kind), func(t *testing.T) {
+			resolver := jwks.NewResolver(
+				remotehttp.NewResolver(remotehttp.Inputs{}),
+				nil,
+				apisettings.BackendRefGrantModeRouteAndPolicy,
+			)
+			const url = "https://issuer.example.com/.well-known/jwks.json"
+			owner := jwks.RemoteJwksOwner{
+				ID: jwks.JwksOwnerID{
+					Kind: kind, Namespace: "demo", Name: "demo-jwt",
+				},
+				DefaultNamespace: "demo",
+				Remote: agentgateway.RemoteJWKS{
+					PolicyBackendEndpoint: agentgateway.PolicyBackendEndpoint{URL: new(url)},
+				},
+			}
+			resolved, err := resolver.ResolveOwner(krt.TestingDummyContext{}, owner)
+			require.NoError(t, err)
+			require.Equal(t, owner.ID, resolved.OwnerID)
+			require.Equal(t, url, resolved.Target.Target.URL)
+		})
+	}
+}
 
 func TestResolverBackendRefGrant(t *testing.T) {
 	const (
@@ -116,7 +142,7 @@ func TestResolverBackendRefGrant(t *testing.T) {
 				},
 				DefaultNamespace: tt.ownerNS,
 				Remote: agentgateway.RemoteJWKS{
-					JwksPath: ptr.Of(agentgateway.LongString("keys")),
+					JwksPath: new(agentgateway.LongString("keys")),
 					PolicyBackendEndpoint: agentgateway.PolicyBackendEndpoint{
 						BackendRef: &gwv1.BackendObjectReference{
 							Name:      targetName,

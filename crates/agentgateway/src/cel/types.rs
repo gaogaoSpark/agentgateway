@@ -27,12 +27,13 @@ use crate::cel::{Error, Expression, context, query};
 use crate::http::ext_authz::ExtAuthzDynamicMetadata;
 use crate::http::ext_proc::ExtProcDynamicMetadata;
 use crate::http::transformation_cel::TransformationMetadata;
-use crate::http::{RecordedBodyHandle, apikey, basicauth, jwt};
+use crate::http::{Body, BodyInspection, RecordedBodyHandle, apikey, basicauth, jwt};
 use crate::llm::{LLMInfo, LLMRequest};
 use crate::mcp::guardrails::McpGuardrailsDynamicMetadata;
-use crate::mcp::{MCPInfo, MCPTool};
+use crate::mcp::{MCPInfo, MCPTool, MCPView};
 use crate::proxy::dtrace;
 use crate::serdes::schema;
+use crate::telemetry::metrics::GuardrailAction;
 use crate::transport::tls::TlsInfo;
 use crate::{apply, llm};
 
@@ -59,12 +60,15 @@ pub struct Executor<'a> {
 	#[dynamic(rename = "basicAuth")]
 	pub basic_auth: ExtensionOrDirect<'a, basicauth::Claims>,
 
-	pub llm: ExtensionOrDirect<'a, LLMContext>,
+	pub llm: LLMView<'a>,
 
 	#[dynamic(rename = "llmRequest")]
 	pub llm_request: Option<&'a serde_json::Value>,
 
-	pub mcp: Option<&'a MCPInfo>,
+	/// Response from a virtual model callout, with `headers` and the decoded JSON `body`.
+	pub callout: Option<&'a serde_json::Value>,
+
+	pub mcp: Option<MCPView<'a>>,
 
 	pub backend: ExtensionOrDirect<'a, BackendContext>,
 
@@ -77,13 +81,28 @@ pub struct Executor<'a> {
 
 	pub guardrails: Option<&'a Vec<GuardrailInfo>>,
 
+	pub upstream_calls: Option<&'a Vec<crate::telemetry::upstream::UpstreamCall>>,
+
 	pub metadata: ExtensionOrDirect<'a, TransformationMetadata>,
+}
+
+#[apply(schema!)]
+#[derive(cel::DynamicType)]
+#[dynamic(rename_all = "camelCase")]
+pub struct ErrorContext {
+	/// Broad classification of the failure, such as `UpstreamFailure` or `Timeout`.
+	pub reason: String,
+	/// Human-readable failure detail. Exact message is subject to change.
+	pub message: String,
 }
 
 #[apply(schema!)]
 #[derive(Default, cel::DynamicType)]
 #[dynamic(rename_all = "camelCase")]
 pub struct ProxyContext {
+	/// The final gateway error when the response was synthesized from a failed request.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error: Option<ErrorContext>,
 	/// The bind that accepted the request.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub bind: Option<Strng>,
@@ -127,6 +146,7 @@ impl ProxyContext {
 		response_processing_duration: Option<std::time::Duration>,
 	) -> Self {
 		Self {
+			error: None,
 			bind: None,
 			gateway: None,
 			listener: None,
@@ -238,7 +258,7 @@ fn is_extension_or_direct_none<T: Send + Sync + 'static>(e: &ExtensionOrDirect<T
 	e.deref().is_none()
 }
 
-fn is_body_extension_or_direct_none(e: &BodyExtensionOrDirect) -> bool {
+fn is_body_view_none(e: &BodyView) -> bool {
 	e.is_none()
 }
 
@@ -421,6 +441,10 @@ pub struct BackendContext {
 	/// The name of the backend being used. For example, `my-service` or `service/my-namespace/my-service:8080`.
 	#[serde(default)]
 	pub name: Strng,
+	/// The resolved target for directly addressed backends, including the port for network endpoints.
+	/// Absent for Service backends, whose workload endpoints are selected separately.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub endpoint: Option<Strng>,
 	/// The type of backend.
 	#[serde(rename = "type")]
 	#[serde(default)]
@@ -486,8 +510,7 @@ static DUMP: Lazy<Expression> =
 impl ExecutorResolver<'_> {
 	pub fn slow_debug(&self) -> serde_json::Value {
 		let expr = &DUMP;
-		let cel_value =
-			Value::resolve(expr.expression.expression(), context(), self).unwrap_or(Value::Null);
+		let cel_value = Value::resolve(expr.ast(), context(), self).unwrap_or(Value::Null);
 		let mut v = cel_value.json().unwrap_or(serde_json::Value::Null);
 		// Filter nulls which are just noisy
 		if let serde_json::Value::Object(obj) = &mut v {
@@ -529,36 +552,46 @@ impl<'a> VariableResolver<'a> for ExecutorResolver<'a> {
 	fn resolve_direct(&self, field: &OptimizedExpr) -> Option<Option<Value<'a>>> {
 		match field {
 			// To avoid a conversion from a string key into a HeaderName, we have a hot path
-			OptimizedExpr::HeaderLookup { request, header } if *request => Some(
-				self
-					.executor
-					.request
-					.as_ref()
-					.and_then(|r| r.headers.get(header))
-					.and_then(|h| h.to_str().ok())
-					.map(|s| Value::String(s.into())),
-			),
-			// OptimizedExpr::HeaderLookup { request, header } if !*request => Some(
-			// 	self
-			// 		.executor
-			// 		.response
-			// 		.as_ref()
-			// 		.and_then(|r| r.headers.get(header))
-			// 		.and_then(|h| h.to_str().ok())
-			// 		.map(|s| Value::String(s.into())),
-			// ),
+			OptimizedExpr::HeaderLookup { request, header } if *request => {
+				let Some(r) = self.executor.request.as_ref() else {
+					return Some(None);
+				};
+				let mut values = r.headers.as_ref().get_all(header).iter();
+				let first = values.next();
+				// Repeated headers are returned as a list; defer to the generic path for those.
+				if values.next().is_some() {
+					return None;
+				}
+				Some(
+					first
+						.and_then(|h| std::str::from_utf8(h.as_bytes()).ok())
+						.map(Value::from),
+				)
+			},
 			_ => None,
 		}
 	}
 }
 
 impl<'a> Executor<'a> {
-	fn set_request<B>(&mut self, req: &'a ::http::Request<B>) {
+	fn set_request(&mut self, req: &'a crate::http::Request) {
 		self.request = Some(req.into());
-		let ext = req.extensions();
+		self.llm_request = req
+			.body()
+			.extension::<crate::json::ParsedJson>()
+			.map(|body| &body.0);
+		self.set_request_extensions(req.extensions());
+	}
+	fn set_request_extensions(&mut self, ext: &'a Extensions) {
 		self.api_key = ExtensionOrDirect::Extension(ext);
 		self.jwt = ExtensionOrDirect::Extension(ext);
-		self.llm = ExtensionOrDirect::Extension(ext);
+		self.llm = match ext.get::<LLMContext>() {
+			Some(llm) => LLMView::Context(llm),
+			None => ext
+				.get::<RequestModel>()
+				.map_or(LLMView::None, LLMView::RequestModel),
+		};
+		self.mcp = ext.get::<MCPInfo>().map(MCPView::new);
 		self.basic_auth = ExtensionOrDirect::Extension(ext);
 		self.extauthz = ExtensionOrDirect::Extension(ext);
 		self.extproc = ExtensionOrDirect::Extension(ext);
@@ -573,7 +606,7 @@ impl<'a> Executor<'a> {
 		self.request = Some(req.into());
 		self.api_key = ExtensionOrDirect::Direct(req.api_key.as_ref());
 		self.jwt = ExtensionOrDirect::Direct(req.jwt.as_ref());
-		self.llm = ExtensionOrDirect::Direct(req.llm.as_ref());
+		self.llm = req.llm.as_ref().into();
 		self.basic_auth = ExtensionOrDirect::Direct(req.basic_auth.as_ref());
 		self.extauthz = ExtensionOrDirect::Direct(req.extauthz.as_ref());
 		self.extproc = ExtensionOrDirect::Direct(req.extproc.as_ref());
@@ -588,7 +621,7 @@ impl<'a> Executor<'a> {
 		self.response = Some(resp.into());
 		self.proxy = ExtensionOrDirect::Extension(resp.extensions());
 		if let Some(llm) = resp.extensions().get::<LLMContext>() {
-			self.llm = ExtensionOrDirect::Direct(Some(llm));
+			self.llm = LLMView::Context(llm);
 		}
 		if let Some(extproc) = resp.extensions().get::<ExtProcDynamicMetadata>() {
 			self.extproc = ExtensionOrDirect::Direct(Some(extproc));
@@ -612,13 +645,13 @@ impl<'a> Executor<'a> {
 		if let Some(req) = req {
 			this.set_request_snapshot(req);
 		}
-		this.mcp = Some(mcp);
+		this.mcp = Some(MCPView::new(mcp));
 		this
 	}
-	pub fn new_mcp_request<B>(req: &'a ::http::Request<B>, mcp: &'a MCPInfo) -> Self {
+	pub fn new_buffered_request(req: &'a ::http::Request<Option<Bytes>>) -> Self {
 		let mut this = Self::new_empty();
-		this.set_request(req);
-		this.mcp = Some(mcp);
+		this.request = Some(req.into());
+		this.set_request_extensions(req.extensions());
 		this
 	}
 	pub fn new_llm(req: Option<&'a RequestSnapshot>, llm_body: &'a serde_json::Value) -> Self {
@@ -626,12 +659,6 @@ impl<'a> Executor<'a> {
 		if let Some(req) = req {
 			this.set_request_snapshot(req);
 		}
-		this.llm_request = Some(llm_body);
-		this
-	}
-	pub fn new_llm_request<B>(req: &'a ::http::Request<B>, llm_body: &'a serde_json::Value) -> Self {
-		let mut this = Self::new_empty();
-		this.set_request(req);
 		this.llm_request = Some(llm_body);
 		this
 	}
@@ -647,12 +674,18 @@ impl<'a> Executor<'a> {
 		let mut this = Self::new_empty();
 		if let Some(req) = req {
 			this.set_request_snapshot(req);
+			let request = this.request.as_mut().unwrap();
+			request.body.recorded = req.recorded_body.as_ref();
+			request.body_prefix = BodyPrefix(request.body.clone());
 		}
 		if let Some(resp) = resp {
 			this.set_response_snapshot(resp);
+			let response = this.response.as_mut().unwrap();
+			response.body.recorded = resp.recorded_body.as_ref();
+			response.body_prefix = BodyPrefix(response.body.clone());
 		}
-		this.llm = ExtensionOrDirect::Direct(llm);
-		this.mcp = mcp;
+		this.llm = llm.into();
+		this.mcp = mcp.map(MCPView::new);
 		this.guardrails = guardrails;
 		if let Some(proxy) = proxy {
 			this.proxy = ExtensionOrDirect::Direct(Some(proxy));
@@ -670,7 +703,7 @@ impl<'a> Executor<'a> {
 		if let Some(req) = req {
 			this.set_request_snapshot(req);
 		}
-		this.llm = ExtensionOrDirect::Direct(Some(llm));
+		this.llm = LLMView::Context(llm);
 		this
 	}
 	pub fn new_tcp_logger(
@@ -736,10 +769,24 @@ impl<'a> Executor<'a> {
 		resolver.slow_debug()
 	}
 
+	pub fn with_mcp_params(mut self, params: Option<&'a dyn DynamicType>) -> Self {
+		if let Some(mcp) = self.mcp.as_mut() {
+			mcp.params = params;
+		}
+		self
+	}
+
+	pub fn with_mcp_result(mut self, result: Option<&'a dyn DynamicType>) -> Self {
+		if let Some(mcp) = self.mcp.as_mut() {
+			mcp.result = result;
+		}
+		self
+	}
+
 	pub fn eval(&'a self, expr: &'a Expression) -> Result<Value<'a>, Error> {
 		let resolver = ExecutorResolver { executor: self };
 		let start = dtrace::timed_start();
-		let res = Value::resolve(expr.expression.expression(), context(), &resolver);
+		let res = Value::resolve(expr.ast(), context(), &resolver);
 		dtrace::trace(|t| {
 			t.cel_eval(
 				start,
@@ -810,6 +857,7 @@ fn ext<T: Clone + Send + Sync + 'static>(req: &mut crate::http::Request, clear: 
 		req.extensions_mut().get().cloned()
 	}
 }
+
 /// snapshot_request takes a request and returns a snapshot of its attributes.
 /// Conditionally, EXTENSIONS ARE CLEARED. Do not use this if you still need the extensions later.
 pub fn snapshot_request(req: &mut crate::http::Request, clear: bool) -> RequestSnapshot {
@@ -820,8 +868,8 @@ pub fn snapshot_request(req: &mut crate::http::Request, clear: bool) -> RequestS
 		scheme: req.uri().scheme().cloned(),
 		version: req.version(),
 		headers: req.headers().clone(),
-		body: ext::<BufferedBody>(req, clear),
-		recorded_body: ext::<RecordedBodyHandle>(req, clear),
+		body: req.body().inspection().map(BufferedBody::from),
+		recorded_body: req.body().recorded().cloned(),
 
 		jwt: ext::<jwt::Claims>(req, clear),
 		api_key: ext::<apikey::Claims>(req, clear),
@@ -835,6 +883,7 @@ pub fn snapshot_request(req: &mut crate::http::Request, clear: bool) -> RequestS
 		mcp_guardrails: ext::<McpGuardrailsDynamicMetadata>(req, clear),
 		metadata: ext::<TransformationMetadata>(req, clear),
 		llm: ext::<LLMContext>(req, clear),
+		agent: ext::<AgentContext>(req, clear),
 		start_time: ext::<RequestTime>(req, clear),
 	}
 }
@@ -846,8 +895,8 @@ pub fn snapshot_response(resp: &mut crate::http::Response) -> ResponseSnapshot {
 		code: resp.status(),
 		grpc_status: crate::proxy::httpproxy::parse_grpc_status(resp.headers()),
 		headers: resp.headers().clone(),
-		body: resp.extensions_mut().remove::<BufferedBody>(),
-		recorded_body: resp.extensions_mut().remove::<RecordedBodyHandle>(),
+		body: resp.body().inspection().map(BufferedBody::from),
+		recorded_body: resp.body().recorded().cloned(),
 		metadata: resp.extensions_mut().remove::<TransformationMetadata>(),
 		proxy: resp.extensions_mut().remove::<ProxyContext>(),
 	}
@@ -892,6 +941,8 @@ pub struct RequestSnapshot {
 	pub metadata: Option<TransformationMetadata>,
 
 	pub llm: Option<LLMContext>,
+
+	pub agent: Option<AgentContext>,
 }
 
 #[derive(Debug, Clone, Serialize, cel::DynamicType)]
@@ -927,19 +978,32 @@ pub struct RequestRef<'a> {
 	/// The request's headers
 	pub headers: Headers<'a>,
 
-	#[serde(skip_serializing_if = "is_body_extension_or_direct_none")]
-	pub body: BodyExtensionOrDirect<'a>,
+	#[serde(skip_serializing_if = "is_body_view_none")]
+	pub body: BodyView<'a>,
 
 	/// The request body buffered up to `maxBufferSize`. Unlike `body`, this remains available when
 	/// the complete body exceeds the limit and contains the first `maxBufferSize` bytes.
-	#[serde(skip_serializing_if = "BodyPrefixExtensionOrDirect::is_none")]
-	pub body_prefix: BodyPrefixExtensionOrDirect<'a>,
+	#[serde(skip_serializing_if = "BodyPrefix::is_none")]
+	pub body_prefix: BodyPrefix<'a>,
 
 	#[serde(skip_serializing_if = "is_extension_or_direct_none")]
 	pub start_time: ExtensionOrDirect<'a, RequestTime>,
 
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub end_time: Option<&'a RequestTime>,
+
+	#[serde(skip_serializing_if = "is_extension_or_direct_none")]
+	pub agent: ExtensionOrDirect<'a, AgentContext>,
+}
+
+/// The agent harness that sent the request, such as Claude Code or Codex.
+#[apply(schema!)]
+#[derive(Default, cel::DynamicType)]
+pub struct AgentContext {
+	/// The agent session the request belongs to, from `standardAttributes.session` or detected from
+	/// well-known agent headers such as `x-claude-code-session-id`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub session: Option<Strng>,
 }
 
 #[derive(Debug, Clone)]
@@ -966,17 +1030,14 @@ pub struct ResponseRef<'a> {
 	/// The headers of the response.
 	pub headers: Headers<'a>,
 
-	#[serde(skip_serializing_if = "is_body_extension_or_direct_none")]
-	pub body: BodyExtensionOrDirect<'a>,
+	#[serde(skip_serializing_if = "is_body_view_none")]
+	pub body: BodyView<'a>,
 
 	/// The response body buffered up to `maxBufferSize`. Unlike `body`, this remains available when
 	/// the complete body exceeds the limit and contains the first `maxBufferSize` bytes.
-	#[serde(
-		rename = "bodyPrefix",
-		skip_serializing_if = "BodyPrefixExtensionOrDirect::is_none"
-	)]
+	#[serde(rename = "bodyPrefix", skip_serializing_if = "BodyPrefix::is_none")]
 	#[dynamic(rename = "bodyPrefix")]
-	pub body_prefix: BodyPrefixExtensionOrDirect<'a>,
+	pub body_prefix: BodyPrefix<'a>,
 }
 
 impl<'a> From<&'a ResponseSnapshot> for ResponseRef<'a> {
@@ -985,13 +1046,13 @@ impl<'a> From<&'a ResponseSnapshot> for ResponseRef<'a> {
 			code: value.code.as_u16(),
 			grpc_status: value.grpc_status,
 			headers: Headers::new(&value.headers),
-			body: BodyExtensionOrDirect::Direct {
-				buffered: value.body.as_ref(),
-				recorded: value.recorded_body.as_ref(),
+			body: BodyView {
+				inspection: value.body.as_ref().map(|body| body.0.clone()),
+				recorded: None,
 			},
-			body_prefix: BodyPrefixExtensionOrDirect(BodyExtensionOrDirect::Direct {
-				buffered: value.body.as_ref(),
-				recorded: value.recorded_body.as_ref(),
+			body_prefix: BodyPrefix(BodyView {
+				inspection: value.body.as_ref().map(|body| body.0.clone()),
+				recorded: None,
 			}),
 		}
 	}
@@ -1059,6 +1120,9 @@ pub struct RequestRefSerde {
 	/// The time the request completed
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub end_time: Option<RequestTime>,
+	/// The agent harness that sent the request.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub agent: Option<AgentContext>,
 }
 
 #[apply(schema!)]
@@ -1110,21 +1174,23 @@ impl<'a> From<&'a RequestSnapshot> for RequestRef<'a> {
 			scheme: value.scheme.as_ref(),
 			version: value.version,
 			headers: Headers::new(&value.headers),
-			body: BodyExtensionOrDirect::Direct {
-				buffered: value.body.as_ref(),
-				recorded: value.recorded_body.as_ref(),
+			body: BodyView {
+				inspection: value.body.as_ref().map(|body| body.0.clone()),
+				recorded: None,
 			},
-			body_prefix: BodyPrefixExtensionOrDirect(BodyExtensionOrDirect::Direct {
-				buffered: value.body.as_ref(),
-				recorded: value.recorded_body.as_ref(),
+			body_prefix: BodyPrefix(BodyView {
+				inspection: value.body.as_ref().map(|body| body.0.clone()),
+				recorded: None,
 			}),
 			start_time: value.start_time.as_ref().into(),
 			end_time: None,
+			agent: value.agent.as_ref().into(),
 		}
 	}
 }
-impl<'a, B> From<&'a ::http::Request<B>> for RequestRef<'a> {
-	fn from(req: &'a ::http::Request<B>) -> Self {
+
+impl<'a> RequestRef<'a> {
+	fn from_request<B>(req: &'a ::http::Request<B>, body: BodyView<'a>) -> Self {
 		Self {
 			method: req.method(),
 			uri: query::QueryAccessor::uri_from_uri(req.uri()),
@@ -1134,12 +1200,29 @@ impl<'a, B> From<&'a ::http::Request<B>> for RequestRef<'a> {
 			scheme: req.uri().scheme(),
 			version: req.version(),
 			headers: Headers::new(req.headers()),
-			body: BodyExtensionOrDirect::Extension(req.extensions()),
-			body_prefix: BodyPrefixExtensionOrDirect(BodyExtensionOrDirect::Extension(req.extensions())),
+			body_prefix: BodyPrefix(body.clone()),
+			body,
 			start_time: req.extensions().into(),
 			// Only known in snapshot phase...
 			end_time: None,
+			agent: req.extensions().into(),
 		}
+	}
+}
+
+impl<'a> From<&'a crate::http::Request> for RequestRef<'a> {
+	fn from(req: &'a crate::http::Request) -> Self {
+		Self::from_request(req, BodyView::managed(req.body()))
+	}
+}
+
+impl<'a> From<&'a ::http::Request<Option<Bytes>>> for RequestRef<'a> {
+	fn from(req: &'a ::http::Request<Option<Bytes>>) -> Self {
+		let body = BodyView {
+			inspection: req.body().clone().map(BodyInspection::Complete),
+			recorded: None,
+		};
+		Self::from_request(req, body)
 	}
 }
 
@@ -1149,57 +1232,32 @@ impl<'a> From<&'a crate::http::Response> for ResponseRef<'a> {
 			code: resp.status().as_u16(),
 			grpc_status: crate::proxy::httpproxy::parse_grpc_status(resp.headers()),
 			headers: Headers::new(resp.headers()),
-			body: BodyExtensionOrDirect::Extension(resp.extensions()),
-			body_prefix: BodyPrefixExtensionOrDirect(BodyExtensionOrDirect::Extension(resp.extensions())),
+			body: BodyView::managed(resp.body()),
+			body_prefix: BodyPrefix(BodyView::managed(resp.body())),
 		}
 	}
 }
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct BufferedBody(
-	#[cfg_attr(feature = "schema", schemars(with = "String"))] BufferedBodyState,
-);
-
-#[derive(Debug, Clone)]
-enum BufferedBodyState {
-	Complete(Bytes),
-	ExceededLimit(Bytes),
-}
+pub struct BufferedBody(#[cfg_attr(feature = "schema", schemars(with = "String"))] BodyInspection);
 
 impl BufferedBody {
 	pub fn complete(bytes: Bytes) -> Self {
-		Self(BufferedBodyState::Complete(bytes))
-	}
-
-	pub fn exceeded_limit(bytes: Bytes) -> Self {
-		Self(BufferedBodyState::ExceededLimit(bytes))
+		Self(BodyInspection::Complete(bytes))
 	}
 
 	pub fn bytes(&self) -> Option<&Bytes> {
 		match &self.0 {
-			BufferedBodyState::Complete(bytes) => Some(bytes),
-			BufferedBodyState::ExceededLimit(_) => None,
+			BodyInspection::Complete(bytes) => Some(bytes),
+			BodyInspection::Partial(_) => None,
 		}
-	}
-
-	fn prefix_bytes(&self) -> &Bytes {
-		match &self.0 {
-			BufferedBodyState::Complete(bytes) | BufferedBodyState::ExceededLimit(bytes) => bytes,
-		}
-	}
-
-	fn is_too_large(&self) -> bool {
-		matches!(&self.0, BufferedBodyState::ExceededLimit(_))
 	}
 }
 
-impl From<crate::http::BodyInspection> for BufferedBody {
-	fn from(inspection: crate::http::BodyInspection) -> Self {
-		match inspection {
-			crate::http::BodyInspection::Complete(bytes) => Self::complete(bytes),
-			crate::http::BodyInspection::Partial(bytes) => Self::exceeded_limit(bytes),
-		}
+impl From<BodyInspection> for BufferedBody {
+	fn from(inspection: BodyInspection) -> Self {
+		Self(inspection)
 	}
 }
 
@@ -1210,11 +1268,11 @@ impl Serialize for BufferedBody {
 	{
 		use base64::Engine;
 		match &self.0 {
-			BufferedBodyState::Complete(bytes) => {
+			BodyInspection::Complete(bytes) => {
 				let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
 				serializer.serialize_str(&encoded)
 			},
-			BufferedBodyState::ExceededLimit(_) => serializer.serialize_none(),
+			BodyInspection::Partial(_) => serializer.serialize_none(),
 		}
 	}
 }
@@ -1240,77 +1298,69 @@ impl DynamicType for BufferedBody {
 
 	fn materialize(&self) -> Value<'_> {
 		match &self.0 {
-			BufferedBodyState::Complete(bytes) => Value::Bytes(BytesValue::Bytes(bytes.clone())),
-			BufferedBodyState::ExceededLimit(_) => Value::Null,
+			BodyInspection::Complete(bytes) => Value::Bytes(BytesValue::Bytes(bytes.clone())),
+			BodyInspection::Partial(_) => Value::Null,
 		}
 	}
 }
 
-#[derive(Debug, Clone)]
-pub enum BodyExtensionOrDirect<'a> {
-	Extension(&'a http::Extensions),
-	Direct {
-		buffered: Option<&'a BufferedBody>,
-		recorded: Option<&'a RecordedBodyHandle>,
-	},
+/// CEL's body view combines two independent sources, not mutually exclusive variants:
+/// inspection captures content available at evaluation/snapshot time; recording observes
+/// bytes subsequently delivered and is exposed only to access-log evaluation.
+///
+/// Both can be present: a policy may inspect only a prefix, then forwarding records
+/// the rest. The logger retains the inspection and adds the recording handle rather
+/// than replacing one with the other. Complete inspection wins; otherwise recording
+/// supplies `body` unless its limit was exceeded, and can always supply `body_prefix`.
+/// Recorded bytes may be partial if delivery stopped early; observing EOF is not
+/// required for logging (Hyper can stop polling after Content-Length bytes).
+/// A complete snapshot is not necessarily the final wire content if a
+/// later policy rewrites the body.
+#[derive(Debug, Clone, Default)]
+pub struct BodyView<'a> {
+	// An owned snapshot of inspected bytes; it does not grow as forwarding proceeds.
+	inspection: Option<BodyInspection>,
+	// A live handle to passive recording, populated only by new_logger. Policies
+	// must not depend on how much of the body happens to have been forwarded yet.
+	recorded: Option<&'a RecordedBodyHandle>,
 }
 
-impl BodyExtensionOrDirect<'_> {
-	fn buffered(&self) -> Option<&BufferedBody> {
-		match self {
-			BodyExtensionOrDirect::Extension(e) => e.get::<BufferedBody>(),
-			BodyExtensionOrDirect::Direct { buffered, .. } => *buffered,
-		}
-	}
-
-	fn recorded(&self) -> Option<&RecordedBodyHandle> {
-		match self {
-			BodyExtensionOrDirect::Extension(e) => e.get::<RecordedBodyHandle>(),
-			BodyExtensionOrDirect::Direct { recorded, .. } => *recorded,
+impl BodyView<'_> {
+	fn managed(body: &Body) -> BodyView<'_> {
+		BodyView {
+			inspection: body.inspection(),
+			recorded: None,
 		}
 	}
 
 	fn bytes(&self) -> Option<Bytes> {
-		if self.too_large() {
-			return None;
+		// Complete inspected content wins, irrespective of the recording limit.
+		if let Some(BodyInspection::Complete(bytes)) = &self.inspection {
+			return Some(bytes.clone());
 		}
-		if let Some(buffered) = self.buffered() {
-			buffered.bytes().cloned()
-		} else {
-			self.recorded().map(RecordedBodyHandle::bytes)
-		}
+		self
+			.recorded
+			.filter(|recorded| !recorded.exceeded_limit())
+			.map(RecordedBodyHandle::bytes)
 	}
 
 	fn prefix_bytes(&self) -> Option<Bytes> {
-		if let Some(buffered) = self.buffered() {
-			Some(buffered.prefix_bytes().clone())
-		} else {
-			self.recorded().map(RecordedBodyHandle::bytes)
+		// Prefer complete inspection, then recording (even if truncated), then
+		// partial inspection. Policies never have a recording handle.
+		match (&self.inspection, self.recorded) {
+			(Some(BodyInspection::Complete(bytes)), _) => Some(bytes.clone()),
+			(_, Some(recorded)) => Some(recorded.bytes()),
+			(Some(BodyInspection::Partial(bytes)), None) => Some(bytes.clone()),
+			(None, None) => None,
 		}
 	}
 
 	fn is_none(&self) -> bool {
-		self.too_large() || (self.buffered().is_none() && self.recorded().is_none())
-	}
-
-	fn too_large(&self) -> bool {
-		self.buffered().is_some_and(BufferedBody::is_too_large)
-			|| self
-				.recorded()
-				.is_some_and(RecordedBodyHandle::exceeded_limit)
+		self.bytes().is_none()
 	}
 }
 
-impl Default for BodyExtensionOrDirect<'_> {
-	fn default() -> Self {
-		Self::Direct {
-			buffered: None,
-			recorded: None,
-		}
-	}
-}
-
-impl Serialize for BodyExtensionOrDirect<'_> {
+impl Serialize for BodyView<'_> {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: serde::Serializer,
@@ -1322,7 +1372,7 @@ impl Serialize for BodyExtensionOrDirect<'_> {
 	}
 }
 
-impl DynamicType for BodyExtensionOrDirect<'_> {
+impl DynamicType for BodyView<'_> {
 	fn auto_materialize(&self) -> bool {
 		true
 	}
@@ -1336,15 +1386,15 @@ impl DynamicType for BodyExtensionOrDirect<'_> {
 }
 
 #[derive(Debug, Clone)]
-pub struct BodyPrefixExtensionOrDirect<'a>(BodyExtensionOrDirect<'a>);
+pub struct BodyPrefix<'a>(BodyView<'a>);
 
-impl BodyPrefixExtensionOrDirect<'_> {
+impl BodyPrefix<'_> {
 	fn is_none(&self) -> bool {
-		self.0.buffered().is_none() && self.0.recorded().is_none()
+		self.0.prefix_bytes().is_none()
 	}
 }
 
-impl Serialize for BodyPrefixExtensionOrDirect<'_> {
+impl Serialize for BodyPrefix<'_> {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: serde::Serializer,
@@ -1356,7 +1406,7 @@ impl Serialize for BodyPrefixExtensionOrDirect<'_> {
 	}
 }
 
-impl DynamicType for BodyPrefixExtensionOrDirect<'_> {
+impl DynamicType for BodyPrefix<'_> {
 	fn auto_materialize(&self) -> bool {
 		true
 	}
@@ -1412,17 +1462,17 @@ impl PartialEq for RequestRef<'_> {
 	}
 }
 
-/// Records one prompt-guard guardrail intervention.
+/// Records one prompt-guard guardrail evaluation.
 #[apply(schema!)]
 #[derive(Default, cel::DynamicType)]
 #[dynamic(rename_all = "camelCase")]
 pub struct GuardrailInfo {
-	/// The phase the guardrail intervened in: `request` or `response`.
+	/// The phase the guardrail was evaluated in: `request` or `response`.
 	pub phase: Strng,
-	/// The guard kind that intervened, such as `bedrockGuardrails`.
+	/// The guard kind that was evaluated, such as `bedrockGuardrails`.
 	pub guard: Strng,
-	/// The action the guardrail took (mask/reject/audit/failOpen).
-	pub action: Strng,
+	/// The action the guardrail took.
+	pub action: GuardrailAction,
 	#[serde(flatten, default)]
 	#[dynamic(flatten)]
 	pub detail: GuardDetail,
@@ -1447,8 +1497,27 @@ pub struct GuardDetail {
 	pub assessments: Vec<serde_json::Value>,
 }
 
+impl DynamicType for GuardrailAction {
+	fn auto_materialize(&self) -> bool {
+		true
+	}
+
+	fn materialize(&self) -> Value<'_> {
+		Value::String(
+			match self {
+				GuardrailAction::Allow => "allow",
+				GuardrailAction::FailOpen => "failOpen",
+				GuardrailAction::Audit => "audit",
+				GuardrailAction::Mask => "mask",
+				GuardrailAction::Reject => "reject",
+			}
+			.into(),
+		)
+	}
+}
+
 impl GuardrailInfo {
-	/// Minimal details about which guardrail fired, when it fired and what the action was.
+	/// Minimal details about which guardrail was evaluated, its phase and its action.
 	/// Does not include detailed reasons or assessments.
 	pub fn minimal(&self) -> serde_json::Value {
 		let mut entry = serde_json::json!({
@@ -1463,14 +1532,69 @@ impl GuardrailInfo {
 	}
 }
 
+/// The incoming request model, exposed as `llm.requestModel` and `llm.originalModel` before LLM
+/// processing.
+#[derive(Clone, Debug, cel::DynamicType)]
+pub struct RequestModel {
+	#[dynamic(rename = "requestModel")]
+	pub request_model: Strng,
+	#[dynamic(rename = "originalModel")]
+	pub original_model: Strng,
+}
+
+#[derive(Debug, Default)]
+pub enum LLMView<'a> {
+	#[default]
+	None,
+	Context(&'a LLMContext),
+	RequestModel(&'a RequestModel),
+}
+
+impl<'a> From<Option<&'a LLMContext>> for LLMView<'a> {
+	fn from(value: Option<&'a LLMContext>) -> Self {
+		value.map_or(Self::None, Self::Context)
+	}
+}
+
+impl DynamicType for LLMView<'_> {
+	fn auto_materialize(&self) -> bool {
+		match self {
+			Self::None => true,
+			Self::Context(llm) => llm.auto_materialize(),
+			Self::RequestModel(model) => model.auto_materialize(),
+		}
+	}
+
+	fn materialize(&self) -> Value<'_> {
+		match self {
+			Self::None => Value::Null,
+			Self::Context(llm) => llm.materialize(),
+			Self::RequestModel(model) => model.materialize(),
+		}
+	}
+
+	fn field(&self, field: &str) -> Option<Value<'_>> {
+		match self {
+			Self::None => None,
+			Self::Context(llm) => llm.field(field),
+			Self::RequestModel(model) => model.field(field),
+		}
+	}
+}
+
 #[apply(schema!)]
 #[derive(cel::DynamicType)]
 pub struct LLMContext {
 	/// Whether the LLM response is streamed. If it is streamed some fields may be inconsistent based on when accessed during the response flow.
 	pub streaming: bool,
-	/// The model requested for the LLM request. This may differ from the actual model used.
+	/// The model requested for the LLM request. Before LLM processing, this is extracted from
+	/// the incoming URL or body, before provider overrides. This may differ from the actual model used.
 	#[dynamic(rename = "requestModel")]
 	pub request_model: Strng,
+	/// The model the client asked for, before any virtual model, alias, provider override, or
+	/// request body rewrite. Equal to `requestModel` when the model was not rewritten.
+	#[dynamic(rename = "originalModel")]
+	pub original_model: Strng,
 	/// The model that actually served the LLM response.
 	#[dynamic(rename = "responseModel")]
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1501,6 +1625,10 @@ pub struct LLMContext {
 	#[dynamic(rename = "inputAudioTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub input_audio_tokens: Option<u64>,
+	/// Seconds of input audio, for models billed by duration rather than tokens (such as `whisper-1`).
+	#[dynamic(rename = "audioSeconds")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub audio_seconds: Option<f64>,
 	/// The number of tokens in the input/prompt read from cache (savings)
 	#[dynamic(rename = "cachedInputTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1542,13 +1670,17 @@ pub struct LLMContext {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub provider_total_tokens: Option<u64>,
 	/// The service tier the provider served the request under.
-	#[dynamic(rename = "serviceTier")]
+	#[dynamic(rename = "serviceTier", with_value = "service_tier_to_value")]
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub service_tier: Option<Strng>,
+	pub service_tier: Option<llm::catalog::PricingTier>,
 	// For now, not exposed to CEL; only used to piggy-back this field for metrics.
 	#[serde(skip)]
 	#[dynamic(skip)]
 	pub first_token: Option<Instant>,
+	// Not exposed to CEL; only used to piggy-back the per-token gaps for metrics.
+	#[serde(skip)]
+	#[dynamic(skip)]
+	pub inter_chunk_latencies: llm::TokenGapSummary,
 	/// Time from request start until the first response token is received.
 	#[dynamic(rename = "timeToFirstToken")]
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1585,6 +1717,10 @@ pub struct LLMContext {
 	#[dynamic(rename = "costRates")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cost_rates: Option<llm::catalog::CostRates>,
+	/// Model catalog metadata for the model that served the request.
+	/// Unset when the model is not in the catalog.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub model: Option<Arc<llm::catalog::ModelInfo>>,
 	#[serde(skip)]
 	#[dynamic(skip)]
 	pub cost_status: Option<llm::catalog::CostLookupStatus>,
@@ -1592,7 +1728,6 @@ pub struct LLMContext {
 
 impl LLMContext {
 	pub fn from_llm_info(value: LLMInfo, model_catalog: Option<&llm::catalog::ModelCatalog>) -> Self {
-		let legacy_token_semantics = *LEGACY_LLM_USAGE_TOKEN_SEMANTICS;
 		let projection = model_catalog.map(|catalog| catalog.project(&value));
 		let normalized_input_tokens = value.normalized_input_tokens();
 		let cache_convention = value.request.cache_convention;
@@ -1608,47 +1743,59 @@ impl LLMContext {
 			total_tokens: None,
 			provider_total_tokens: resp.total_tokens,
 			first_token: resp.first_token,
+			inter_chunk_latencies: resp.inter_chunk_latencies,
 			time_to_first_token: None,
 			time_per_output_token: None,
 			reasoning_tokens: resp.reasoning_tokens,
 			input_image_tokens: resp.input_image_tokens,
 			input_text_tokens: resp.input_text_tokens,
 			input_audio_tokens: resp.input_audio_tokens,
+			audio_seconds: resp.audio_seconds,
 			cached_input_tokens: resp.cached_input_tokens,
 			cache_creation_input_tokens: resp.cache_creation_input_tokens,
-			service_tier: resp.service_tier.clone(),
-			response_model: resp.provider_model.clone(),
+			service_tier: resp
+				.service_tier
+				.as_deref()
+				.and_then(|tier| llm::catalog::PricingTier::detect(&value.request.provider, tier)),
+			response_model: resp.provider_model,
 			// Not always set
-			completion: resp.completion.clone(),
-			tool_calls: resp
-				.output_messages
-				.as_ref()
-				.map(|msgs| msgs.iter().flat_map(|m| m.tool_calls()).collect()),
+			completion: resp.completion,
+			tool_calls: resp.output_messages.map(|msgs| {
+				msgs
+					.into_iter()
+					.flat_map(|m| m.content)
+					.map(|part| match part {
+						llm::OutputMessagePart::ToolCall {
+							id,
+							name,
+							arguments,
+						} => llm::ToolCall {
+							id,
+							name,
+							arguments,
+						},
+					})
+					.collect()
+			}),
 			..LLMContext::from(value.request)
 		};
 
-		if legacy_token_semantics {
-			base.input_tokens = base.provider_input_tokens.or(base.input_tokens);
-			base.total_tokens = base.provider_total_tokens;
-		} else {
-			base.input_tokens = normalized_input_tokens;
-		}
-		if !legacy_token_semantics {
-			base.total_tokens = match (base.input_tokens, base.output_tokens) {
-				(Some(input), Some(output)) => Some(input.saturating_add(output)),
-				_ => resp.total_tokens.map(|total| {
-					cache_convention.include_cache_tokens(
-						total,
-						resp.cached_input_tokens,
-						resp.cache_creation_input_tokens,
-					)
-				}),
-			};
-		}
+		base.input_tokens = normalized_input_tokens;
+		base.total_tokens = match (base.input_tokens, base.output_tokens) {
+			(Some(input), Some(output)) => Some(input.saturating_add(output)),
+			_ => resp.total_tokens.map(|total| {
+				cache_convention.include_cache_tokens(
+					total,
+					resp.cached_input_tokens,
+					resp.cache_creation_input_tokens,
+				)
+			}),
+		};
 
 		if let Some(projection) = projection {
 			base.cost = projection.cost;
 			base.cost_rates = projection.cost_rates;
+			base.model = projection.model;
 			base.cost_status = Some(projection.status);
 		}
 
@@ -1684,6 +1831,7 @@ impl From<llm::LLMRequest> for LLMContext {
 			input_format: _, // Expose this?
 			cache_convention: _,
 			request_model,
+			original_model,
 			provider,
 			streaming,
 			params,
@@ -1692,6 +1840,7 @@ impl From<llm::LLMRequest> for LLMContext {
 		} = info;
 		LLMContext {
 			streaming,
+			original_model: original_model.unwrap_or_else(|| request_model.clone()),
 			request_model,
 			provider,
 			input_tokens,
@@ -1700,6 +1849,7 @@ impl From<llm::LLMRequest> for LLMContext {
 			prompt,
 
 			first_token: None,
+			inter_chunk_latencies: llm::TokenGapSummary::default(),
 			time_to_first_token: None,
 			time_per_output_token: None,
 			count_tokens: None,
@@ -1716,20 +1866,17 @@ impl From<llm::LLMRequest> for LLMContext {
 			input_image_tokens: None,
 			input_text_tokens: None,
 			input_audio_tokens: None,
+			audio_seconds: None,
 			cached_input_tokens: None,
 			cache_creation_input_tokens: None,
 			service_tier: None,
 			cost: None,
 			cost_rates: None,
 			cost_status: None,
+			model: None,
 		}
 	}
 }
-
-static LEGACY_LLM_USAGE_TOKEN_SEMANTICS: Lazy<bool> = Lazy::new(|| {
-	std::env::var("AGENTGATEWAY_LEGACY_LLM_USAGE_TOKEN_SEMANTICS")
-		.is_ok_and(|value| value.eq_ignore_ascii_case("true"))
-});
 
 fn to_value_str<'a, T: AsRef<str>>(c: &'a &'a T) -> Value<'a> {
 	Value::String(c.as_ref().into())
@@ -1774,6 +1921,17 @@ impl DynamicType for SecretStringValue<'_> {
 pub fn secret_string_to_value(secret: &SecretString) -> Value<'_> {
 	Value::Dynamic(DynamicValue::new_owned(SecretStringValue(secret)))
 }
+fn service_tier_to_value(c: &Option<llm::catalog::PricingTier>) -> Value<'_> {
+	match c {
+		None => Value::Null,
+		Some(llm::catalog::PricingTier::Standard) => Value::String("standard".into()),
+		Some(llm::catalog::PricingTier::Flex) => Value::String("flex".into()),
+		Some(llm::catalog::PricingTier::Priority) => Value::String("priority".into()),
+		Some(llm::catalog::PricingTier::Reserved) => Value::String("reserved".into()),
+		Some(llm::catalog::PricingTier::Ultrafast) => Value::String("ultrafast".into()),
+	}
+}
+
 fn version_to_value<'a>(c: &'a http::Version) -> Value<'a> {
 	Value::String(crate::http::version_str(c).into())
 }
@@ -1812,13 +1970,6 @@ impl<'a> Headers<'a> {
 
 	fn as_ref(&self) -> &http::HeaderMap {
 		self.headers
-	}
-
-	fn get<K>(&self, name: K) -> Option<&http::HeaderValue>
-	where
-		K: http::header::AsHeaderName,
-	{
-		self.as_ref().get(name)
 	}
 
 	fn redacted(mut self) -> Self {
@@ -2139,6 +2290,8 @@ pub struct ExecutorSerde {
 	pub jwt: Option<jwt::Claims>,
 
 	/// `apiKey` contains the claims from a verified API Key. This is only present if the API Key policy is enabled.
+	/// In addition to `key`, user-supplied metadata fields are flattened into this object; for example,
+	/// `apiKey.group`. Metadata values are plain JSON and are not treated as secrets.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub api_key: Option<apikey::Claims>,
 
@@ -2150,8 +2303,8 @@ pub struct ExecutorSerde {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub llm: Option<LLMContext>,
 
-	/// `llmRequest` contains the raw LLM request before processing. This is only present *during* LLM policies;
-	/// policies occurring after the LLM policy, such as logs, will not have this field present even for LLM requests.
+	/// `llmRequest` contains the raw JSON LLM request during route and LLM policies.
+	/// Policies occurring after LLM processing, such as logs, will not have this field present.
 	#[serde(rename = "llmRequest", skip_serializing_if = "Option::is_none")]
 	pub llm_request: Option<serde_json::Value>,
 
@@ -2164,9 +2317,11 @@ pub struct ExecutorSerde {
 	pub destination: Option<DestinationContext>,
 
 	/// `mcp` contains attributes about the MCP request.
-	/// Request-time CEL only includes identity fields such as `tool`, `prompt`, or `resource`.
-	/// Post-request CEL may also include fields like `methodName`, `sessionId`, and tool payloads.
+	/// Request-time CEL includes identity fields (`tool`, `prompt`, `resource`,
+	/// `task`) plus `methodName`. Post-request CEL may also include fields like
+	/// `sessionId`, tool payloads, and list results.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<MCPView<'static>>"))]
 	pub mcp: Option<MCPInfo>,
 
 	/// `backend` contains information about the backend being used.
@@ -2189,11 +2344,17 @@ pub struct ExecutorSerde {
 	)]
 	pub mcp_guardrails: Option<McpGuardrailsDynamicMetadata>,
 
-	/// `guardrails` contains one entry per prompt-guard guardrail intervention, in either the
+	/// `guardrails` contains entries for prompt-guard guardrail evaluations, in either the
 	/// request or response phase. Only present in CEL that runs after the request completes,
 	/// such as log and metric fields.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub guardrails: Option<Vec<GuardrailInfo>>,
+
+	/// `upstreamCalls` lists the outbound calls made for this request, such as MCP target and policy calls.
+	/// It's only filled in for access log expressions that reference it.
+	/// Its request headers are the ones sent to the backend. `request.headers` still has the client's headers.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub upstream_calls: Option<Vec<crate::telemetry::upstream::UpstreamCall>>,
 
 	/// `metadata` contains values set by transformation metadata expressions.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2247,16 +2408,21 @@ impl ExecutorSerde {
 				scheme: req.scheme.as_ref(),
 				version: req.version,
 				headers: Headers::new(&req.headers),
-				body: BodyExtensionOrDirect::Direct {
-					buffered: req.body.as_ref(),
+				body: BodyView {
+					inspection: req.body.as_ref().map(|body| body.0.clone()),
 					recorded: None,
 				},
-				body_prefix: BodyPrefixExtensionOrDirect(BodyExtensionOrDirect::Direct {
-					buffered: req.body_prefix.as_ref().or(req.body.as_ref()),
+				body_prefix: BodyPrefix(BodyView {
+					inspection: req
+						.body_prefix
+						.as_ref()
+						.or(req.body.as_ref())
+						.map(|body| body.0.clone()),
 					recorded: None,
 				}),
 				start_time: ExtensionOrDirect::Direct(req.start_time.as_ref()),
 				end_time: req.end_time.as_ref(),
+				agent: ExtensionOrDirect::Direct(req.agent.as_ref()),
 			});
 		}
 
@@ -2266,12 +2432,16 @@ impl ExecutorSerde {
 				code: resp.code,
 				grpc_status: resp.grpc_status,
 				headers: Headers::new(&resp.headers),
-				body: BodyExtensionOrDirect::Direct {
-					buffered: resp.body.as_ref(),
+				body: BodyView {
+					inspection: resp.body.as_ref().map(|body| body.0.clone()),
 					recorded: None,
 				},
-				body_prefix: BodyPrefixExtensionOrDirect(BodyExtensionOrDirect::Direct {
-					buffered: resp.body_prefix.as_ref().or(resp.body.as_ref()),
+				body_prefix: BodyPrefix(BodyView {
+					inspection: resp
+						.body_prefix
+						.as_ref()
+						.or(resp.body.as_ref())
+						.map(|body| body.0.clone()),
 					recorded: None,
 				}),
 			});
@@ -2285,14 +2455,15 @@ impl ExecutorSerde {
 		exec.jwt = ExtensionOrDirect::Direct(self.jwt.as_ref());
 		exec.api_key = ExtensionOrDirect::Direct(self.api_key.as_ref());
 		exec.basic_auth = ExtensionOrDirect::Direct(self.basic_auth.as_ref());
-		exec.llm = ExtensionOrDirect::Direct(self.llm.as_ref());
+		exec.llm = self.llm.as_ref().into();
 		exec.backend = ExtensionOrDirect::Direct(self.backend.as_ref());
 		exec.extauthz = ExtensionOrDirect::Direct(self.extauthz.as_ref());
 		exec.extproc = ExtensionOrDirect::Direct(self.extproc.as_ref());
 		exec.mcp_guardrails = ExtensionOrDirect::Direct(self.mcp_guardrails.as_ref());
 		exec.guardrails = self.guardrails.as_ref();
+		exec.upstream_calls = self.upstream_calls.as_ref();
 		exec.metadata = ExtensionOrDirect::Direct(self.metadata.as_ref());
-		exec.mcp = self.mcp.as_ref();
+		exec.mcp = self.mcp.as_ref().map(MCPView::new);
 
 		exec
 	}
@@ -2324,6 +2495,9 @@ pub fn full_example_executor() -> ExecutorSerde {
 			end_time: Some(RequestTime(
 				chrono::DateTime::parse_from_rfc3339("2000-01-01T12:00:01.12345678Z").unwrap(),
 			)),
+			agent: Some(AgentContext {
+				session: Some("e96634a3-fa28-4083-b354-55542e2dca01".into()),
+			}),
 		}),
 		response: Some(ResponseRefSerde {
 			code: 200,
@@ -2333,6 +2507,10 @@ pub fn full_example_executor() -> ExecutorSerde {
 			body_prefix: Some(BufferedBody::complete(Bytes::from(r#"{"ok": true}"#))),
 		}),
 		proxy: Some(ProxyContext {
+			error: Some(ErrorContext {
+				reason: "UpstreamFailure".to_string(),
+				message: "upstream call failed: connection refused".to_string(),
+			}),
 			bind: Some("bind".into()),
 			gateway: Some(ProxyGatewayContext {
 				namespace: "ns-1".into(),
@@ -2406,6 +2584,7 @@ pub fn full_example_executor() -> ExecutorSerde {
 		llm: Some(LLMContext {
 			streaming: false,
 			request_model: "gpt-4".into(),
+			original_model: "gpt-4".into(),
 			response_model: Some("gpt-4-turbo".into()),
 			provider: "fake-ai".into(),
 			input_tokens: Some(100),
@@ -2413,6 +2592,7 @@ pub fn full_example_executor() -> ExecutorSerde {
 			input_image_tokens: Some(60),
 			input_text_tokens: Some(40),
 			input_audio_tokens: Some(5),
+			audio_seconds: None,
 			cached_input_tokens: Some(20),
 			cache_creation_input_tokens: Some(10),
 			output_tokens: Some(50),
@@ -2422,8 +2602,9 @@ pub fn full_example_executor() -> ExecutorSerde {
 			reasoning_tokens: Some(30),
 			total_tokens: Some(150),
 			provider_total_tokens: Some(150),
-			service_tier: Some("default".into()),
+			service_tier: Some(llm::catalog::PricingTier::Standard),
 			first_token: None,
+			inter_chunk_latencies: llm::TokenGapSummary::default(),
 			time_to_first_token: Some(chrono::Duration::milliseconds(123).into()),
 			time_per_output_token: Some(chrono::Duration::milliseconds(7).into()),
 			count_tokens: Some(10),
@@ -2440,14 +2621,17 @@ pub fn full_example_executor() -> ExecutorSerde {
 				max_tokens: Some(1024),
 				encoding_format: None,
 				dimensions: None,
+				reasoning_effort: None,
 			},
 			cost: None,
 			cost_rates: None,
 			cost_status: None,
+			model: None,
 		}),
 		mcp: Some(MCPInfo {
-			method_name: Some("tools/call".to_string()),
+			method_name: Some("tools/call".into()),
 			session_id: Some("session-123".to_string()),
+			target: None,
 			tool: Some(MCPTool {
 				target: "my-mcp-server".to_string(),
 				name: "get_weather".to_string(),
@@ -2468,20 +2652,26 @@ pub fn full_example_executor() -> ExecutorSerde {
 			prompt: None,
 			resource: None,
 			task: None,
+			tools_list: None,
+			prompts_list: None,
+			resources_list: None,
+			resource_templates_list: None,
 			error: None,
 		}),
 		backend: Some(BackendContext {
 			name: "my-backend".into(),
+			endpoint: Some("example.com:443".into()),
 			backend_type: BackendType::Service,
 			protocol: BackendProtocol::http,
 		}),
 		extauthz: Some(ExtAuthzDynamicMetadata::default()),
 		extproc: Some(ExtProcDynamicMetadata::default()),
+		upstream_calls: None,
 		mcp_guardrails: Some(McpGuardrailsDynamicMetadata::default()),
 		guardrails: Some(vec![GuardrailInfo {
 			phase: "request".into(),
 			guard: "bedrockGuardrails".into(),
-			action: "reject".into(),
+			action: GuardrailAction::Reject,
 			detail: GuardDetail {
 				guardrail_id: Some("gr-abc123".into()),
 				guardrail_version: Some("1".into()),

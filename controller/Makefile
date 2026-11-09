@@ -131,13 +131,16 @@ lint: analyze
 
 .PHONY: analyze
 analyze: ensure-custom-golangci-lint  ## Run golangci-lint. Override options with ANALYZE_ARGS.
+	$(if $(findstring --fix,$(ANALYZE_ARGS)),$(CUSTOM_GOLANGCI_LINT_FMT) ./...)
 	$(CUSTOM_GOLANGCI_LINT_RUN) $(ANALYZE_ARGS) ./...
 
 .PHONY: ensure-custom-golangci-lint
 ensure-custom-golangci-lint:
 	@expected_go_version="$$(go env GOVERSION)"; \
-	current_go_version="$$( $(CUSTOM_GOLANGCI_LINT_BIN) version 2>/dev/null | sed -n 's/.* built with \(go[0-9.]*\).*/\1/p' )"; \
-	if [ ! -x "$(CUSTOM_GOLANGCI_LINT_BIN)" ] || [ "$$current_go_version" != "$$expected_go_version" ]; then \
+	expected_golangci_version="$$(sed -n 's/^version: *//p' .custom-gcl.yml)"; \
+	current_go_version="$$( $(CUSTOM_GOLANGCI_LINT_BIN) version 2>/dev/null | sed -n 's/.* built with \(go[^[:space:]]*\).*/\1/p' )"; \
+	current_golangci_version="$$( $(CUSTOM_GOLANGCI_LINT_BIN) version 2>/dev/null | sed -n 's/.* version \(v[0-9][0-9.]*\)-custom.*/\1/p' )"; \
+	if [ ! -x "$(CUSTOM_GOLANGCI_LINT_BIN)" ] || [ "$$current_go_version" != "$$expected_go_version" ] || [ "$$current_golangci_version" != "$$expected_golangci_version" ]; then \
 		echo "Rebuilding golangci-lint custom with $$expected_go_version..."; \
 		rm -f "$(CUSTOM_GOLANGCI_LINT_BIN)"; \
 		GOTOOLCHAIN="$$expected_go_version" golangci-lint custom; \
@@ -337,7 +340,7 @@ clean-gen:
 	rm -rf api/applyconfiguration
 	rm -rf pkg/generated/openapi
 	rm -rf pkg/client
-	rm -f install/helm/agentgateway-crds/templates/agentgateway.dev_*.yaml
+	rm -f install/helm/agentgateway-crds/files/crds/agentgateway.dev_*.yaml
 
 # Clean all stamp files to force regeneration
 .PHONY: clean-stamps
@@ -419,7 +422,7 @@ export AGENTGATEWAY_IMAGE_REPO ?= agentgateway-controller
 
 .PHONY: agentgateway-controller
 agentgateway-controller:
-	 $(GO_BUILD_FLAGS) GOOS=linux go build -ldflags='$(LDFLAGS)' -gcflags='$(GCFLAGS)' -o $(CONTROLLER_OUTPUT_DIR)/agentgateway-linux-$(GOARCH) ./cmd/agentgateway
+	 $(GO_BUILD_FLAGS) GOOS=linux go build -trimpath -tags=disable_pgv,agent -ldflags='$(LDFLAGS)' -gcflags='$(GCFLAGS)' -o $(CONTROLLER_OUTPUT_DIR)/agentgateway-linux-$(GOARCH) ./cmd/agentgateway
 
 #----------------------------------------------------------------------------------
 # agctl CLI
@@ -600,7 +603,7 @@ INSTALL_NAMESPACE ?= agentgateway-system
 
 # The version of the Node Docker image to use for booting the kind cluster: https://hub.docker.com/r/kindest/node/tags
 # This version should stay in sync with the default node version in (controller)`test/setup/setup-kind-ci.sh`.
-CLUSTER_NODE_VERSION ?= v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+CLUSTER_NODE_VERSION ?= v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
 
 .PHONY: kind-create
 kind-create: ## Create a KinD cluster
@@ -708,7 +711,7 @@ kind-load: kind-load-testbox
 
 # Agent Gateway conformance test configuration
 AGW_CONFORMANCE_GATEWAY_CLASS ?= agentgateway
-AGW_CONFORMANCE_REPORT_ARGS ?= -report-output=$(TEST_ASSET_DIR)/conformance/agw-$(VERSION)-report.yaml -organization=agentgateway -project=agentgateway -version=$(VERSION) -url=github.com/agentgateway/agentgateway -contact=github.com/agentgateway/agentgateway/issues/new/choose
+AGW_CONFORMANCE_REPORT_ARGS ?= -report-output=$(TEST_ASSET_DIR)/conformance/agw-$(VERSION)-report.yaml -organization=agentgateway -project=agentgateway -version=$(VERSION) -url=https://github.com/agentgateway/agentgateway -contact=https://github.com/agentgateway/agentgateway/issues/new/choose
 AGW_CONFORMANCE_SKIP_TESTS ?=
 AGW_CONFORMANCE_SKIP_ARGS := $(if $(AGW_CONFORMANCE_SKIP_TESTS),-skip-tests=$(AGW_CONFORMANCE_SKIP_TESTS))
 AGW_CONFORMANCE_ARGS := -gateway-class=$(AGW_CONFORMANCE_GATEWAY_CLASS) $(AGW_CONFORMANCE_REPORT_ARGS) $(AGW_CONFORMANCE_SKIP_ARGS)
@@ -734,15 +737,21 @@ GIE_CONFORMANCE_REPORT_ARGS ?= \
 GIE_CONFORMANCE_GATEWAY_CLASS ?= agentgateway
 GIE_CONFORMANCE_ARGS := \
     -gateway-class=$(GIE_CONFORMANCE_GATEWAY_CLASS) \
+    -allow-crds-mismatch \
     $(GIE_CONFORMANCE_REPORT_ARGS)
+
+# The suite runs from an upstream checkout so it builds with its own go.mod.
+GIE_CONFORMANCE_REF ?= $(GIE_CRD_VERSION)
+GIE_CONFORMANCE_DIR := $(OUTPUT_DIR)/gie-conformance-$(GIE_CONFORMANCE_REF)
 
 .PHONY: gie-conformance
 gie-conformance: gie-crds ## Run the Gateway API Inference Extension conformance suite
 	@mkdir -p $(TEST_ASSET_DIR)/conformance
-	CGO_ENABLED=0 go test -mod=mod -ldflags='$(LDFLAGS)' \
-	    -tags conformance \
+	@[ -d $(GIE_CONFORMANCE_DIR) ] || git -c advice.detachedHead=false clone -q --depth 1 --branch $(GIE_CONFORMANCE_REF) \
+	    https://github.com/kubernetes-sigs/gateway-api-inference-extension $(GIE_CONFORMANCE_DIR)
+	cd $(GIE_CONFORMANCE_DIR)/conformance && CGO_ENABLED=0 go test \
 	    -timeout=25m \
-	    -v $(shell go mod download && go list -m -f '{{.Dir}}' sigs.k8s.io/gateway-api-inference-extension/conformance) \
+	    -v . \
 	    -args $(GIE_CONFORMANCE_ARGS)
 
 # An alias to run both Gateway API and Inference Extension conformance tests.
@@ -768,7 +777,8 @@ bump-gtw: ## Bump Gateway API deps to $DEP_REF (or $DEP_VERSION). Example: make 
 
 .PHONY: bump-gie
 bump-gie: ## Bump Gateway API Inference Extension to $DEP_REF (or $DEP_VERSION). Example: make bump-gie DEP_REF=198e6cab...
-	@if [ -z "$${DEP_REF:-}" ] && [ -n "$${DEP_VERSION:-}" ]; then DEP_REF="$$DEP_VERSION"; fi; \
+	@set -e; \
+	if [ -z "$${DEP_REF:-}" ] && [ -n "$${DEP_VERSION:-}" ]; then DEP_REF="$$DEP_VERSION"; fi; \
 	if [ -z "$${DEP_REF:-}" ]; then \
 	  echo "DEP_REF is not set (or DEP_VERSION). e.g. make bump-gie DEP_REF=v0.5.1 or DEP_REF=198e6cab6774..."; \
 	  exit 2; \

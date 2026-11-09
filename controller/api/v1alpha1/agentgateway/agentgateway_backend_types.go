@@ -212,7 +212,7 @@ type NamedLLMProvider struct {
 }
 
 // Large language model provider that the backend routes requests to.
-// +kubebuilder:validation:ExactlyOneOf=openai;azureopenai;azure;anthropic;gemini;vertexai;bedrock;custom
+// +kubebuilder:validation:ExactlyOneOf=openai;azureopenai;azure;anthropic;gemini;vertexai;bedrock;custom;copilot
 // +kubebuilder:validation:XValidation:rule="has(self.host) || has(self.port) ? has(self.host) && has(self.port) : true",message="both host and port must be set together"
 // +kubebuilder:validation:XValidation:rule="has(self.custom) ? has(self.custom.backendRef) != has(self.host) : true",message="custom providers must specify exactly one of backendRef or host and port"
 // +kubebuilder:validation:XValidation:rule="!(has(self.path) && has(self.pathPrefix))",message="path and pathPrefix are mutually exclusive"
@@ -222,6 +222,10 @@ type LLMProvider struct {
 	// OpenAI provider settings.
 	// +optional
 	OpenAI *OpenAIConfig `json:"openai,omitempty"`
+
+	// GitHub Copilot provider settings.
+	// +optional
+	Copilot *CopilotConfig `json:"copilot,omitempty"`
 
 	// Azure OpenAI provider settings.
 	// +optional
@@ -282,11 +286,10 @@ type LLMProvider struct {
 }
 
 // References a namespace-local backend resource.
-// +kubebuilder:validation:XValidation:rule="(size(self.group) == 0 && self.kind == 'Service') ? has(self.port) : true",message="Must have port for Service reference"
+// +kubebuilder:validation:XValidation:rule="((!has(self.group) || size(self.group) == 0) && (!has(self.kind) || self.kind == 'Service')) ? has(self.port) : true",message="Must have port for Service reference"
 type LocalBackendObjectReference struct {
 	// API group of the referenced resource. For example, `gateway.networking.k8s.io`.
-	// When unspecified or empty string, core API group is inferred.
-	// +kubebuilder:default=""
+	// Defaults to the empty string, which identifies the core API group.
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	// +optional
@@ -294,7 +297,6 @@ type LocalBackendObjectReference struct {
 
 	// Kind of the referenced resource. For example, `Service`.
 	// Defaults to "Service" when not specified.
-	// +kubebuilder:default=Service
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:Pattern=`^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$`
@@ -389,6 +391,12 @@ const (
 
 	// ProviderFormatRerank is the Cohere-compatible rerank API.
 	ProviderFormatRerank ProviderFormat = "Rerank"
+
+	// ProviderFormatDecisions is the OpenAI decisions API.
+	ProviderFormatDecisions ProviderFormat = "Decisions"
+
+	// ProviderFormatSystemOne is the TypeSafe SystemOne API.
+	ProviderFormatSystemOne ProviderFormat = "SystemOne"
 )
 
 // Settings for the [OpenAI](https://developers.openai.com/api/docs/guides/streaming-responses) LLM provider.
@@ -409,7 +417,6 @@ type OpenAIInlineModeration struct {
 	// The moderation model to use, such as `omni-moderation-latest`.
 	// Defaults to `omni-moderation-latest` if not specified.
 	// +optional
-	// +kubebuilder:default=omni-moderation-latest
 	Model ShortString `json:"model,omitempty"`
 
 	// Policies to apply to request input and generated output.
@@ -513,6 +520,14 @@ type AzureConfig struct {
 	Model *ShortString `json:"model,omitempty"`
 }
 
+// Settings for the GitHub Copilot LLM provider.
+type CopilotConfig struct {
+	// Model name override.
+	// If unset, the model name is taken from the request.
+	// +optional
+	Model *ShortString `json:"model,omitempty"`
+}
+
 // Settings for the [Gemini](https://ai.google.dev/gemini-api/docs) LLM provider.
 type GeminiConfig struct {
 	// Model name override, such as `gemini-2.5-pro`.
@@ -532,7 +547,6 @@ type VertexAISettings struct {
 	// multi-region endpoints. Other values are treated as regional locations.
 	// Defaults to `global` if not specified.
 	// +optional
-	// +kubebuilder:default=global
 	Region TinyString `json:"region,omitempty"`
 }
 
@@ -553,11 +567,11 @@ type AnthropicConfig struct {
 	Model *ShortString `json:"model,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.guardrail) || !has(self.endpointPreference) || !(self.endpointPreference in ['MantlePreferred', 'MantleOnly'])",message="Bedrock guardrails cannot be used with MantlePreferred or MantleOnly"
 type BedrockSettings struct {
 	// AWS region to use for the backend.
 	// Defaults to `us-east-1` if not specified.
 	// +optional
-	// +kubebuilder:default=us-east-1
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern="^[a-z0-9-]+$"
@@ -568,7 +582,31 @@ type BedrockSettings struct {
 	// If not specified, the AWS Guardrail policy will not be used.
 	// +optional
 	Guardrail *AWSGuardrailConfig `json:"guardrail,omitempty"`
+
+	// EndpointPreference selects which Bedrock API surface to prefer.
+	// Defaults to `RuntimePreferred`, preferring runtime over mantle.
+	// Decides which endpoint to pick mainly based on the catalog tags
+	// `mantle` and `runtime`.
+	// +optional
+	EndpointPreference BedrockEndpointPreference `json:"endpointPreference,omitempty"`
 }
+
+// BedrockEndpointPreference selects the Bedrock API endpoint preference.
+// +k8s:enum
+type BedrockEndpointPreference string
+
+const (
+	// BedrockEndpointPreferenceRuntimePreferred uses Runtime by default and routes to
+	// Mantle only for models the catalog tags `mantle` but not `runtime`. This is the default.
+	BedrockEndpointPreferenceRuntimePreferred BedrockEndpointPreference = "RuntimePreferred"
+	// BedrockEndpointPreferenceMantlePreferred uses Mantle by default and routes to
+	// Runtime only for models the catalog tags `runtime` but not `mantle`.
+	BedrockEndpointPreferenceMantlePreferred BedrockEndpointPreference = "MantlePreferred"
+	// BedrockEndpointPreferenceMantleOnly always uses the Mantle endpoint, regardless of catalog tags.
+	BedrockEndpointPreferenceMantleOnly BedrockEndpointPreference = "MantleOnly"
+	// BedrockEndpointPreferenceRuntimeOnly always uses the Runtime endpoint, regardless of catalog tags.
+	BedrockEndpointPreferenceRuntimeOnly BedrockEndpointPreference = "RuntimeOnly"
+)
 
 type BedrockConfig struct {
 	BedrockSettings `json:",inline"`
@@ -599,6 +637,7 @@ type MCPBackend struct {
 	// +listMapKey=name
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=128
+	// +kubebuilder:validation:XValidation:rule="self.size() > 1 || self.all(t, !has(t.condition) || has(t.selector))",message="mcp target condition requires at least two targets unless the target uses selector"
 	// +required
 	Targets []McpTargetSelector `json:"targets"`
 
@@ -655,6 +694,9 @@ type McpTargetSelector struct {
 	Name gwv1.SectionName `json:"name"`
 
 	// Label selector used to select `Service` resources.
+	// Selected `Service` ports must set `appProtocol: agentgateway.dev/mcp` for
+	// streamable HTTP or `appProtocol: agentgateway.dev/mcp-sse` for SSE. Ports
+	// without a recognized MCP `appProtocol` value are ignored.
 	// If policies are needed on a per-service basis, `AgentgatewayPolicy` can
 	// target the desired `Service`.
 	// +optional
@@ -665,6 +707,12 @@ type McpTargetSelector struct {
 	// instead.
 	// +optional
 	Static *McpTarget `json:"static,omitempty"`
+
+	// CEL expression evaluated per request; when it evaluates to false, the
+	// target is excluded from the virtual MCP. `mcp.target.name` is available.
+	// With `selector`, the condition applies to each selected target.
+	// +optional
+	Condition *CELExpression `json:"condition,omitempty"`
 }
 
 const (

@@ -50,7 +50,20 @@ export function mcpPlaygroundEndpoint(
 }
 
 export function llmGatewayOrigin(config: GatewayConfig | null | undefined) {
-	const gateway = firstGatewayEndpoint(config, llmGatewayRefs(config));
+	const refs = llmGatewayRefs(config);
+	const uiGateways = uiGatewayRefs(config);
+	// When the UI is served from the same gateway, the browser's origin is the externally reachable
+	// address, even behind a reverse proxy that changes the scheme or port.
+	if (
+		config &&
+		uiGateways.length > 0 &&
+		refs.length > 0 &&
+		gatewayRefsOverlap(config, uiGateways, refs)
+	) {
+		// The proxy strips ui.basePath for everything on the UI's gateway, not just the UI.
+		return `${window.location.origin}${config.ui?.basePath ?? ''}`;
+	}
+	const gateway = firstGatewayEndpoint(config, refs);
 	if (gateway?.port !== undefined) {
 		return gatewayOrigin(gateway.port, gateway.scheme ?? currentWindowScheme());
 	}
@@ -75,7 +88,7 @@ function playgroundEndpoint(
 		targets.length > 0 &&
 		gatewayRefsOverlap(config, uiGateways, targets)
 	) {
-		return { baseUrl: sameOriginBaseUrl, sameOrigin: true };
+		return { baseUrl: `${config.ui?.basePath ?? ''}${sameOriginBaseUrl}`, sameOrigin: true };
 	}
 
 	const gateway = firstGatewayEndpoint(config, targets);

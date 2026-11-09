@@ -51,8 +51,11 @@ impl TCPProxy {
 			tcp.clone(),
 		)
 		.into();
-		// Set source context for TCP logging
-		log.with(|l| l.source_context = Some(src));
+		// Set TCP-specific logging context before any operation that can fail.
+		log.with(|l| {
+			l.source_context = Some(src);
+			l.backend_protocol = Some(cel::BackendProtocol::tcp);
+		});
 		let ret = self.proxy_internal(connection, log.as_mut().unwrap()).await;
 		if let Err(e) = ret {
 			log.with(|l| l.error = Some(e.to_string()));
@@ -95,13 +98,27 @@ impl TCPProxy {
 		} else {
 			connection
 		};
+		log.tls_info = connection.ext::<TLSConnectionInfo>().cloned();
+		if let Some(actor) = connection.ext::<http::substrate::ActorIdentity>() {
+			log.ate_actor_name = Some(actor.actor_name.clone());
+			log.ate_actor_uid = actor.actor_uid.clone();
+			log.ate_atespace = Some(actor.atespace.clone());
+		}
+		let sni = log
+			.tls_info
+			.as_ref()
+			.and_then(|tls| tls.server_name.as_deref())
+			.map(|s| s.to_string());
+		let destination = crate::cel::DestinationContext {
+			address: self.target_address.ip(),
+			port: self.target_address.port(),
+			hostname: sni.as_deref().map(strng::new),
+		};
 		if let Some(authz) = frontend_policies.network_authorization.as_ref() {
-			authz.apply(
-				log
-					.source_context
-					.as_ref()
-					.expect("expected source context"),
-			)?;
+			authz.apply(&cel::Executor::new_tcp(
+				log.source_context.as_ref(),
+				&destination,
+			))?;
 		}
 		if let Some(authz) = frontend_policies.network_ext_authz.as_ref() {
 			authz
@@ -120,8 +137,6 @@ impl TCPProxy {
 				)
 				.await?;
 		}
-		log.tls_info = connection.ext::<TLSConnectionInfo>().cloned();
-		log.backend_protocol = Some(cel::BackendProtocol::tcp);
 		let tcp_labels = TCPLabels {
 			bind: Some(&self.bind_name).into(),
 			gateway: Some(&self.selected_listener.name.as_gateway_name()).into(),
@@ -138,11 +153,6 @@ impl TCPProxy {
 			.downstream_connection
 			.get_or_create(&tcp_labels)
 			.inc();
-		let sni = log
-			.tls_info
-			.as_ref()
-			.and_then(|tls| tls.server_name.as_deref())
-			.map(|s| s.to_string());
 
 		let selected_listener = self.selected_listener.clone();
 		let inputs = self.inputs.clone();
@@ -185,19 +195,24 @@ impl TCPProxy {
 			.ext::<WaypointService>()
 			.map(|_| crate::client::HboneSourceRole::Waypoint)
 			.or(Some(crate::client::HboneSourceRole::Gateway));
-		let destination = crate::cel::DestinationContext {
-			address: self.target_address.ip(),
-			port: self.target_address.port(),
-			hostname: sni.as_deref().map(strng::new),
-		};
-		let mut backend_call = Self::build_backend_call(
-			&mut Some(log),
-			Some(&destination),
-			&inputs,
-			&selected_backend.backend.backend,
-			backend_policies,
-			hbone_source,
-		)?;
+		let mut backend_call =
+			if let Some(target) = connection.ext::<httpproxy::DynamicBackendOverride>() {
+				if !matches!(selected_backend.backend.backend, Backend::Dynamic(_, _)) {
+					return Err(ProxyError::SubstrateEgressDenied(
+						"substrate egress requires a dynamic TCP route backend".to_owned(),
+					));
+				}
+				BackendCall::new(target.0.clone(), backend_policies)
+			} else {
+				Self::build_backend_call(
+					&mut Some(log),
+					Some(&destination),
+					&inputs,
+					&selected_backend.backend.backend,
+					backend_policies,
+					hbone_source,
+				)?
+			};
 		if let Some(tunnel) = backend_call.backend_policies.tunnel.clone() {
 			backend_call.set_tunnel_proxy(resolve_tunnel_backend_call(
 				&mut Some(log),
@@ -235,7 +250,9 @@ impl TCPProxy {
 					transport,
 					tcp: backend_call.backend_policies.tcp.clone(),
 					max_connection_duration: None,
+					backend: Some(selected_backend.backend.backend.name()),
 				},
+				dynamic_backend: matches!(selected_backend.backend.backend, Backend::Dynamic(_, _)),
 			})
 			.await?;
 		Ok(())
@@ -614,6 +631,7 @@ mod tests {
 			},
 			hostname: Default::default(),
 			protocol: ListenerProtocol::HBONE,
+			..Default::default()
 		})
 	}
 
@@ -857,6 +875,7 @@ mod tests {
 			},
 			hostname: Default::default(),
 			protocol: ListenerProtocol::TLS(None), // Not HBONE
+			..Default::default()
 		});
 
 		let route = super::select_best_route(None, listener, &stores, &network, dst, None);
@@ -1021,6 +1040,7 @@ mod tests {
 			&client::Config {
 				resolver_cfg: ResolverConfig::default(),
 				resolver_opts: ResolverOpts::default(),
+				max_ttl: None,
 			},
 			None,
 			BackendConfig::default(),
@@ -1036,6 +1056,7 @@ mod tests {
 			)),
 			model_catalog: ModelCatalog::empty(),
 			admin: None,
+			stats: None,
 			upstream: client,
 			ca: None,
 			spiffe: None,

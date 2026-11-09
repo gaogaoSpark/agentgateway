@@ -17,21 +17,29 @@ use crate::common::gateway::AgentGateway;
 //   - Optional: VERTEX_ANTHROPIC_MODEL to run Anthropic-on-Vertex specific tests
 // - Bedrock: (requires AWS implicit auth)
 // - Azure OpenAI: AZURE_HOST (requires implicit auth)
+// - Azure AI Foundry: FOUNDRY_RESOURCE_NAME (requires implicit auth)
+//   - FOUNDRY_ANTHROPIC_MODEL: Anthropic model deployed in Foundry, for the Messages tests
+//   - FOUNDRY_OPENAI_MODEL: OpenAI-compatible model deployed in Foundry, for the Completions tests
 //
 // Examples:
 //
 // 1. Run all E2E tests for all providers:
-//    AGENTGATEWAY_E2E=true ANTHROPIC_API_KEY=... OPENAI_API_KEY=... cargo test --test integration tests::llm::
+//    AGENTGATEWAY_E2E=true ANTHROPIC_API_KEY=... OPENAI_API_KEY=... cargo test --test integration tests::llm_providers::
 //
 // 2. Run all tests for a specific provider (e.g., OpenAI):
-//    AGENTGATEWAY_E2E=true OPENAI_API_KEY=... cargo test --test integration tests::llm::openai::
+//    AGENTGATEWAY_E2E=true OPENAI_API_KEY=... cargo test --test integration tests::llm_providers::openai::
 //
 // 3. Run a specific targeted test case (e.g., Bedrock messages):
-//    AGENTGATEWAY_E2E=true cargo test --test integration tests::llm::bedrock::messages
+//    AGENTGATEWAY_E2E=true cargo test --test integration tests::llm_providers::bedrock::messages
+//
+// 4. Run the Azure AI Foundry tests:
+//    AGENTGATEWAY_E2E=true FOUNDRY_RESOURCE_NAME=my-resource \
+//    FOUNDRY_ANTHROPIC_MODEL=claude-3-5-haiku-20241022 FOUNDRY_OPENAI_MODEL=gpt-4o-mini \
+//    cargo test --test integration tests::llm_providers::foundry::
 //
 // DNS configuration can be overridden via environment variables, for example:
 //    IPV6_ENABLED=false DNS_LOOKUP_FAMILY=V4Only DNS_EDNS0=true \
-//    AGENTGATEWAY_E2E=true cargo test --test integration tests::llm::gemini::
+//    AGENTGATEWAY_E2E=true cargo test --test integration tests::llm_providers::gemini::
 // This will disable IPv6 and enable EDNS0 for the Gemini tests.
 //
 // Note: Some providers (Bedrock, Vertex) use implicit environment auth (AWS/GCP) instead of explicit keys.
@@ -195,6 +203,15 @@ macro_rules! provider_env_model_test {
 const VERTEX_RERANK_MODEL: &str = "semantic-ranker-default@latest";
 
 fn llm_config(provider: &str, env: &str, model: &str) -> String {
+	llm_config_pref(provider, env, model, None)
+}
+
+fn llm_config_pref(
+	provider: &str,
+	env: &str,
+	model: &str,
+	bedrock_preference: Option<&str>,
+) -> String {
 	let policies = if provider == "azure" || provider == "foundry" {
 		r#"
       policies:
@@ -215,14 +232,18 @@ fn llm_config(provider: &str, env: &str, model: &str) -> String {
 		"".to_string()
 	};
 	let extra = if provider == "bedrock" {
-		r#"
-              region: us-west-2
+		let pref = bedrock_preference
+			.map(|p| format!("\n              endpointPreference: {p}"))
+			.unwrap_or_default();
+		format!(
+			r#"
+              region: us-west-2{pref}
               "#
-		.to_string()
+		)
 	} else if provider == "vertex" {
-		// Discovery Engine ranking (rerank) is only served from `global`/`us`/`eu`, not the Vertex AI
-		// regions used for chat/embeddings, so the rerank model pins the location to `global`.
-		let region = if model == VERTEX_RERANK_MODEL {
+		// Discovery Engine ranking (rerank) is only served from `global`/`us`/`eu`, and Gemini 3 is
+		// only served from `global`, not the regions used for the other chat/embedding models.
+		let region = if model == VERTEX_RERANK_MODEL || model.contains("gemini-3") {
 			"global"
 		} else {
 			"us-east5"
@@ -482,6 +503,43 @@ mod bedrock {
 	);
 }
 
+// Live smoke test for the Bedrock Mantle endpoint (bedrock-mantle.{region}.api.aws).
+//
+// Required env vars:
+//   AGENTGATEWAY_E2E=true
+//   AWS credentials resolvable by the default provider chain (e.g. AWS_PROFILE, or the standard
+//   AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN), for a region where Mantle is
+//   available and the model is enabled (the config below pins us-west-2).
+//
+// Example:
+//   AGENTGATEWAY_E2E=true AWS_PROFILE=my-bedrock-profile \
+//   cargo test --test integration -- --ignored mantle_smoke
+async fn setup_bedrock_mantle(model: &str) -> Option<AgentGateway> {
+	if !require_env("AGENTGATEWAY_E2E") {
+		return None;
+	}
+	let gw = AgentGateway::new(llm_config_pref("bedrock", "", model, Some("mantleOnly")))
+		.await
+		.unwrap();
+	Some(gw)
+}
+
+mod bedrock_mantle {
+	use super::*;
+
+	#[tokio::test]
+	#[ignore]
+	async fn mantle_smoke() {
+		let Some(gw) = setup_bedrock_mantle("openai.gpt-oss-120b").await else {
+			return;
+		};
+		// Cap output so it stays within the shared assert_log token bound.
+		send_completions_request(&gw, false, Some(50), None, "give me a 1 word answer").await;
+		send_completions_request(&gw, true, Some(50), None, "give me a 1 word answer").await;
+		send_responses(&gw, false).await;
+	}
+}
+
 mod anthropic {
 	use super::*;
 	send_completions_tests!(
@@ -548,28 +606,28 @@ mod anthropic {
 
 mod gemini {
 	use super::*;
-	send_completions_tests!("gemini", "GEMINI_API_KEY", "gemini-2.5-flash");
-	send_completions_tool_tests!("gemini", "GEMINI_API_KEY", "gemini-2.5-flash");
-	send_messages_tests!("gemini", "GEMINI_API_KEY", "gemini-2.5-flash");
+	send_completions_tests!("gemini", "GEMINI_API_KEY", "gemini-3.8-flash");
+	send_completions_tool_tests!("gemini", "GEMINI_API_KEY", "gemini-3.8-flash");
+	send_messages_tests!("gemini", "GEMINI_API_KEY", "gemini-3.8-flash");
 	send_messages_image_tests!(
 		"gemini",
 		"GEMINI_API_KEY",
-		"gemini-2.5-flash",
+		"gemini-3.8-flash",
 		send_messages_with_image_url
 	);
-	send_messages_tool_tests!("gemini", "GEMINI_API_KEY", "gemini-2.5-flash");
+	send_messages_tool_tests!("gemini", "GEMINI_API_KEY", "gemini-3.8-flash");
 	provider_model_test!(
 		messages_count_tokens_completions_backend,
 		"gemini",
 		"GEMINI_API_KEY",
-		"gemini-2.5-flash",
+		"gemini-3.8-flash",
 		send_messages_count_tokens
 	);
 	provider_model_test!(
 		responses,
 		"gemini",
 		"GEMINI_API_KEY",
-		"gemini-2.5-flash",
+		"gemini-3.8-flash",
 		send_responses,
 		false
 	);
@@ -577,7 +635,7 @@ mod gemini {
 		responses_streaming,
 		"gemini",
 		"GEMINI_API_KEY",
-		"gemini-2.5-flash",
+		"gemini-3.8-flash",
 		send_streaming_responses_and_drain,
 	);
 
@@ -617,16 +675,16 @@ mod gemini {
 
 mod vertex {
 	use super::*;
-	send_completions_tests!("vertex", "", "google/gemini-2.5-flash-lite");
-	send_completions_tool_tests!("vertex", "", "google/gemini-2.5-flash-lite");
-	send_messages_tests!("vertex", "", "google/gemini-2.5-flash-lite");
+	send_completions_tests!("vertex", "", "google/gemini-3.8-flash");
+	send_completions_tool_tests!("vertex", "", "google/gemini-3.8-flash");
+	send_messages_tests!("vertex", "", "google/gemini-3.8-flash");
 	send_messages_image_tests!(
 		"vertex",
 		"",
-		"google/gemini-2.5-flash-lite",
+		"google/gemini-3.8-flash",
 		send_messages_with_image_url
 	);
-	send_messages_tool_tests!("vertex", "", "google/gemini-2.5-flash-lite");
+	send_messages_tool_tests!("vertex", "", "google/gemini-3.8-flash");
 
 	// TODO(https://github.com/agentgateway/agentgateway/pull/909) support this
 	provider_env_model_test!(
@@ -682,7 +740,7 @@ mod vertex {
 		messages_count_tokens_completions_backend,
 		"vertex",
 		"",
-		"google/gemini-2.5-flash-lite",
+		"google/gemini-3.8-flash",
 		send_messages_count_tokens
 	);
 }
@@ -705,20 +763,6 @@ mod azure {
 	);
 }
 
-// Azure AI Foundry tests.
-//
-// Required env vars:
-//   AGENTGATEWAY_E2E=true
-//   FOUNDRY_RESOURCE_NAME   — Foundry resource/workspace name (e.g. my-foundry-resource)
-//   FOUNDRY_ANTHROPIC_MODEL — Anthropic model deployed in Foundry (e.g. claude-3-5-haiku-20241022)
-//   FOUNDRY_OPENAI_MODEL    — OpenAI-compatible model deployed in Foundry (e.g. gpt-4o-mini)
-//
-// Example:
-//   AGENTGATEWAY_E2E=true \
-//   FOUNDRY_RESOURCE_NAME=my-resource \
-//   FOUNDRY_ANTHROPIC_MODEL=claude-3-5-haiku-20241022 \
-//   FOUNDRY_OPENAI_MODEL=gpt-4o-mini \
-//   cargo test --test integration tests::llm::foundry::
 mod foundry {
 	use super::*;
 
@@ -800,7 +844,8 @@ pub async fn setup(provider: &str, env: &str, model: &str) -> Option<AgentGatewa
 }
 
 async fn assert_log(path: &str, streaming: bool, test_id: &str) {
-	assert_log_with_output_range(path, streaming, test_id, 1, 100).await;
+	// A short answer can still use many reasoning tokens.
+	assert_log_with_output_range(path, streaming, test_id, 1, i64::MAX).await;
 }
 
 async fn assert_request_log(path: &str, streaming: bool, test_id: &str) {
@@ -1247,7 +1292,7 @@ pub async fn send_messages_multi_turn_tool_use(gw: &AgentGateway) {
 				},
 				{
 					"role": "assistant",
-					"content": [tool_use]
+					"content": content
 				},
 				{
 					"role": "user",

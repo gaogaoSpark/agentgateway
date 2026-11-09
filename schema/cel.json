@@ -87,6 +87,23 @@
             "string",
             "null"
           ]
+        },
+        "agent": {
+          "description": "The agent harness that sent the request.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "session": {
+              "description": "The agent session the request belongs to, from `standardAttributes.session` or detected from\nwell-known agent headers such as `x-claude-code-session-id`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -148,6 +165,28 @@
         "null"
       ],
       "properties": {
+        "error": {
+          "description": "The final gateway error when the response was synthesized from a failed request.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "reason": {
+              "description": "Broad classification of the failure, such as `UpstreamFailure` or `Timeout`.",
+              "type": "string"
+            },
+            "message": {
+              "description": "Human-readable failure detail. Exact message is subject to change.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "reason",
+            "message"
+          ]
+        },
         "bind": {
           "description": "The bind that accepted the request.",
           "type": [
@@ -294,7 +333,7 @@
       "additionalProperties": true
     },
     "apiKey": {
-      "description": "`apiKey` contains the claims from a verified API Key. This is only present if the API Key policy is enabled.",
+      "description": "`apiKey` contains the claims from a verified API Key. This is only present if the API Key policy is enabled.\nIn addition to `key`, user-supplied metadata fields are flattened into this object; for example,\n`apiKey.group`. Metadata values are plain JSON and are not treated as secrets.",
       "type": [
         "object",
         "null"
@@ -338,7 +377,11 @@
           "type": "boolean"
         },
         "requestModel": {
-          "description": "The model requested for the LLM request. This may differ from the actual model used.",
+          "description": "The model requested for the LLM request. Before LLM processing, this is extracted from\nthe incoming URL or body, before provider overrides. This may differ from the actual model used.",
+          "type": "string"
+        },
+        "originalModel": {
+          "description": "The model the client asked for, before any virtual model, alias, provider override, or\nrequest body rewrite. Equal to `requestModel` when the model was not rewritten.",
           "type": "string"
         },
         "responseModel": {
@@ -396,6 +439,14 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "audioSeconds": {
+          "description": "Seconds of input audio, for models billed by duration rather than tokens (such as `whisper-1`).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
         },
         "cachedInputTokens": {
           "description": "The number of tokens in the input/prompt read from cache (savings)",
@@ -483,6 +534,14 @@
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "standard",
+            "flex",
+            "priority",
+            "reserved",
+            "ultrafast",
+            null
           ]
         },
         "timeToFirstToken": {
@@ -630,6 +689,23 @@
               ],
               "format": "uint64",
               "minimum": 0
+            },
+            "reasoning_effort": {
+              "description": "The reasoning effort requested by the client: OpenAI `reasoning_effort` or\n`reasoning.effort`, Anthropic `output_config.effort`, or Gemini `thinkingLevel`.\nUnset when the request does not specify one, in which case the provider default applies.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                null
+              ]
             }
           }
         },
@@ -660,6 +736,20 @@
               "type": "number",
               "format": "double"
             },
+            "cacheWriteDetails": {
+              "type": "object",
+              "properties": {
+                "1h": {
+                  "type": "number",
+                  "format": "double"
+                },
+                "12h": {
+                  "type": "number",
+                  "format": "double"
+                }
+              },
+              "additionalProperties": false
+            },
             "reasoning": {
               "type": "number",
               "format": "double"
@@ -669,6 +759,14 @@
               "format": "double"
             },
             "outputAudio": {
+              "type": "number",
+              "format": "double"
+            },
+            "pages": {
+              "type": "number",
+              "format": "double"
+            },
+            "audioDuration": {
               "type": "number",
               "format": "double"
             }
@@ -682,7 +780,8 @@
             "cacheWrite",
             "reasoning",
             "inputAudio",
-            "outputAudio"
+            "outputAudio",
+            "pages"
           ]
         },
         "costRates": {
@@ -720,6 +819,26 @@
               ],
               "format": "double"
             },
+            "cacheWriteDetails": {
+              "type": "object",
+              "properties": {
+                "1h": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "format": "double"
+                },
+                "12h": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "format": "double"
+                }
+              },
+              "additionalProperties": false
+            },
             "reasoning": {
               "type": [
                 "number",
@@ -740,21 +859,224 @@
                 "null"
               ],
               "format": "double"
+            },
+            "perPage": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "perAudioMinute": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
             }
           },
           "additionalProperties": false
+        },
+        "model": {
+          "description": "Model catalog metadata for the model that served the request.\nUnset when the model is not in the catalog.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "id": {
+              "description": "The catalog model ID the request resolved to.",
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable display name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "description": "Lifecycle stage (alpha, beta, deprecated); absent means generally available.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "released": {
+              "description": "Release date, as YYYY-MM-DD or YYYY-MM.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tags": {
+              "description": "Freeform capability/routing tags for this model.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "limits": {
+              "description": "Token limits.",
+              "type": "object",
+              "properties": {
+                "context": {
+                  "description": "Total context window, shared by input and output.",
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "input": {
+                  "description": "Maximum input tokens, when tighter than the context window allows.",
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "output": {
+                  "description": "Maximum output tokens.",
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "default": {}
+            },
+            "modalities": {
+              "description": "Supported input and output modalities.",
+              "type": "object",
+              "properties": {
+                "input": {
+                  "description": "Input modalities, such as text, image, pdf, audio, or video.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "output": {
+                  "description": "Output modalities, such as text, image, audio, or video.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false,
+              "default": {}
+            },
+            "capabilities": {
+              "description": "Supported features. Absent fields are unknown.",
+              "type": "object",
+              "properties": {
+                "reasoning": {
+                  "description": "Whether the model supports reasoning.",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "structuredOutput": {
+                  "description": "Whether the model supports JSON Schema structured outputs.",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "toolCall": {
+                  "description": "Whether the model supports tool calling.",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "temperature": {
+                  "description": "Whether the model accepts the temperature parameter.",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "default": {}
+            },
+            "reasoning": {
+              "description": "How reasoning can be controlled.",
+              "type": "object",
+              "properties": {
+                "toggle": {
+                  "description": "Whether reasoning can be turned on and off.",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "effort": {
+                  "description": "Accepted effort levels.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "budgetTokens": {
+                  "description": "Accepted reasoning token budget range.",
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "min": {
+                      "description": "Minimum reasoning token budget.",
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "max": {
+                      "description": "Maximum reasoning token budget.",
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false,
+              "default": {}
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "id"
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
         "streaming",
         "requestModel",
+        "originalModel",
         "provider",
         "params"
       ]
     },
     "llmRequest": {
-      "description": "`llmRequest` contains the raw LLM request before processing. This is only present *during* LLM policies;\npolicies occurring after the LLM policy, such as logs, will not have this field present even for LLM requests."
+      "description": "`llmRequest` contains the raw JSON LLM request during route and LLM policies.\nPolicies occurring after LLM processing, such as logs, will not have this field present."
     },
     "source": {
       "description": "`source` contains attributes about the source of the request.",
@@ -928,7 +1250,7 @@
       "additionalProperties": false
     },
     "mcp": {
-      "description": "`mcp` contains attributes about the MCP request.\nRequest-time CEL only includes identity fields such as `tool`, `prompt`, or `resource`.\nPost-request CEL may also include fields like `methodName`, `sessionId`, and tool payloads.",
+      "description": "`mcp` contains attributes about the MCP request.\nRequest-time CEL includes identity fields (`tool`, `prompt`, `resource`,\n`task`) plus `methodName`. Post-request CEL may also include fields like\n`sessionId`, tool payloads, and list results.",
       "type": [
         "object",
         "null"
@@ -944,6 +1266,22 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "target": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "name": {
+              "description": "The MCP target for the current target-scoped operation.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "name"
           ]
         },
         "tool": {
@@ -1039,6 +1377,24 @@
             "target",
             "name"
           ]
+        },
+        "toolsList": {
+          "description": "The terminal tools/list result returned to the client, if available."
+        },
+        "promptsList": {
+          "description": "The terminal prompts/list result returned to the client, if available."
+        },
+        "resourcesList": {
+          "description": "The terminal resources/list result returned to the client, if available."
+        },
+        "resourceTemplatesList": {
+          "description": "The terminal resources/templates/list result returned to the client, if available."
+        },
+        "params": {
+          "description": "Current request parameters, with the same structure as the `params` object in an MCP request.\nAvailable only during request-phase CEL guardrails."
+        },
+        "result": {
+          "description": "Current response result, with the same structure as the `result` object in an MCP response.\nAvailable only during response-phase CEL guardrails."
         }
       },
       "additionalProperties": false
@@ -1054,6 +1410,13 @@
           "description": "The name of the backend being used. For example, `my-service` or `service/my-namespace/my-service:8080`.",
           "type": "string",
           "default": ""
+        },
+        "endpoint": {
+          "description": "The resolved target for directly addressed backends, including the port for network endpoints.\nAbsent for Service backends, whose workload endpoints are selected separately.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "type": {
           "description": "The type of backend.",
@@ -1108,26 +1471,33 @@
       "additionalProperties": true
     },
     "guardrails": {
-      "description": "`guardrails` contains one entry per prompt-guard guardrail intervention, in either the\nrequest or response phase. Only present in CEL that runs after the request completes,\nsuch as log and metric fields.",
+      "description": "`guardrails` contains entries for prompt-guard guardrail evaluations, in either the\nrequest or response phase. Only present in CEL that runs after the request completes,\nsuch as log and metric fields.",
       "type": [
         "array",
         "null"
       ],
       "items": {
-        "description": "Records one prompt-guard guardrail intervention.",
+        "description": "Records one prompt-guard guardrail evaluation.",
         "type": "object",
         "properties": {
           "phase": {
-            "description": "The phase the guardrail intervened in: `request` or `response`.",
+            "description": "The phase the guardrail was evaluated in: `request` or `response`.",
             "type": "string"
           },
           "guard": {
-            "description": "The guard kind that intervened, such as `bedrockGuardrails`.",
+            "description": "The guard kind that was evaluated, such as `bedrockGuardrails`.",
             "type": "string"
           },
           "action": {
-            "description": "The action the guardrail took (mask/reject/audit/failOpen).",
-            "type": "string"
+            "description": "The action the guardrail took.",
+            "type": "string",
+            "enum": [
+              "allow",
+              "failOpen",
+              "audit",
+              "mask",
+              "reject"
+            ]
           },
           "guardrailId": {
             "description": "The configured guardrail identifier.",
@@ -1161,6 +1531,107 @@
           "phase",
           "guard",
           "action"
+        ]
+      }
+    },
+    "upstreamCalls": {
+      "description": "`upstreamCalls` lists the outbound calls made for this request, such as MCP target and policy calls.\nIt's only filled in for access log expressions that reference it.\nIts request headers are the ones sent to the backend. `request.headers` still has the client's headers.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "description": "Call category: `Primary` (backend request) or `Policy` (policy callout).",
+            "oneOf": [
+              {
+                "description": "The primary backend call",
+                "type": "string",
+                "const": "Primary"
+              },
+              {
+                "description": "A callout as part of a policy execution",
+                "type": "string",
+                "const": "Policy"
+              },
+              {
+                "description": "A mirrored call",
+                "type": "string",
+                "const": "Mirror"
+              }
+            ]
+          },
+          "subtype": {
+            "description": "Call subtype: `Http`, `Llm`, `Mcp`, `ExtAuthz`, `Substrate`, `ExtProc`,\n`Guardrail`, `RateLimit`, `Oidc`, `Callout`, or a custom subtype name.",
+            "type": "string"
+          },
+          "target": {
+            "description": "The MCP target name for MCP calls, otherwise the connection address (host:port).",
+            "type": "string"
+          },
+          "request": {
+            "type": "object",
+            "properties": {
+              "headers": {
+                "description": "Headers sent to the backend, after backend auth. Tunnel proxy credentials are left out.",
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "headers"
+            ]
+          },
+          "response": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "description": "HTTP status code. Empty when no response came back.",
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint16",
+                "minimum": 0,
+                "maximum": 65535
+              },
+              "grpcStatus": {
+                "description": "gRPC status code, from the response headers or trailers.\nTrailers that arrive after the access log is written aren't included.",
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint8",
+                "minimum": 0,
+                "maximum": 255
+              }
+            }
+          },
+          "duration": {
+            "description": "Time from before DNS resolution through response headers, including connection setup.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Error description when the call fails. Exact wording may change between versions.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "subtype",
+          "target",
+          "request",
+          "response"
         ]
       }
     },

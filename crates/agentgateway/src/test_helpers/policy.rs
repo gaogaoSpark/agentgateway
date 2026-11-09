@@ -1,3 +1,4 @@
+use crate::proxy::ProxyError;
 use crate::telemetry::log::MetricsConfig;
 
 pub fn policy_client() -> crate::proxy::httpproxy::PolicyClient {
@@ -5,10 +6,11 @@ pub fn policy_client() -> crate::proxy::httpproxy::PolicyClient {
 	crate::proxy::httpproxy::PolicyClient::new(proxy.inputs())
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn test_policy<P>(
 	policy: &P,
 	req: &mut crate::http::Request,
-) -> Result<crate::http::PolicyResponse, crate::proxy::ProxyResponse>
+) -> Result<crate::http::PolicyResponse, ProxyError>
 where
 	P: crate::store::RequestPolicyTrait + ?Sized,
 {
@@ -33,7 +35,8 @@ fn make_min_req_log() -> crate::telemetry::log::RequestLog {
 	let log_cfg = log::Config {
 		filter: None,
 		fields: LoggingFields::default(),
-		database_fields: LoggingFields::default(),
+		standard_attributes: Default::default(),
+		session: Default::default(),
 		level: "info".to_string(),
 		format: crate::LoggingFormat::Text,
 		database: None,

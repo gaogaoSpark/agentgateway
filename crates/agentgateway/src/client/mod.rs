@@ -1,4 +1,6 @@
+mod aws;
 mod azure;
+mod callout;
 pub(crate) mod connect_tunnel;
 mod dns;
 mod hbone_tunnel;
@@ -7,8 +9,8 @@ mod tls;
 use std::str::FromStr;
 use std::task;
 
-use ::http::HeaderValue;
 use ::http::uri::{Authority, Scheme};
+use ::http::{HeaderName, HeaderValue};
 use agent_pool::pool::ExpectedCapacity;
 use agent_pool::rt::TokioIo;
 use tracing::event;
@@ -26,6 +28,8 @@ use crate::*;
 pub struct Client {
 	client: agent_pool::Client<Connector, PoolKey>,
 	connector: Connector,
+	callout_proxy: Option<Arc<callout::Proxy>>,
+	allow_dynamic_loopback: bool,
 }
 
 impl Debug for Client {
@@ -34,16 +38,24 @@ impl Debug for Client {
 	}
 }
 
+/// Overrides the connect timeout of a `Client::simple_call` request.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectTimeout(pub Duration);
+
 pub struct Call {
 	pub req: http::Request,
 	pub target: Target,
 	pub connection: ConnectionConfig,
+	/// The target came from a dynamic backend, so loopback destinations are rejected unless allowed.
+	pub dynamic_backend: bool,
 }
 
 pub struct TCPCall {
 	pub source: Socket,
 	pub target: Target,
 	pub connection: ConnectionConfig,
+	/// The target came from a dynamic backend, so loopback destinations are rejected unless allowed.
+	pub dynamic_backend: bool,
 }
 
 #[derive(Default, Debug, Clone, Hash, PartialEq, Eq)]
@@ -76,6 +88,7 @@ pub struct TunnelConfig {
 	pub target: Target,
 	pub connection: Box<ConnectionConfig>,
 	pub token: Option<HeaderValue>,
+	pub connect_headers: Vec<(HeaderName, HeaderValue)>,
 	pub connect: bool,
 }
 
@@ -217,6 +230,8 @@ pub struct ConnectionConfig {
 	pub transport: Transport,
 	pub tcp: Option<types::backend::TCP>,
 	pub max_connection_duration: Option<Duration>,
+	/// The backend this connection serves. Part of the pool key, so backends do not share connections.
+	pub backend: Option<Strng>,
 }
 
 impl From<Transport> for ConnectionConfig {
@@ -225,8 +240,14 @@ impl From<Transport> for ConnectionConfig {
 			transport,
 			tcp: None,
 			max_connection_duration: None,
+			backend: None,
 		}
 	}
+}
+
+// Randomly shortens a duration by up to 10%.
+pub(crate) fn jittered(d: Duration) -> Duration {
+	d - rand::random_range(Duration::ZERO..=d / 10)
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -325,6 +346,7 @@ impl Connector {
 			transport,
 			tcp,
 			max_connection_duration,
+			backend,
 		} = connection;
 		let connect_start = std::time::Instant::now();
 		let transport_name = transport.name();
@@ -357,9 +379,15 @@ impl Connector {
 				// This is recursive but bounded: we cannot even tunnel to a tunnel
 				let con = Box::pin(self.connect(tcfg.target, proxy_dst, *tcfg.connection, false)).await?;
 
-				let con = connect_tunnel::handshake(con, &dest, tcfg.token, self.h2_config.clone())
-					.await
-					.map_err(crate::http::Error::new)?;
+				let con = connect_tunnel::handshake(
+					con,
+					&dest,
+					tcfg.token,
+					&tcfg.connect_headers,
+					self.h2_config.clone(),
+				)
+				.await
+				.map_err(crate::http::Error::new)?;
 				debug!(%dest, "connected to tunnel proxy (CONNECT)");
 				con
 			},
@@ -452,9 +480,22 @@ impl Connector {
 		);
 
 		if let Some(max_age) = max_connection_duration {
+			let max_age = jittered(max_age);
 			socket
 				.ext_mut()
 				.insert(stream::ConnectionDeadline(connect_start + max_age));
+		}
+
+		if let (Some(m), Some(backend)) = (&self.metrics, backend) {
+			let gauge = m
+				.upstream_connections_active
+				.get_or_create(&metrics::BackendLabels {
+					backend: Some(backend).into(),
+				})
+				.clone();
+			socket
+				.ext_mut()
+				.insert(Arc::new(metrics::GaugeGuard::new(gauge)));
 		}
 
 		socket.with_logging(LoggingMode::Upstream);
@@ -519,6 +560,21 @@ impl tower::Service<::http::Extensions> for Connector {
 pub struct Config {
 	pub resolver_cfg: ResolverConfig,
 	pub resolver_opts: ResolverOpts,
+	#[serde(with = "serde_dur_option")]
+	pub max_ttl: Option<Duration>,
+}
+
+/// Rejects loopback and link-local destinations, checked after DNS resolution.
+fn check_not_loopback(dest: SocketAddr) -> Result<(), ProxyError> {
+	let ip = dest.ip().to_canonical();
+	let link_local = match ip {
+		std::net::IpAddr::V4(ip) => ip.is_link_local(),
+		std::net::IpAddr::V6(ip) => ip.is_unicast_link_local(),
+	};
+	if ip.is_loopback() || link_local || (ip.is_unspecified() && dest.port() != 0) {
+		return Err(ProxyError::DynamicBackendLoopback);
+	}
+	Ok(())
 }
 
 impl Client {
@@ -542,7 +598,11 @@ impl Client {
 		backend_config: BackendConfig,
 		metrics: Option<Arc<crate::metrics::Metrics>>,
 	) -> Client {
-		let resolver = dns::CachedResolver::new(cfg.resolver_cfg.clone(), cfg.resolver_opts.clone());
+		let resolver = dns::CachedResolver::new(
+			cfg.resolver_cfg.clone(),
+			cfg.resolver_opts.clone(),
+			cfg.max_ttl,
+		);
 		let mut b = agent_pool::Client::<_, PoolKey>::builder(::hyper_util::rt::TokioExecutor::new());
 		b.pool_timer(hyper_util::rt::tokio::TokioTimer::new());
 		b.pool_idle_timeout(backend_config.pool_idle_timeout);
@@ -552,7 +612,13 @@ impl Client {
 		if let Some(pool_max) = backend_config.pool_max_size {
 			b.pool_max_idle_per_host(pool_max);
 		};
+		if !backend_config.h2_keepalive_interval.is_zero() {
+			b.http2_keep_alive_interval(Some(backend_config.h2_keepalive_interval));
+			b.http2_keep_alive_timeout(backend_config.h2_keepalive_timeout);
+			b.http2_keep_alive_while_idle(true);
+		}
 
+		let allow_dynamic_loopback = backend_config.allow_dynamic_loopback;
 		let connector = Connector {
 			resolver: Arc::new(resolver),
 			hbone_pool,
@@ -561,7 +627,12 @@ impl Client {
 			metrics,
 		};
 		let client = b.build(connector.clone());
-		Client { client, connector }
+		Client {
+			client,
+			connector,
+			callout_proxy: None,
+			allow_dynamic_loopback,
+		}
 	}
 
 	pub async fn simple_call(&self, req: http::Request) -> Result<http::Response, ProxyError> {
@@ -578,17 +649,31 @@ impl Client {
 			.port()
 			.map(|p| p.as_u16())
 			.unwrap_or_else(|| if scheme == &Scheme::HTTPS { 443 } else { 80 });
-		let transport = Transport::from(if scheme == &Scheme::HTTPS {
+		let app = if scheme == &Scheme::HTTPS {
 			ApplicationTransport::Tls(http::backendtls::SYSTEM_TRUST.base_config())
 		} else {
 			ApplicationTransport::Plaintext
-		});
-		let target = Target::from((host, port));
+		};
+		let target = Target::from((host.trim_start_matches('[').trim_end_matches(']'), port));
+		let transport = self.callout_transport(Transport::Plain(app), &target);
+		let tcp = req
+			.extensions()
+			.get::<ConnectTimeout>()
+			.map(|t| types::backend::TCP {
+				connect_timeout: Some(t.0),
+				..Default::default()
+			});
 		self
 			.call(Call {
 				req,
 				target,
-				connection: transport.into(),
+				connection: ConnectionConfig {
+					transport,
+					tcp,
+					max_connection_duration: None,
+					backend: None,
+				},
+				dynamic_backend: false,
 			})
 			.await
 	}
@@ -599,12 +684,16 @@ impl Client {
 			source,
 			target,
 			connection,
+			dynamic_backend,
 		} = call;
 
 		let dest = self
 			.connector
 			.resolve_target(connection.transport.skip_dns_resolution(), &target)
 			.await?;
+		if dynamic_backend && !self.allow_dynamic_loopback {
+			check_not_loopback(dest)?;
+		}
 
 		let transport_name = connection.transport.name();
 		let target_name = target.to_string();
@@ -671,16 +760,30 @@ impl Client {
 	) -> impl std::future::Future<Output = Result<http::Response, ProxyError>> + '_ {
 		let client = &self.client;
 		let connector = &self.connector;
+		let deny_loopback = call.dynamic_backend && !self.allow_dynamic_loopback;
 		let start = std::time::Instant::now();
 		let Call {
 			mut req,
 			target,
 			connection,
+			..
 		} = call;
 		async move {
+			let mut upstream_call = crate::telemetry::upstream::PendingCall::from_request(&req, &target);
 			let dest = connector
 				.resolve_target(connection.transport.skip_dns_resolution(), &target)
-				.await?;
+				.await
+				.and_then(|dest| {
+					if deny_loopback {
+						check_not_loopback(dest)?;
+					}
+					Ok(dest)
+				})
+				.inspect_err(|error| {
+					if let Some(call) = upstream_call.as_mut() {
+						call.set_error(error.to_string());
+					}
+				})?;
 			http::modify_req_uri(&mut req, |uri| {
 				let scheme = connection.transport.scheme();
 				// Strip the port from the hostname if its the default already
@@ -702,6 +805,9 @@ impl Client {
 			}
 			let version = req.version();
 			let transport_name = connection.transport.name();
+			if let Some(call) = upstream_call.as_mut() {
+				call.set_headers(req.headers());
+			}
 			// We are going to do a HTTP absolute form tunnel request. For CONNECT this is handled
 			// in the connect layer, but here we need to merge it into the request
 			if let Transport::Tunnel(app, tc) = &connection.transport
@@ -713,6 +819,19 @@ impl Client {
 					.headers_mut()
 					.insert(http::header::PROXY_AUTHORIZATION, h.clone());
 			}
+			let active = connection
+				.backend
+				.clone()
+				.zip(connector.metrics.as_ref())
+				.map(|(backend, m)| {
+					let gauge = m
+						.requests_active
+						.get_or_create(&metrics::BackendLabels {
+							backend: Some(backend).into(),
+						})
+						.clone();
+					metrics::GaugeGuard::new(gauge)
+				});
 			let key = PoolKey(target.clone(), dest, connection, version);
 			trace!(?req, ?key, "sending request");
 			req.extensions_mut().insert(key);
@@ -730,16 +849,22 @@ impl Client {
 			);
 			let buffer_limit = http::buffer_limit(&req);
 			let to = req.extensions().get::<BackendRequestTimeout>().cloned();
-			let call = client.request(req);
+			let deadline = to.map(|to| tokio::time::Instant::now() + to.0);
+
+			// We are leaving agentgateway code so no longer need our specialized body; Boxing is fine here.
+			let call = client.request(req.map(http::Body::into_boxed));
+
 			let map_error = |err: agent_pool::Error| {
 				if err.is_connect_timeout() {
 					ProxyError::UpstreamCallTimeout
+				} else if connect_tunnel::is_stale_assignment(&err) {
+					ProxyError::StaleAssignment
 				} else {
 					ProxyError::UpstreamCallFailed(err)
 				}
 			};
-			let resp = if let Some(to) = to {
-				match tokio::time::timeout(to.0, call).await {
+			let resp = if let Some(deadline) = deadline {
+				match tokio::time::timeout_at(deadline, call).await {
 					Err(_) => Err(ProxyError::UpstreamCallTimeout),
 					Ok(Err(err)) => Err(map_error(err)),
 					Ok(Ok(resp)) => Ok(resp),
@@ -747,6 +872,12 @@ impl Client {
 			} else {
 				call.await.map_err(map_error)
 			};
+			if let Some(call) = upstream_call.as_mut() {
+				match &resp {
+					Ok(response) => call.set_response(response),
+					Err(error) => call.set_error(error.to_string()),
+				}
+			}
 			let dur = format!("{}ms", start.elapsed().as_millis());
 			// If version changed due to ALPN negotiation, make sure we get the real version
 			let version = resp.as_ref().map(|resp| resp.version()).unwrap_or(version);
@@ -781,7 +912,17 @@ impl Client {
 				.extensions_mut()
 				.insert(transport::BufferLimit::new(buffer_limit));
 			resp.extensions_mut().insert(ResolvedDestination(dest));
-			Ok(resp)
+			let trailer_observer = upstream_call.as_ref().map(|call| call.trailer_observer());
+			Ok(resp.map(|body| {
+				let mut body = http::Body::new(body).with_drop_guard(active);
+				if let Some(deadline) = deadline {
+					body.set_deadline(deadline);
+				}
+				if let Some(observer) = trailer_observer {
+					body = body.with_observer(observer);
+				}
+				body
+			}))
 		}
 	}
 }
@@ -832,6 +973,7 @@ mod tests {
 			&Config {
 				resolver_cfg: hickory_resolver::config::ResolverConfig::default(),
 				resolver_opts: hickory_resolver::config::ResolverOpts::default(),
+				max_ttl: None,
 			},
 			None,
 			crate::BackendConfig::default(),
@@ -847,6 +989,7 @@ mod tests {
 					transport: Transport::Plain(ApplicationTransport::Plaintext),
 					tcp: None,
 					max_connection_duration: Some(max_age),
+					backend: None,
 				},
 			)
 			.await
@@ -854,8 +997,18 @@ mod tests {
 		let deadline = agent_pool::connect::Connection::connected(&socket)
 			.get_valid_until()
 			.expect("deadline should be set");
-		assert!(deadline >= before + max_age);
+		assert!(deadline >= before + max_age - max_age / 10);
 		assert!(deadline <= std::time::Instant::now() + max_age);
+	}
+
+	#[test]
+	fn jittered_reduces_within_bounds() {
+		let d = Duration::from_secs(60);
+		for _ in 0..100 {
+			let j = jittered(d);
+			assert!(j >= Duration::from_secs(54) && j <= d);
+		}
+		assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
 	}
 
 	/// Millisecond truncation put every observation on an exact multiple of 1ms, and a loopback
@@ -881,6 +1034,7 @@ mod tests {
 			&Config {
 				resolver_cfg: hickory_resolver::config::ResolverConfig::default(),
 				resolver_opts: hickory_resolver::config::ResolverOpts::default(),
+				max_ttl: None,
 			},
 			None,
 			crate::BackendConfig::default(),

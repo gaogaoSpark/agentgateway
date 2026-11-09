@@ -14,6 +14,26 @@ use crate::types::agent::{
 use crate::types::local::NormalizedLocalConfig;
 use crate::*;
 
+#[test]
+fn merged_prompt_guards_validate_streaming_scopes() {
+	let streaming: llm::policy::PromptGuard = serde_json::from_value(serde_json::json!({
+		"streaming": "Enabled", "response": [{"regex": {"rules": []}}]
+	}))
+	.unwrap();
+	let tools: llm::policy::PromptGuard = serde_json::from_value(serde_json::json!({
+		"response": [{"regex": {"rules": []}, "scope": ["toolInput"]}]
+	}))
+	.unwrap();
+	for (shared, model) in [(streaming.clone(), tools.clone()), (tools, streaming)] {
+		let err = super::merge_prompt_guards(Some(shared), Some(model)).unwrap_err();
+		assert!(
+			err
+				.to_string()
+				.contains("streaming response guards only support the messages scope")
+		);
+	}
+}
+
 const TEST_OIDC_JWKS: &str = r#"{"keys":[{"use":"sig","kty":"EC","kid":"kid-1","crv":"P-256","alg":"ES256","x":"WM7udBHga09KxC5kxq6GhrZ9M3Y8S9ZThq_XxsOcDhk","y":"xc7T4afkXmwjEbJMzQXCdQcU3PZKiLFlHl23GE1z4ug"}]}"#;
 
 struct ClearTracingEnv {
@@ -72,6 +92,7 @@ fn test_client() -> client::Client {
 		&client::Config {
 			resolver_cfg: hickory_resolver::config::ResolverConfig::default(),
 			resolver_opts: hickory_resolver::config::ResolverOpts::default(),
+			max_ttl: None,
 		},
 		None,
 		BackendConfig::default(),
@@ -111,6 +132,10 @@ fn test_oidc_policy() -> super::FilterOrPolicy {
 			client_secret: SecretString::new("client-secret".into()),
 			redirect_uri: "http://localhost:3000/oauth/callback".into(),
 			scopes: vec![],
+			session_ttl: None,
+			login: None,
+			logout: None,
+			credentials: Default::default(),
 		}),
 		..Default::default()
 	}
@@ -168,7 +193,8 @@ async fn normalize_test_yaml(yaml: &str) -> anyhow::Result<NormalizedLocalConfig
 async fn normalize_test_config(yaml_str: &str) -> anyhow::Result<NormalizedLocalConfig> {
 	let client = test_client();
 	let resources = crate::resource_manager::ResourceFetcher::direct(client);
-	let config = crate::config::parse_config(yaml_str.to_string(), None).unwrap();
+	let mut config = crate::config::parse_config(yaml_str.to_string(), None).unwrap();
+	config.oidc_cookie_encoder = test_config().oidc_cookie_encoder;
 
 	NormalizedLocalConfig::from(
 		&config,
@@ -329,9 +355,8 @@ backends:
 fn test_local_backend_policies_reject_unknown_fields() {
 	// serde(flatten) disables deny_unknown_fields on the outer struct, but the
 	// flattened SimpleLocalBackendPolicies still rejects leftover unknown keys.
-	let err =
-		crate::serdes::yamlviajson::from_str::<super::LocalBackendPolicies>("mcpAuthorizatoin: {}")
-			.unwrap_err();
+	let err = crate::serdes::yaml::from_str::<super::LocalBackendPolicies>("mcpAuthorizatoin: {}")
+		.unwrap_err();
 	assert!(err.to_string().contains("unknown field"), "{err}");
 }
 
@@ -489,6 +514,11 @@ async fn test_config_parsing(test_name: &str) {
 #[tokio::test]
 async fn test_basic_config() {
 	test_config_parsing("basic").await;
+}
+
+#[tokio::test]
+async fn test_ui_oidc_config() {
+	test_config_parsing("ui_oidc").await;
 }
 
 #[tokio::test]
@@ -665,6 +695,11 @@ async fn test_llm_provider_reference_config() {
 }
 
 #[tokio::test]
+async fn test_keyed_rate_limit_config() {
+	test_config_parsing("keyed_rate_limit").await;
+}
+
+#[tokio::test]
 async fn test_llm_virtual_model_config() {
 	test_config_parsing("llm_virtual_model").await;
 }
@@ -677,40 +712,6 @@ async fn test_llm_virtual_model_failover_config() {
 #[tokio::test]
 async fn test_llm_virtual_model_conditional_config() {
 	test_config_parsing("llm_virtual_model_conditional").await;
-}
-
-#[test]
-fn test_llm_route_types_reuse_defaults_and_override_passthrough() {
-	let default_routes = super::llm_route_types(None);
-	assert!(
-		default_routes
-			.iter()
-			.any(|(path, route_type)| path.as_str() == "/v1/messages"
-				&& *route_type == crate::llm::RouteType::Messages),
-		"default route table should include explicit message endpoint"
-	);
-	assert!(
-		default_routes
-			.iter()
-			.any(|(path, route_type)| path.as_str() == "*"
-				&& *route_type == crate::llm::RouteType::Passthrough),
-		"default route table should include passthrough wildcard"
-	);
-
-	let detect_passthrough = super::llm_route_types(Some(&super::LocalLLMPassthrough::Detect));
-	assert!(
-		detect_passthrough
-			.iter()
-			.any(|(path, route_type)| path.as_str() == "/v1/messages"
-				&& *route_type == crate::llm::RouteType::Messages),
-		"passthrough override should preserve explicit route defaults"
-	);
-	assert!(
-		detect_passthrough.iter().any(
-			|(path, route_type)| path.as_str() == "*" && *route_type == crate::llm::RouteType::Detect
-		),
-		"passthrough override should replace wildcard fallback"
-	);
 }
 
 #[tokio::test]
@@ -858,6 +859,21 @@ llm:
 	)
 	.await
 	.expect("model id should be accepted");
+}
+
+#[tokio::test]
+async fn test_llm_model_accepts_display_name() {
+	normalize_test_config(
+		r#"
+llm:
+  models:
+  - name: "*"
+    displayName: Gemini (us-east5)
+    provider: ollama
+"#,
+	)
+	.await
+	.expect("model displayName should be accepted");
 }
 
 #[tokio::test]
@@ -1037,7 +1053,11 @@ llm:
 	let AIProvider::Custom(custom_provider) = &provider.provider else {
 		panic!("expected custom provider");
 	};
-	assert_eq!(custom_provider.model.as_deref(), Some("upstream-custom"));
+	assert_eq!(
+		custom_provider.model_override.as_deref(),
+		Some("upstream-custom")
+	);
+	assert_eq!(provider.path_prefix.as_deref(), Some("/"));
 	assert!(custom_provider.formats.iter().any(|format| format.format
 		== crate::llm::custom::ProviderFormat::Messages
 		&& format.path.as_deref() == Some("/api/messages")));
@@ -1219,6 +1239,51 @@ mcp:
 }
 
 #[tokio::test]
+async fn test_gateway_bind_address_is_per_gateway() {
+	let normalized = normalize_test_yaml(
+		r#"
+gateways:
+  private:
+    port: 3000
+    bindAddress: 127.0.0.1
+  shared:
+    port: 4000
+    bindAddress: 0.0.0.0
+    listeners:
+    - name: first
+      hostname: first.example.com
+    - name: second
+      hostname: second.example.com
+"#,
+	)
+	.await
+	.expect("gateways with different bind addresses should normalize");
+	assert_eq!(normalized.binds.len(), 2);
+	let private = normalized
+		.binds
+		.iter()
+		.find(|b| b.address.port() == 3000)
+		.unwrap();
+	let shared = normalized
+		.binds
+		.iter()
+		.find(|b| b.address.port() == 4000)
+		.unwrap();
+	assert_eq!(private.address, "127.0.0.1:3000".parse().unwrap());
+	assert_eq!(shared.address, "0.0.0.0:4000".parse().unwrap());
+	assert_eq!(shared.listeners.iter().count(), 2);
+}
+
+#[tokio::test]
+async fn test_gateway_bind_address_rejects_invalid_ip() {
+	let err =
+		normalize_test_yaml("gateways:\n  private:\n    port: 3000\n    bindAddress: localhost\n")
+			.await
+			.expect_err("bindAddress must be an IP address");
+	assert!(err.to_string().contains("IP address"), "{err:?}");
+}
+
+#[tokio::test]
 async fn test_gateways_attach_llm_mcp_and_ui_to_one_listener() {
 	let normalized = normalize_test_yaml(&format!(
 		r#"
@@ -1314,6 +1379,62 @@ ui:
 	assert!(normalized.backends.iter().any(|backend| {
 		matches!(&backend.backend, Backend::Internal(name, _) if name.name.as_str() == "ui")
 	}));
+}
+
+#[tokio::test]
+async fn test_ui_oidc_under_base_path() {
+	let normalized = normalize_test_yaml(&format!(
+		r#"
+gateways:
+  default:
+    port: 3000
+ui:
+  basePath: /team/agw
+  policies:
+    oidc:
+      issuer: https://issuer.example.com
+      authorizationEndpoint: https://issuer.example.com/authorize
+      tokenEndpoint: https://issuer.example.com/token
+      jwks: '{TEST_OIDC_JWKS}'
+      clientId: client-id
+      clientSecret: client-secret
+      redirectURI: https://tools.example.com/team/agw/oauth/callback
+"#
+	))
+	.await
+	.expect("UI under a base path should normalize");
+
+	let ui_route = normalized
+		.listener_routes
+		.iter()
+		.flat_map(|(_, routes)| routes)
+		.find(|route| route.key.as_str() == "gateway/default/ui")
+		.expect("UI route");
+	assert!(ui_route.matches.iter().any(
+		|route_match| matches!(&route_match.path, PathMatch::Exact(path) if path.as_str() == "/oauth/callback")
+	));
+	assert!(normalized.backends.iter().any(|backend| matches!(
+		&backend.backend,
+		Backend::Internal(_, crate::types::local::InternalBackend::Ui { base_path }) if base_path == "/team/agw"
+	)));
+	let oidc = ui_route
+		.inline_policies
+		.iter()
+		.find_map(|policy| match policy {
+			TrafficPolicy::Oidc(oidc) => Some(oidc.clone().into_policy_inners()),
+			_ => None,
+		})
+		.expect("UI OIDC policy");
+	let oidc = &oidc[0].pol;
+	assert_eq!(oidc.redirect_uri.callback_path.path(), "/oauth/callback");
+	assert_eq!(
+		oidc.login.as_ref().and_then(|v| v.redirect.as_deref()),
+		Some("/team/agw/ui/login")
+	);
+	assert_eq!(
+		oidc.logout.as_ref().and_then(|v| v.redirect.as_deref()),
+		Some("/team/agw/ui/login")
+	);
 }
 
 #[tokio::test]
@@ -1520,6 +1641,28 @@ mcp:
 	normalize_test_yaml(yaml)
 		.await
 		.expect_err("MCP target name containing '_' should be rejected");
+}
+
+#[tokio::test]
+async fn test_local_mcp_target_condition_requires_multiplexing() {
+	let err = normalize_test_yaml(
+		r#"
+mcp:
+  targets:
+  - name: only
+    condition: 'true'
+    stdio:
+      cmd: echo
+"#,
+	)
+	.await
+	.expect_err("a condition on a single MCP target should be rejected");
+	assert!(
+		err
+			.to_string()
+			.contains("mcp target condition requires at least two configured targets"),
+		"{err:?}"
+	);
 }
 
 #[tokio::test]
@@ -2038,7 +2181,8 @@ binds:
 #[test]
 fn test_migrate_deprecated_local_config_moves_fields() {
 	let _env = ClearTracingEnv::new();
-	let input = r#"
+	let input = r#"# yaml-language-server: $schema=./config.schema.json
+# Gateway settings
 config:
   logging:
     level: info
@@ -2053,9 +2197,27 @@ config:
     headers:
       authorization: token
     otlpProtocol: http
+
+# Public listeners
+binds:
+  - port: 8080 # keep this port
+    listeners: []
 "#;
 	let out = super::migrate_deprecated_local_config(input).unwrap();
-	let v: serde_json::Value = crate::serdes::yamlviajson::from_str(&out).unwrap();
+	assert!(
+		out.starts_with("# yaml-language-server: $schema=./config.schema.json\n# Gateway settings\n")
+	);
+	assert!(
+		out
+			.contains("# Public listeners\nbinds:\n  - port: 8080 # keep this port\n    listeners: []\n"),
+		"{out}"
+	);
+	let unchanged = "# Current config\nbinds: [] # no listeners\n";
+	assert_eq!(
+		super::migrate_deprecated_local_config(unchanged).unwrap(),
+		unchanged
+	);
+	let v: serde_json::Value = crate::serdes::yaml::from_str(&out).unwrap();
 	let cfg = v.get("config").unwrap();
 	let logging = cfg.get("logging").unwrap();
 	assert_eq!(logging.get("level").unwrap(), "info");
@@ -2092,7 +2254,7 @@ config:
     otlpProtocol: http
 "#;
 	let out = super::migrate_deprecated_local_config(input).unwrap();
-	let v: serde_json::Value = crate::serdes::yamlviajson::from_str(&out).unwrap();
+	let v: serde_json::Value = crate::serdes::yaml::from_str(&out).unwrap();
 	let tracing = v.get("frontendPolicies").unwrap().get("tracing").unwrap();
 	let policies = tracing
 		.get("policies")
@@ -2120,7 +2282,7 @@ config:
     otlpProtocol: http
 "#;
 	let out = super::migrate_deprecated_local_config(input).unwrap();
-	let v: serde_json::Value = crate::serdes::yamlviajson::from_str(&out).unwrap();
+	let v: serde_json::Value = crate::serdes::yaml::from_str(&out).unwrap();
 	let tracing = v.get("frontendPolicies").unwrap().get("tracing").unwrap();
 	assert_eq!(
 		tracing.get("inlineBackend").unwrap(),
@@ -2143,7 +2305,7 @@ fn test_deprecated_tracing_endpoint_schemes(
 	let input =
 		format!("config:\n  tracing:\n    otlpEndpoint: {endpoint}\n    otlpProtocol: {protocol}\n");
 	let out = super::migrate_deprecated_local_config(&input).unwrap();
-	let v: serde_json::Value = crate::serdes::yamlviajson::from_str(&out).unwrap();
+	let v: serde_json::Value = crate::serdes::yaml::from_str(&out).unwrap();
 	let tracing = v.get("frontendPolicies").unwrap().get("tracing").unwrap();
 	assert_eq!(tracing.get("inlineBackend").unwrap(), expected);
 }
@@ -2285,7 +2447,7 @@ binds:
 	};
 	assert_eq!(
 		target_spec.backend,
-		crate::types::agent::SimpleBackendReference::Backend("shared-upstream".into())
+		crate::types::agent::SimpleBackendReference::Backend("/shared-upstream".into())
 	);
 	assert_eq!(target_spec.path, "/mcp");
 }
@@ -2320,6 +2482,93 @@ binds:
 	);
 }
 
+// A route referencing a top-level backend by its bare name must resolve to the
+// backend's store key (`/name` for the empty local namespace), otherwise the
+// lookup at request time fails with a misleading `service not found`.
+// See https://github.com/agentgateway/agentgateway/issues/3662.
+#[tokio::test]
+async fn test_named_backend_reference_resolves_bare_name() {
+	let normalized = normalize_test_yaml(
+		r#"
+backends:
+- name: upstream
+  host: example.com:80
+binds:
+- port: 3000
+  listeners:
+  - routes:
+    - backends:
+      - backend: upstream
+    - backends:
+      - backend: /upstream
+"#,
+	)
+	.await
+	.expect("bare and qualified named backend references should normalize");
+
+	let routes = &normalized.listener_routes[0].1;
+	let backend_name = normalized
+		.backends
+		.iter()
+		.find_map(|backend| match &backend.backend {
+			Backend::Opaque(_, _) => Some(backend.backend.name()),
+			_ => None,
+		})
+		.expect("normalized opaque backend");
+	assert_eq!(backend_name.as_str(), "/upstream");
+
+	for route in routes {
+		let RouteBackendTarget::Backend(reference) = &route.backends[0].target else {
+			panic!("expected backend reference target");
+		};
+		// Both spellings must resolve to the exact key the backend is registered under.
+		assert_eq!(
+			reference.as_str(),
+			backend_name.as_str(),
+			"reference must match registered key"
+		);
+	}
+}
+
+#[tokio::test]
+async fn test_tcp_named_backend_reference_resolves_bare_name() {
+	let normalized = normalize_test_yaml(
+		r#"
+backends:
+- name: upstream
+  host: example.com:80
+binds:
+- port: 3000
+  protocol: AUTO
+  listeners:
+  - protocol: TCP
+    tcpRoutes:
+    - backends:
+      - backend: upstream
+"#,
+	)
+	.await
+	.expect("bare TCP named backend reference should normalize");
+
+	let backend_name = normalized
+		.backends
+		.iter()
+		.find_map(|backend| match &backend.backend {
+			Backend::Opaque(_, _) => Some(backend.backend.name()),
+			_ => None,
+		})
+		.expect("normalized opaque backend");
+	assert_eq!(backend_name.as_str(), "/upstream");
+
+	let tcp_route = &normalized.listener_tcp_routes[0].1[0];
+	let crate::types::agent::BackendReference::Backend(tcp_reference) =
+		&tcp_route.backends[0].backend
+	else {
+		panic!("expected TCP backend reference");
+	};
+	assert_eq!(tcp_reference.as_str(), backend_name.as_str());
+}
+
 #[test]
 fn test_mcp_backend_host_rejects_mixed_host_and_backend() {
 	let err = serde_json::from_value::<super::McpBackendHost>(serde_json::json!({
@@ -2334,6 +2583,77 @@ fn test_mcp_backend_host_rejects_mixed_host_and_backend() {
 			.contains("cannot mix host/port with backend for MCP target backend configuration"),
 		"{err}"
 	);
+}
+
+#[rstest::rstest]
+#[case::host_only(serde_json::json!({ "host": "https://example.com" }), Ok("/from-spec"))]
+#[case::host_root(serde_json::json!({ "host": "https://example.com/" }), Ok("/from-spec"))]
+#[case::host_path(serde_json::json!({ "host": "https://example.com/api" }), Ok("/api"))]
+#[case::host_parts_root(serde_json::json!({ "host": "example.com", "port": 80, "path": "/" }), Ok("/from-spec"))]
+#[case::host_parts_path(serde_json::json!({ "host": "example.com", "port": 80, "path": "/api" }), Ok("/api"))]
+#[case::reference(serde_json::json!({ "backend": "example" }), Ok("/from-spec"))]
+#[case::reference_path(serde_json::json!({ "backend": "example", "path": "/api" }), Ok("/api"))]
+#[case::relative(serde_json::json!({ "backend": "example", "path": "api" }), Err("must start with"))]
+#[case::authority(serde_json::json!({ "backend": "example", "path": "//example.com/api" }), Err("must start with"))]
+#[case::query(serde_json::json!({ "backend": "example", "path": "/api?v=1" }), Err("must start with"))]
+#[case::backslash(serde_json::json!({ "backend": "example", "path": "/api\\v1" }), Err("must start with"))]
+#[case::space(serde_json::json!({ "backend": "example", "path": "/api v1" }), Err("must start with"))]
+#[tokio::test]
+async fn test_openapi_target_prefix(
+	#[case] mut target: serde_json::Value,
+	#[case] expected: Result<&str, &str>,
+	#[values(false, true)] multiple_servers: bool,
+) {
+	let servers = if multiple_servers {
+		serde_json::json!([{ "url": "https://example.com/v1" }, { "url": "https://example.com/v2" }])
+	} else {
+		serde_json::json!([{ "url": "https://example.com/from-spec" }])
+	};
+	target["schema"] = serde_json::json!(
+		serde_json::json!({
+			"openapi": "3.0.0",
+			"info": { "title": "Test", "version": "1.0.0" },
+			"servers": servers,
+			"paths": {}
+		})
+		.to_string()
+	);
+	let local: super::LocalBackend = serde_json::from_value(serde_json::json!({
+		"mcp": { "targets": [{ "name": "example", "openapi": target }] }
+	}))
+	.unwrap();
+	let resources = crate::resource_manager::ResourceFetcher::direct(test_client());
+	let result = local
+		.as_backends(
+			ResourceName::new("test-mcp".into(), "".into()),
+			&resources,
+			crate::mcp::DEFAULT_SESSION_IDLE_TTL,
+		)
+		.await;
+	let expected = match expected {
+		Ok("/from-spec") if multiple_servers => Err("multiple servers"),
+		e => e,
+	};
+	let backends = match (result, expected) {
+		(Err(err), Err(msg)) => {
+			let err = err.to_string();
+			assert!(err.contains("openapi MCP target 'example'"), "{err}");
+			assert!(err.contains(msg), "{err}");
+			return;
+		},
+		(result, _) => result.unwrap(),
+	};
+	let mcp = backends
+		.iter()
+		.find_map(|b| match &b.backend {
+			Backend::MCP(_, mcp) => Some(mcp),
+			_ => None,
+		})
+		.unwrap();
+	let crate::types::agent::McpTargetSpec::OpenAPI(target) = &mcp.targets[0].spec else {
+		panic!("expected OpenAPI target");
+	};
+	assert_eq!(Ok(target.prefix.as_str()), expected);
 }
 
 #[tokio::test]
@@ -2498,6 +2818,16 @@ fn test_de_backend_auth_accepts_each_shape() {
 	));
 	assert!(full_key.credentials.is_empty());
 
+	let expression_key = parse(serde_json::json!({"key": {"expression": "jwt.sub"}}));
+	assert!(matches!(
+		expression_key.kind,
+		Some(super::LocalBackendAuthKind::Key {
+			value: None,
+			expression: Some(_),
+			..
+		})
+	));
+
 	let full_with_credentials = parse(serde_json::json!({
 		"key": {"value": "explicit-secret"},
 		"credentials": [{"location": {"header": {"name": "x-token"}}, "key": "tok"}],
@@ -2573,4 +2903,188 @@ binds:
 		.await
 		.expect("a change to the key file should notify the resource manager")
 		.expect("resource change channel should stay open");
+}
+
+async fn assert_referenced_file_is_watched(
+	contents: &str,
+	rewritten: &str,
+	yaml: impl FnOnce(&Path) -> String,
+) {
+	let dir = tempfile::tempdir().unwrap();
+	let file = dir.path().join("referenced");
+	fs::write(&file, contents).unwrap();
+
+	let manager = crate::resource_manager::ResourceManager::new(test_client()).unwrap();
+	let resources = crate::resource_manager::ResourceFetcher::managed(manager.clone());
+	let mut changes = manager.subscribe_changes();
+
+	NormalizedLocalConfig::from(
+		&test_config(),
+		&resources,
+		ListenerTarget {
+			gateway_name: "name".into(),
+			gateway_namespace: "ns".into(),
+			listener_name: None,
+			port: None,
+		},
+		&yaml(&file),
+	)
+	.await
+	.expect("config with a referenced file should load");
+
+	let _ = changes.borrow_and_update();
+
+	fs::write(&file, rewritten).unwrap();
+	tokio::time::timeout(std::time::Duration::from_secs(10), changes.changed())
+		.await
+		.expect("a change to the referenced file should notify the resource manager")
+		.expect("resource change channel should stay open");
+}
+
+#[tokio::test]
+async fn basic_auth_htpasswd_file_is_a_tracked_resource() {
+	assert_referenced_file_is_watched(
+		"alice:$apr1$saltsalt$X8aAqtalfR6pZ6Jbhuyx1/\n",
+		"bob:$apr1$saltsalt$X8aAqtalfR6pZ6Jbhuyx1/\n",
+		|file| {
+			format!(
+				r#"
+binds:
+- port: 3000
+  listeners:
+  - routes:
+    - policies:
+        basicAuth:
+          htpasswd:
+            file: {}
+      backends:
+      - host: 127.0.0.1:8080
+"#,
+				file.display()
+			)
+		},
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn llm_api_key_file_is_a_tracked_resource() {
+	assert_referenced_file_is_watched("first-key\n", "second-key\n", |file| {
+		format!(
+			r#"
+llm:
+  models:
+  - name: concrete
+    provider: openAI
+    params:
+      apiKey:
+        file: {}
+"#,
+			file.display()
+		)
+	})
+	.await;
+}
+
+#[tokio::test]
+async fn gcp_credential_file_is_a_tracked_resource() {
+	assert_referenced_file_is_watched(
+		r#"{"type":"gdch_service_account"}"#,
+		r#"{"type":"gdch_service_account","project":"rotated"}"#,
+		|file| {
+			format!(
+				r#"
+binds:
+- port: 3000
+  listeners:
+  - routes:
+    - backends:
+      - host: 127.0.0.1:8080
+        policies:
+          backendAuth:
+            gcp:
+              type: idToken
+              audience: https://aud.example
+              credential:
+                file: {}
+"#,
+				file.display()
+			)
+		},
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn oauth_client_secret_file_is_a_tracked_resource() {
+	assert_referenced_file_is_watched("first-secret\n", "second-secret\n", |file| {
+		format!(
+			r#"
+binds:
+- port: 3000
+  listeners:
+  - routes:
+    - backends:
+      - host: 127.0.0.1:8080
+        policies:
+          backendAuth:
+            oauthTokenExchange:
+              host: 127.0.0.1:9000
+              clientAuth:
+                clientId: gateway-client
+                clientSecret:
+                  file: {}
+"#,
+			file.display()
+		)
+	})
+	.await;
+}
+
+/// A backend TLS file resolved by a serde hook during the parse is watched like a
+/// file the load fetched itself.
+#[tokio::test]
+async fn parse_time_backend_tls_files_become_managed_dependencies() {
+	let root = tempfile::NamedTempFile::new().unwrap();
+	fs_err::write(
+		root.path(),
+		include_bytes!("../../tests/common/testdata/root-cert.pem"),
+	)
+	.unwrap();
+	let manager = crate::resource_manager::ResourceManager::new(test_client()).unwrap();
+	let resources = crate::resource_manager::ResourceFetcher::managed(manager.clone());
+	let yaml = format!(
+		r#"
+frontendPolicies:
+  substrateEgressActorResolution:
+    host: 127.0.0.1:6443
+    policies:
+      backendTLS:
+        root: {}
+"#,
+		root.path().display()
+	);
+	NormalizedLocalConfig::from(
+		&test_config(),
+		&resources,
+		ListenerTarget {
+			gateway_name: "name".into(),
+			gateway_namespace: "ns".into(),
+			listener_name: None,
+			port: None,
+		},
+		&yaml,
+	)
+	.await
+	.unwrap();
+	let mut changes = manager.subscribe_changes();
+	fs_err::write(
+		root.path(),
+		include_bytes!("../../../../examples/mcp-tls/certs/cert.pem"),
+	)
+	.unwrap();
+	tokio::time::timeout(std::time::Duration::from_secs(10), changes.changed())
+		.await
+		.expect("a rotation of the root certificate is published")
+		.unwrap();
 }

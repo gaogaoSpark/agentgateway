@@ -12,11 +12,14 @@ import {
 	MessageSquare,
 	RefreshCw,
 	Settings,
+	Shield,
+	ShieldBan,
+	ShieldEllipsis,
 	User,
 	Wrench
 } from 'lucide-react';
 import { marked } from 'marked';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import { analyticsSummary, getLog, searchLogs, streamLogs } from '@/api/logsApi';
 import { ConfigDiffSaveActions } from '@/components/ConfigDiffDrawer';
@@ -126,13 +129,12 @@ export function LogsPage() {
 	const detailSeqRef = useRef(0);
 	const detailLoadingTimerRef = useRef<number | null>(null);
 	const filterOptionsSeqRef = useRef(0);
-	const logFiltersKey = analyticsFiltersKey(logFilters);
 	const filters = useMemo(
 		() => ({
 			...analyticsLogFilters(logFilters),
 			httpStatus: status ? [Number(status)] : []
 		}),
-		[logFiltersKey, status]
+		[logFilters, status]
 	);
 	const visibleLogs = useMemo(() => {
 		if (!expanded || !expandedId || response.logs.some(entry => entry.id === expandedId))
@@ -140,7 +142,7 @@ export function LogsPage() {
 		return [expanded, ...response.logs];
 	}, [expanded, expandedId, response.logs]);
 
-	async function load() {
+	const load = useCallback(async () => {
 		const loadSeq = loadSeqRef.current + 1;
 		loadSeqRef.current = loadSeq;
 		setError(null);
@@ -159,11 +161,11 @@ export function LogsPage() {
 		} finally {
 			if (loadSeq === loadSeqRef.current) setLoading(false);
 		}
-	}
+	}, [filters]);
 
 	useEffect(() => {
 		void load();
-	}, [filters]);
+	}, [load]);
 
 	useEffect(() => {
 		const loadSeq = filterOptionsSeqRef.current + 1;
@@ -196,7 +198,7 @@ export function LogsPage() {
 				);
 			}
 		})();
-	}, [logFiltersKey, models]);
+	}, [logFilters, models]);
 
 	useEffect(() => {
 		abortRef.current?.abort();
@@ -242,6 +244,44 @@ export function LogsPage() {
 		});
 	}
 
+	const stopDeferredExpandedLoading = useCallback(() => {
+		if (detailLoadingTimerRef.current != null) {
+			window.clearTimeout(detailLoadingTimerRef.current);
+			detailLoadingTimerRef.current = null;
+		}
+		setExpandedLoading(false);
+	}, []);
+
+	const startDeferredExpandedLoading = useCallback(() => {
+		stopDeferredExpandedLoading();
+		detailLoadingTimerRef.current = window.setTimeout(() => {
+			detailLoadingTimerRef.current = null;
+			setExpandedLoading(true);
+		}, 180);
+	}, [stopDeferredExpandedLoading]);
+
+	const loadExpandedLog = useCallback(
+		async (logId: string, fallback?: LogEntry) => {
+			const detailSeq = detailSeqRef.current + 1;
+			detailSeqRef.current = detailSeq;
+			setExpandedId(logId);
+			setExpanded(fallback ?? null);
+			startDeferredExpandedLoading();
+			try {
+				const detail = await getLog(logId);
+				if (detailSeq !== detailSeqRef.current) return;
+				const nextLog = detail.log ?? fallback ?? null;
+				setExpanded(nextLog);
+			} catch (err) {
+				if (detailSeq !== detailSeqRef.current) return;
+				setError(err instanceof Error ? err.message : 'Failed to load log detail');
+			} finally {
+				if (detailSeq === detailSeqRef.current) stopDeferredExpandedLoading();
+			}
+		},
+		[startDeferredExpandedLoading, stopDeferredExpandedLoading]
+	);
+
 	useEffect(() => {
 		if (!linkedLogId) {
 			setExpandedId(null);
@@ -252,26 +292,7 @@ export function LogsPage() {
 		if (linkedLogId === expandedId) return;
 		const fallback = response.logs.find(entry => entry.id === linkedLogId);
 		void loadExpandedLog(linkedLogId, fallback);
-	}, [linkedLogId]);
-
-	async function loadExpandedLog(logId: string, fallback?: LogEntry) {
-		const detailSeq = detailSeqRef.current + 1;
-		detailSeqRef.current = detailSeq;
-		setExpandedId(logId);
-		setExpanded(fallback ?? null);
-		startDeferredExpandedLoading();
-		try {
-			const detail = await getLog(logId);
-			if (detailSeq !== detailSeqRef.current) return;
-			const nextLog = detail.log ?? fallback ?? null;
-			setExpanded(nextLog);
-		} catch (err) {
-			if (detailSeq !== detailSeqRef.current) return;
-			setError(err instanceof Error ? err.message : 'Failed to load log detail');
-		} finally {
-			if (detailSeq === detailSeqRef.current) stopDeferredExpandedLoading();
-		}
-	}
+	}, [linkedLogId, expandedId, response.logs, loadExpandedLog, stopDeferredExpandedLoading]);
 
 	async function expand(entry: LogEntry) {
 		if (expandedId === entry.id) {
@@ -283,22 +304,6 @@ export function LogsPage() {
 		}
 		setLinkedLogQuery(entry.id);
 		await loadExpandedLog(entry.id, entry);
-	}
-
-	function startDeferredExpandedLoading() {
-		stopDeferredExpandedLoading();
-		detailLoadingTimerRef.current = window.setTimeout(() => {
-			detailLoadingTimerRef.current = null;
-			setExpandedLoading(true);
-		}, 180);
-	}
-
-	function stopDeferredExpandedLoading() {
-		if (detailLoadingTimerRef.current != null) {
-			window.clearTimeout(detailLoadingTimerRef.current);
-			detailLoadingTimerRef.current = null;
-		}
-		setExpandedLoading(false);
 	}
 
 	return (
@@ -352,11 +357,9 @@ export function LogsPage() {
 								values={logFilters[dimension]}
 								placeholder={`All ${meta.filterLabel.toLowerCase()}`}
 								allLabel={`All ${meta.filterLabel.toLowerCase()}`}
+								searchLabel={`Search ${meta.label.toLowerCase()}`}
 								onChange={values =>
-									setLogFilters(current => ({
-										...current,
-										[dimension]: values
-									}))
+									setLogFilters(current => withAnalyticsFilter(current, dimension, values))
 								}
 							/>
 						);
@@ -385,14 +388,15 @@ export function LogsPage() {
 							onChange={event => setStream(event.target.checked)}
 						/>
 						Stream
-						{stream ? <span className="stream-live-dot" aria-label="streaming" /> : null}
 					</label>
 					{hasAnalyticsFilters(logFilters) || status ? (
 						<button
 							className="button"
 							type="button"
 							onClick={() => {
-								setLogFilters(emptyAnalyticsFilterOptions());
+								setLogFilters(current =>
+									hasAnalyticsFilters(current) ? emptyAnalyticsFilterOptions() : current
+								);
 								setStatus('');
 							}}
 						>
@@ -447,6 +451,7 @@ export function LogsPage() {
 									entry={entry}
 									detail={expandedId === entry.id ? (expanded ?? entry) : entry}
 									expanded={expandedId === entry.id}
+									promptLoggingEnabled={promptLoggingEnabled}
 									loading={expandedId === entry.id && expandedLoading}
 									onToggle={() => void expand(entry)}
 									onOpenSettings={() => setSettings('logs')}
@@ -596,6 +601,15 @@ function LogsSettingsDrawer(props: {
 	);
 }
 
+function withAnalyticsFilter(
+	filters: Record<AnalyticsDimension, string[]>,
+	dimension: AnalyticsDimension,
+	values: string[]
+) {
+	const next = { ...filters, [dimension]: values };
+	return analyticsFiltersKey(next) === analyticsFiltersKey(filters) ? filters : next;
+}
+
 function hasAnalyticsFilters(filters: Record<AnalyticsDimension, string[]>) {
 	return ANALYTICS_DIMENSIONS.some(item => filters[item.value].length > 0);
 }
@@ -719,7 +733,11 @@ export function AnalyticsPage() {
 	const loadSeqRef = useRef(0);
 	const selectedGroupBy: AnalyticsDimension[] = groupBy;
 	const groupByKey = selectedGroupBy.join(',');
-	const filtersKey = analyticsFiltersKey(filters);
+	const [optionScope, setOptionScope] = useState({ timeRange, groupByKey });
+	if (optionScope.timeRange !== timeRange || optionScope.groupByKey !== groupByKey) {
+		setOptionScope({ timeRange, groupByKey });
+		setFilterOptionMap(emptyAnalyticsFilterOptions());
+	}
 	const analyticsState = useMemo(
 		() => ({
 			timeRange,
@@ -727,7 +745,7 @@ export function AnalyticsPage() {
 			filters,
 			metric
 		}),
-		[timeRange, groupByKey, filtersKey, metric]
+		[timeRange, selectedGroupBy, filters, metric]
 	);
 
 	useEffect(() => {
@@ -746,7 +764,7 @@ export function AnalyticsPage() {
 		return () => window.removeEventListener('popstate', onPopState);
 	}, []);
 
-	async function load() {
+	const load = useCallback(async () => {
 		const loadSeq = loadSeqRef.current + 1;
 		loadSeqRef.current = loadSeq;
 		setError(null);
@@ -778,25 +796,21 @@ export function AnalyticsPage() {
 		} finally {
 			if (loadSeq === loadSeqRef.current) setLoading(false);
 		}
-	}
+	}, [timeRange, selectedGroupBy, filters]);
 
 	useEffect(() => {
 		void load();
-	}, [timeRange, groupByKey, filtersKey]);
-
-	useEffect(() => {
-		setFilterOptionMap(emptyAnalyticsFilterOptions());
-	}, [timeRange, groupByKey]);
+	}, [load]);
 
 	function updateGroupBy(next: string[]) {
 		const normalized = next.filter((value): value is AnalyticsDimension =>
 			isAnalyticsDimension(value)
 		);
-		setGroupBy(normalized);
+		setGroupBy(current => (current.join(',') === normalized.join(',') ? current : normalized));
 	}
 
 	function updateFilter(dimension: AnalyticsDimension, values: string[]) {
-		setFilters(current => ({ ...current, [dimension]: values }));
+		setFilters(current => withAnalyticsFilter(current, dimension, values));
 	}
 
 	const requestedRange = useMemo(() => logTimeRangeToApi(timeRange), [timeRange]);
@@ -810,16 +824,7 @@ export function AnalyticsPage() {
 				selectedGroupBy,
 				metric
 			),
-		[
-			buckets,
-			summaryRange?.from,
-			summaryRange?.to,
-			requestedRange.from,
-			requestedRange.to,
-			effectiveBucketSeconds,
-			selectedGroupBy,
-			metric
-		]
+		[buckets, summaryRange, requestedRange, effectiveBucketSeconds, selectedGroupBy, metric]
 	);
 	const chartData = useMemo(
 		() => analyticsBreakdownData(usage, selectedGroupBy, metric),
@@ -879,6 +884,7 @@ export function AnalyticsPage() {
 									values={filters[dimension]}
 									placeholder={`All ${meta.filterLabel.toLowerCase()}`}
 									allLabel={`All ${meta.filterLabel.toLowerCase()}`}
+									searchLabel={`Search ${meta.label.toLowerCase()}`}
 									onChange={values => updateFilter(dimension, values)}
 								/>
 							);
@@ -1136,10 +1142,10 @@ function LogTurnBadge(props: { entry: LogEntry }) {
 		(output === 'assistant' || output === 'toolCall');
 	return (
 		<Tooltip content={label}>
-			<span
+			<button
+				type="button"
 				className={`log-turn-badge ${common ? variant : 'other'}`}
 				aria-label={label}
-				tabIndex={0}
 			>
 				{common ? (
 					<>
@@ -1150,7 +1156,7 @@ function LogTurnBadge(props: { entry: LogEntry }) {
 				) : (
 					<Ellipsis size={15} />
 				)}
-			</span>
+			</button>
 		</Tooltip>
 	);
 }
@@ -1182,41 +1188,136 @@ function formatCompactNumber(value: number | null | undefined) {
 	return typeof value === 'number' ? compactNumberFormat.format(value) : '—';
 }
 
-const PROVIDER_ICON_KEYS = [
-	'openai',
-	'anthropic',
-	'gemini',
-	'vertex',
-	'bedrock',
-	'azure',
-	'copilot',
-	'cohere',
-	'ollama',
-	'baseten',
-	'cerebras',
-	'deepinfra',
-	'deepseek',
-	'groq',
-	'huggingface',
-	'mistral',
-	'openrouter',
-	'togetherai',
-	'xai',
-	'fireworks'
-];
+// Telemetry reports some providers by their qualified gen_ai.provider.name.
+const PROVIDER_ICON_ALIASES: Record<string, string> = {
+	'gcp.gemini': 'gemini',
+	'gcp.vertex_ai': 'vertex',
+	'aws.bedrock': 'bedrock'
+};
 
 function providerIconName(name: string | null | undefined) {
 	if (!name) return 'custom';
 	const normalized = name.trim().toLowerCase();
-	const match = PROVIDER_ICON_KEYS.find(key => normalized === key || normalized.includes(key));
-	if (!match) return name;
-	return match === 'xai' ? 'xAI' : match;
+	return PROVIDER_ICON_ALIASES[normalized] ?? normalized;
+}
+
+function logGuardrails(entry: LogEntry): Record<string, unknown>[] {
+	const value = parseMaybeJson(attributeValue(entry.attributes, 'agw.ai.guardrails'));
+	if (!Array.isArray(value)) return [];
+	return value.filter(
+		(item): item is Record<string, unknown> =>
+			item != null && typeof item === 'object' && !Array.isArray(item)
+	);
+}
+
+function LogGuardrailBadge(props: { entry: LogEntry }) {
+	const guards = logGuardrails(props.entry);
+	if (!guards.length) return null;
+	const rejected = guards.some(guard => guard.action === 'reject');
+	const masked = guards.some(guard => guard.action === 'mask');
+	const failedOpen = guards.some(guard => guard.action === 'failOpen');
+	const state = rejected ? 'rejected' : failedOpen ? 'failed-open' : masked ? 'masked' : 'inactive';
+	const label = rejected
+		? 'Guardrail rejected'
+		: failedOpen
+			? 'Guardrail failed open'
+			: masked
+				? 'Guardrail masked content'
+				: 'Guardrail present — no action taken';
+	const Icon = rejected ? ShieldBan : masked ? ShieldEllipsis : Shield;
+	return (
+		<Tooltip
+			content={
+				<>
+					<strong>{label}</strong>
+					{guards.map((guard, index) => (
+						// biome-ignore lint/suspicious/noArrayIndexKey: Log evaluations are immutable and may repeat the same guard.
+						<div key={index}>
+							{String(guard.phase ?? '')}: {String(guard.guard ?? 'guardrail')} (
+							{String(guard.action ?? 'unknown')})
+						</div>
+					))}
+				</>
+			}
+		>
+			<span className={`log-guardrail-badge ${state}`} role="img" aria-label={label}>
+				<Icon size={15} aria-hidden="true" />
+			</span>
+		</Tooltip>
+	);
+}
+
+function LogGuardrailDetails(props: { entry: LogEntry }) {
+	const guards = logGuardrails(props.entry);
+	if (!guards.length) return null;
+	const outcomes: Record<string, { label: string; description: string }> = {
+		allow: { label: 'Allowed', description: 'Content passed without modification.' },
+		reject: { label: 'Rejected', description: 'The guardrail blocked the call.' },
+		mask: { label: 'Masked', description: 'The guardrail modified content before continuing.' },
+		audit: {
+			label: 'Audit only',
+			description: 'The guardrail flagged content without blocking or masking it.'
+		},
+		failOpen: {
+			label: 'Failed open',
+			description: 'The guardrail could not complete its check; the call continued.'
+		}
+	};
+	return (
+		<section className="log-detail-section">
+			<h4>Guardrails</h4>
+			<div className="log-guardrail-list">
+				{guards.map((guard, index) => {
+					const action = String(guard.action ?? 'unknown');
+					const outcome = outcomes[action];
+					const state =
+						action === 'reject'
+							? 'rejected'
+							: action === 'failOpen'
+								? 'failed-open'
+								: action === 'mask'
+									? 'masked'
+									: 'inactive';
+					const Icon =
+						action === 'reject' ? ShieldBan : action === 'mask' ? ShieldEllipsis : Shield;
+					return (
+						// biome-ignore lint/suspicious/noArrayIndexKey: Log evaluations are immutable and may repeat the same guard.
+						<div className="log-guardrail-result" key={index}>
+							<span className={`log-guardrail-badge ${state}`}>
+								<Icon size={18} aria-hidden="true" />
+							</span>
+							<div className="log-guardrail-context">
+								<div className="log-guardrail-heading">
+									<strong>{String(guard.guard ?? 'Guardrail')}</strong>
+									<span className="log-op-chip">
+										{guard.phase === 'request'
+											? 'Request'
+											: guard.phase === 'response'
+												? 'Response'
+												: String(guard.phase ?? 'Unknown phase')}
+									</span>
+									<span className={`log-guardrail-badge ${state}`}>{outcome?.label ?? action}</span>
+								</div>
+								{outcome ? <p>{outcome.description}</p> : null}
+								{typeof guard.guardrailId === 'string' ? (
+									<p>
+										Guardrail ID: <code>{guard.guardrailId}</code>
+									</p>
+								) : null}
+							</div>
+						</div>
+					);
+				})}
+			</div>
+		</section>
+	);
 }
 
 function LogCallRow(props: {
 	entry: LogEntry;
 	detail: LogEntry;
 	expanded: boolean;
+	promptLoggingEnabled: boolean;
 	loading: boolean;
 	onToggle: () => void;
 	onOpenSettings?: () => void;
@@ -1231,6 +1332,8 @@ function LogCallRow(props: {
 	const showResolved = Boolean(resolvedModel && resolvedModel !== primaryModel);
 	const operation = props.entry.genAi.operationName ?? 'chat';
 	const provider = props.entry.genAi.providerName ?? null;
+	const summaryId = useId();
+	const toggleRef = useRef<HTMLButtonElement>(null);
 	return (
 		<tbody
 			className={
@@ -1240,27 +1343,55 @@ function LogCallRow(props: {
 			}
 		>
 			<tr
+				id={summaryId}
 				className="log-row-summary"
-				tabIndex={0}
-				role="button"
-				aria-expanded={props.expanded}
-				onClick={props.onToggle}
-				onKeyDown={event => {
-					if (event.key === 'Enter' || event.key === ' ') {
-						event.preventDefault();
-						props.onToggle();
+				onClick={event => {
+					const toggle = toggleRef.current;
+					// Another button in the row, like the turn badge, keeps focus.
+					const button = (event.target as Element).closest('button');
+					if (toggle && (!button || button === toggle)) {
+						// Pointer clicks leave keyboard mode, like the old focusable row.
+						if (event.detail > 0) delete toggle.dataset.keyboard;
+						if (document.activeElement !== toggle) {
+							toggle.focus({ focusVisible: false, preventScroll: true });
+						}
 					}
+					props.onToggle();
 				}}
 			>
 				<td className="log-td-time">
-					<span className="log-cell-lines">
-						<span className="log-cell-primary">{formatRelativeTime(props.entry.completedAt)}</span>
-						<span className="log-cell-secondary">{formatDate(props.entry.completedAt)}</span>
-					</span>
+					<button
+						aria-expanded={props.expanded}
+						aria-labelledby={summaryId}
+						className="log-row-toggle"
+						ref={toggleRef}
+						type="button"
+						onBlur={event => {
+							delete event.currentTarget.dataset.keyboard;
+						}}
+						onKeyDown={event => {
+							// Show the row ring after a key press, as the focused row did before.
+							event.currentTarget.dataset.keyboard = '';
+							if (event.key === ' ') {
+								event.preventDefault();
+								props.onToggle();
+							}
+						}}
+					>
+						<span className="log-cell-lines">
+							<span className="log-cell-primary">
+								{formatRelativeTime(props.entry.completedAt)}
+							</span>
+							<span className="log-cell-secondary">{formatDate(props.entry.completedAt)}</span>
+						</span>
+					</button>
 				</td>
 				<td className="log-td-status">
-					<span className={statusBad ? 'log-status-pill bad' : 'log-status-pill ok'}>
-						{props.entry.httpStatus ?? 'err'}
+					<span className="log-status-indicators">
+						<span className={statusBad ? 'log-status-pill bad' : 'log-status-pill ok'}>
+							{props.entry.httpStatus ?? 'err'}
+						</span>
+						<LogGuardrailBadge entry={props.entry} />
 					</span>
 				</td>
 				<td className="log-td-model">
@@ -1305,7 +1436,11 @@ function LogCallRow(props: {
 					<td colSpan={11}>
 						<div className="expanded-log">
 							{props.loading ? <StatusBanner state="loading" title="Loading log payload" /> : null}
-							<LogDetailView entry={props.detail} onOpenSettings={props.onOpenSettings} />
+							<LogDetailView
+								entry={props.detail}
+								promptLoggingEnabled={props.promptLoggingEnabled}
+								onOpenSettings={props.onOpenSettings}
+							/>
 						</div>
 					</td>
 				</tr>
@@ -1382,7 +1517,11 @@ function logUsageDetail(entry: LogEntry): LogUsageDetail {
 	};
 }
 
-function LogDetailView(props: { entry: LogEntry; onOpenSettings?: () => void }) {
+function LogDetailView(props: {
+	entry: LogEntry;
+	promptLoggingEnabled: boolean;
+	onOpenSettings?: () => void;
+}) {
 	const messages = logConversation(props.entry);
 	const trajectory = trajectoryEvents(messages);
 	const conversationRef = useRef<HTMLDetailsElement>(null);
@@ -1410,13 +1549,13 @@ function LogDetailView(props: { entry: LogEntry; onOpenSettings?: () => void }) 
 
 	useEffect(() => {
 		const anchorId = decodeURIComponent(window.location.hash.slice(1));
-		if (!trajectory.some(event => event.anchorId === anchorId)) return;
+		if (!anchorId || !trajectoryAnchors.split('|').includes(anchorId)) return;
 		if (conversationRef.current) conversationRef.current.open = true;
 		const frame = window.requestAnimationFrame(() => {
 			document.getElementById(anchorId)?.scrollIntoView({ block: 'center' });
 		});
 		return () => window.cancelAnimationFrame(frame);
-	}, [props.entry.id, trajectoryAnchors]);
+	}, [trajectoryAnchors]);
 
 	return (
 		<div className="log-detail-view">
@@ -1510,6 +1649,8 @@ function LogDetailView(props: { entry: LogEntry; onOpenSettings?: () => void }) 
 				</section>
 			</div>
 
+			<LogGuardrailDetails entry={props.entry} />
+
 			{messages.length ? (
 				<details className="log-conversation" ref={conversationRef}>
 					<summary>
@@ -1524,11 +1665,19 @@ function LogDetailView(props: { entry: LogEntry; onOpenSettings?: () => void }) 
 							<LogMessageView
 								events={trajectory.filter(event => event.messageIndex === index)}
 								message={message}
-								key={`${message.role}-${index}`}
+								key={`${message.role}-${
+									// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+									index
+								}`}
 							/>
 						))}
 					</div>
 				</details>
+			) : props.promptLoggingEnabled ? (
+				<StatusBanner state="info" title="No prompt or completion content recorded">
+					Prompt logging is enabled, but no content was captured for this request. This can happen
+					in passthrough mode.
+				</StatusBanner>
 			) : (
 				<StatusBanner state="info" title="Prompt logging is off">
 					Enable "Include prompts and completions in logs" in{' '}
@@ -1604,7 +1753,10 @@ function LogTrajectory(props: { events: TrajectoryEvent[]; onJump: (anchorId: st
 											aria-label={`Step ${index + 1}: ${event.label}`}
 											aria-pressed={selected === index}
 											className={`log-trajectory-bar ${lane}${event.system ? ' system' : ''}${selected === index ? ' selected' : ''}`}
-											key={`${lane}-${index}`}
+											key={`${lane}-${
+												// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+												index
+											}`}
 											title={`Step ${index + 1}: ${event.label}`}
 											type="button"
 											onClick={() => setSelected(current => (current === index ? null : index))}
@@ -1617,7 +1769,10 @@ function LogTrajectory(props: { events: TrajectoryEvent[]; onJump: (anchorId: st
 										<span
 											aria-hidden="true"
 											className="log-trajectory-gap"
-											key={`${lane}-${index}`}
+											key={`${lane}-${
+												// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+												index
+											}`}
 										/>
 									)
 								)}
@@ -1628,8 +1783,8 @@ function LogTrajectory(props: { events: TrajectoryEvent[]; onJump: (anchorId: st
 			</div>
 			<div className="log-trajectory-caption" aria-live="polite">
 				<span>
-					{selectedEvent
-						? `Step ${selected! + 1} ${selectedEvent.label}`
+					{selected != null && selectedEvent
+						? `Step ${selected + 1} ${selectedEvent.label}`
 						: 'Width shows approximate tokens'}
 				</span>
 				{selectedEvent ? (
@@ -1793,6 +1948,7 @@ function ModelRouteStep(props: { label: string; value: string; last?: boolean })
 
 function LogUsagePanel(props: { usage: LogUsageDetail }) {
 	const usage = props.usage;
+	const { inputTokens, outputTokens } = usage;
 	const inputBreakdown =
 		usage.inputTokens != null
 			? splitInputTokens(
@@ -1809,10 +1965,7 @@ function LogUsagePanel(props: { usage: LogUsageDetail }) {
 		usage.outputTokens != null && !outputBreakdownUnavailable
 			? splitOutputTokens(usage.outputTokens, usage.reasoningTokens, usage.outputAudioTokens)
 			: null;
-	const showBar =
-		usage.inputTokens != null &&
-		usage.outputTokens != null &&
-		usage.inputTokens + usage.outputTokens > 0;
+	const showBar = inputTokens != null && outputTokens != null && inputTokens + outputTokens > 0;
 	const showCostBar = [
 		usage.inputCost,
 		usage.cacheReadCost,
@@ -1909,8 +2062,8 @@ function LogUsagePanel(props: { usage: LogUsageDetail }) {
 						<div className="log-usage-bar-row">
 							<span className="log-usage-bar-label">Tokens</span>
 							<TokenBar
-								input={usage.inputTokens!}
-								output={usage.outputTokens!}
+								input={inputTokens}
+								output={outputTokens}
 								cacheRead={usage.cacheReadTokens ?? undefined}
 								cacheWrite={usage.cacheWriteTokens ?? undefined}
 								inputAudio={usage.inputAudioTokens ?? undefined}
@@ -2016,7 +2169,10 @@ function LogMessageView(props: { message: RenderedLogMessage; events: Trajectory
 								anchorId={props.events.find(event => event.partIndex === index)?.anchorId}
 								part={part}
 								collapsed={part.type === 'text' && collapsed}
-								key={`${part.type}-${index}`}
+								key={`${part.type}-${
+									// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+									index
+								}`}
 							/>
 						))}
 						{collapsible ? (
@@ -2048,30 +2204,42 @@ function LogMessageView(props: { message: RenderedLogMessage; events: Trajectory
 					</>
 				) : null}
 				{!message.parts && hasToolCalls
-					? message.toolCalls!.map((call, index) => (
+					? message.toolCalls?.map((call, index) => (
 							<LogToolBlock
 								anchorId={toolCallEvents[index]?.anchorId}
 								kind="call"
 								name={call.name}
 								value={call.arguments}
-								key={`${call.name}-${index}`}
+								key={`${call.name}-${
+									// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+									index
+								}`}
 							/>
 						))
 					: null}
 				{!message.parts && hasToolResults
-					? message.toolResults!.map((result, index) => (
+					? message.toolResults?.map((result, index) => (
 							<LogToolBlock
 								kind="result"
 								name={result.name ?? 'unknown'}
 								value={result.content}
 								isError={result.isError}
-								key={`${result.id ?? result.name ?? 'result'}-${index}`}
+								key={`${result.id ?? result.name ?? 'result'}-${
+									// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+									index
+								}`}
 							/>
 						))
 					: null}
 				{!message.parts && hasReasoning
-					? message.reasoning!.map((reasoning, index) => (
-							<LogReasoningBlock content={reasoning} key={`reasoning-${index}`} />
+					? message.reasoning?.map((reasoning, index) => (
+							<LogReasoningBlock
+								content={reasoning}
+								key={`reasoning-${
+									// biome-ignore lint/suspicious/noArrayIndexKey: Existing lint violation; remove this suppression when the underlying issue is fixed.
+									index
+								}`}
+							/>
 						))
 					: null}
 				{!content && !hasToolCalls && !hasToolResults && !hasReasoning ? (
@@ -2225,8 +2393,10 @@ function escapeLogMarkdownHtml(value: string) {
 }
 
 function LogMarkdown(props: { content: string; collapsed: boolean; anchorId?: string }) {
-	const html = useMemo(
-		() =>
+	const ref = useRef<HTMLDivElement>(null);
+	// Keep this div empty in JSX so React leaves the sanitized content alone.
+	useLayoutEffect(() => {
+		ref.current?.replaceChildren(
 			DOMPurify.sanitize(
 				marked.parse(props.content, {
 					async: false,
@@ -2236,16 +2406,17 @@ function LogMarkdown(props: { content: string; collapsed: boolean; anchorId?: st
 				}) as string,
 				{
 					ALLOWED_ATTR: [],
-					ALLOWED_TAGS: LOG_MARKDOWN_TAGS
+					ALLOWED_TAGS: LOG_MARKDOWN_TAGS,
+					RETURN_DOM_FRAGMENT: true
 				}
-			),
-		[props.content]
-	);
+			)
+		);
+	}, [props.content]);
 	return (
 		<div
 			className={`log-msg-content log-markdown${props.collapsed ? ' collapsed' : ''}`}
-			dangerouslySetInnerHTML={{ __html: html }}
 			id={props.anchorId}
+			ref={ref}
 		/>
 	);
 }
@@ -2711,8 +2882,7 @@ function CostBar(props: { usage: LogUsageDetail }) {
 	const total = components.reduce((sum, [, cost]) => sum + Math.max(cost ?? 0, 0), 0);
 	if (!total) return null;
 	const title = components
-		.filter(([, cost]) => cost != null && cost > 0)
-		.map(([label, cost]) => `${label}: ${formatCost(cost!)}`)
+		.flatMap(([label, cost]) => (cost != null && cost > 0 ? [`${label}: ${formatCost(cost)}`] : []))
 		.join(' / ');
 	return (
 		<UsageBar

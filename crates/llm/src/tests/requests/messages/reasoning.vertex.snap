@@ -2,10 +2,11 @@
 source: crates/llm/src/golden_tests.rs
 description: src/tests/requests/messages/reasoning.json
 info:
-  model: claude-opus-4-6
+  model: gpt-5.6-terra
   max_tokens: 1024
   thinking:
     type: adaptive
+    display: summarized
   output_config:
     effort: high
   output_format: markdown
@@ -36,21 +37,23 @@ info:
     ],
     "anthropic_version": "vertex-2023-10-16",
     "max_tokens": 1024,
-    "thinking": {
-      "type": "adaptive"
-    },
     "output_config": {
       "effort": "high"
+    },
+    "thinking": {
+      "type": "adaptive",
+      "display": "summarized"
     }
   },
   "parsed": {
     "input_format": "Messages",
     "cache_convention": "InputIncludesCache",
-    "request_model": "claude-opus-4-6",
+    "request_model": "gpt-5.6-terra",
     "provider": "vertex",
     "streaming": false,
     "params": {
-      "max_tokens": 1024
+      "max_tokens": 1024,
+      "reasoning_effort": "high"
     },
     "prompt": [
       {

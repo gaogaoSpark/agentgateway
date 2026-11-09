@@ -7,14 +7,17 @@ export async function sendChatCompletion(args: {
 	messages: Array<Record<string, unknown>>;
 	tools?: unknown[];
 	stream?: boolean;
+	headers?: Record<string, string>;
 }) {
 	const url = `${args.baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
 	const headers: Record<string, string> = {
+		...args.headers,
 		'Content-Type': 'application/json'
 	};
 	if (args.apiKey) headers.Authorization = `Bearer ${args.apiKey}`;
 	const response = await fetch(url, {
 		method: 'POST',
+		credentials: 'omit',
 		headers,
 		body: JSON.stringify({
 			model: args.model,
@@ -46,6 +49,7 @@ export async function sendMcpJsonRpc(args: {
 	try {
 		response = await fetch(args.baseUrl, {
 			method: 'POST',
+			credentials: 'omit',
 			headers,
 			body: JSON.stringify(args.body)
 		});

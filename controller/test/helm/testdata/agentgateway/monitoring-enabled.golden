@@ -23,10 +23,20 @@ spec:
   namespaceSelector:
     matchNames:
     - default
+  scrapeNativeHistograms: false
+  scrapeClassicHistograms: true
+  scrapeProtocols:
+    - OpenMetricsText1.0.0
+    - OpenMetricsText0.0.1
+    - PrometheusText1.0.0
+    - PrometheusText0.0.4
   podMetricsEndpoints:
   - port: metrics
     path: /metrics
     interval: 30s
+  podTargetLabels:
+    - gateway.networking.k8s.io/gateway-name
+
 ---
 # Source: agentgateway/templates/monitoring.yaml
 apiVersion: monitoring.coreos.com/v1
@@ -51,6 +61,13 @@ spec:
   namespaceSelector:
     matchNames:
     - default
+  scrapeNativeHistograms: false
+  scrapeClassicHistograms: true
+  scrapeProtocols:
+    - OpenMetricsText1.0.0
+    - OpenMetricsText0.0.1
+    - PrometheusText1.0.0
+    - PrometheusText0.0.4
   endpoints:
   - port: metrics
     path: /metrics

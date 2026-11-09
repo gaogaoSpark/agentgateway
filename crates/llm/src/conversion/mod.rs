@@ -1,11 +1,95 @@
 pub mod bedrock;
 pub mod completions;
+pub mod copilot;
 pub mod gemini;
 pub mod messages;
+pub mod namespace_tools;
 pub mod openai_compat;
 pub mod responses;
+pub mod systemone;
 pub mod vertex;
 pub mod vertex_gemini;
+
+/// Rough token estimate (words x 1.3) used for the promptCaching policy's minTokens.
+pub(crate) fn estimate_tokens<'a>(texts: impl IntoIterator<Item = &'a str>) -> usize {
+	let word_count: usize = texts
+		.into_iter()
+		.map(|t| t.split_whitespace().count())
+		.sum();
+	(word_count * 13) / 10
+}
+
+#[derive(Default)]
+struct ProviderUsage {
+	input_tokens: u64,
+	total_tokens: u64,
+	reasoning_tokens: Option<u64>,
+	cache_creation_1h_input_tokens: Option<u64>,
+	cache_creation_12h_input_tokens: Option<u64>,
+	usage_lines: Vec<crate::UsageLine>,
+}
+
+/// Keep provider token counts for accounting when translating client usage conventions.
+struct ResponseWithProviderUsage<T> {
+	response: T,
+	provider_usage: Option<ProviderUsage>,
+}
+
+impl<T: crate::types::ResponseType> crate::types::ResponseType for ResponseWithProviderUsage<T> {
+	fn to_llm_response(&self, log_content: crate::LogContentFields) -> crate::LLMResponse {
+		let mut response = self.response.to_llm_response(log_content);
+		if let Some(usage) = &self.provider_usage {
+			response.input_tokens = Some(usage.input_tokens);
+			response.total_tokens = Some(usage.total_tokens);
+			response.reasoning_tokens = usage.reasoning_tokens.or(response.reasoning_tokens);
+			response.cache_creation_1h_input_tokens = usage
+				.cache_creation_1h_input_tokens
+				.or(response.cache_creation_1h_input_tokens);
+			response.cache_creation_12h_input_tokens = usage
+				.cache_creation_12h_input_tokens
+				.or(response.cache_creation_12h_input_tokens);
+			response.usage_lines.clone_from(&usage.usage_lines);
+		}
+		response
+	}
+
+	fn to_webhook_choices(&self) -> Vec<crate::webhook::ResponseChoice> {
+		self.response.to_webhook_choices()
+	}
+
+	fn set_webhook_choices(
+		&mut self,
+		choices: Vec<crate::webhook::ResponseChoice>,
+	) -> anyhow::Result<()> {
+		self.response.set_webhook_choices(choices)
+	}
+
+	fn serialize(&self) -> serde_json::Result<Vec<u8>> {
+		self.response.serialize()
+	}
+
+	fn visit_text_mut(&mut self, f: &mut dyn FnMut(crate::types::ResponseText, &mut String)) {
+		self.response.visit_text_mut(f)
+	}
+}
+
+/// Older OpenAI chat models have no reasoning support and reject any reasoning effort.
+pub(crate) fn supports_reasoning_effort(model: &str) -> bool {
+	!["gpt-3.5", "gpt-4", "chatgpt-4o"]
+		.iter()
+		.any(|prefix| model.starts_with(prefix))
+}
+
+pub(crate) fn supports_prompt_cache_breakpoint(model: &str) -> bool {
+	model
+		.strip_prefix("gpt-")
+		.and_then(|model| model.split('-').next())
+		.and_then(|version| {
+			let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+			Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?))
+		})
+		.is_some_and(|version| version >= (5, 6))
+}
 
 /// Translate an OpenAI `tool_calls[].function.arguments` string into an Anthropic
 /// `tool_use.input` value.
@@ -23,6 +107,31 @@ pub(crate) fn tool_arguments_to_input(arguments: &str) -> serde_json::Value {
 		.unwrap_or_else(|_| serde_json::Value::String(arguments.to_string()))
 }
 
+// Keep provider state in the client API's opaque reasoning field so long signatures do not alter
+// public tool IDs. The embedded call ID preserves the association across parallel tool calls.
+const GEMINI_THOUGHT_SIGNATURE_PREFIX: &str = "agentgateway.gemini.thought-signature.v1:";
+
+/// Borrowed to encode, owned once decoded.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GeminiThoughtSignature<S = String> {
+	call_id: S,
+	signature: S,
+}
+
+impl<'a> GeminiThoughtSignature<&'a str> {
+	fn encode(call_id: &'a str, signature: &'a str) -> String {
+		let json = serde_json::to_string(&Self { call_id, signature })
+			.expect("serializing two strings cannot fail");
+		format!("{GEMINI_THOUGHT_SIGNATURE_PREFIX}{json}")
+	}
+}
+
+impl GeminiThoughtSignature {
+	fn decode(carrier: &str) -> Option<Self> {
+		serde_json::from_str(carrier.strip_prefix(GEMINI_THOUGHT_SIGNATURE_PREFIX)?).ok()
+	}
+}
+
 #[cfg(test)]
 mod rerank_tests;
 
@@ -31,6 +140,30 @@ mod tests {
 	use serde_json::json;
 
 	use super::tool_arguments_to_input;
+
+	#[test]
+	fn thinking_budget_buckets() {
+		use crate::types::messages::typed::ThinkingEffort::{High, Low, Max, Medium, Xhigh};
+		for (budget, expected) in [
+			(0, Low),
+			(1024, Low),
+			(2047, Low),
+			(2048, Medium),
+			(4095, Medium),
+			(4096, High),
+			(8191, High),
+			(8192, Xhigh),
+			(16383, Xhigh),
+			(16384, Max),
+			(u64::MAX, Max),
+		] {
+			assert_eq!(
+				crate::types::anthropic_effort_for_thinking_budget(budget),
+				expected,
+				"budget {budget}"
+			);
+		}
+	}
 
 	#[test]
 	fn empty_arguments_become_an_empty_object() {

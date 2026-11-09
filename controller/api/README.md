@@ -15,17 +15,17 @@ These are the steps required to add a new CRD to be used in the Kubernetes Gatew
 3. Run codegen via `make generated-code -B`. This will invoke the `controller-gen` command specified in [generate.go](/controller/hack/generate.go), which should result in the following:
     - A `zz_generated.deepcopy.go` file is created in the same directory as the Go types.
     - A `zz_generated.register.go` file is created in the same directory as the Go types, to help with registering the Go types with the scheme.
-    - CRDs are generated in the CRD helm chart template dir: [install/helm/agentgateway-crds/templates](/controller/install/helm/agentgateway-crds/templates)
+    - CRDs are generated in the CRD helm chart: [install/helm/agentgateway-crds/files/crds](/controller/install/helm/agentgateway-crds/files/crds)
     - RBAC roles are generated in [controller/install/helm/templates/role.yaml](/agentgateway/install/helm/agentgateway/templates/role.yaml)
     - Updates the [api/applyconfiguration](/api/applyconfiguration), [pkg/generated](/pkg/generated) and [pkg/client](/pkg/client) folders with kube clients. These are used in plugin initialization and the fake client is used in tests.
 
 ## API guidelines
 - Include documentation as well as any appropriate json and kubebuilder annotations on all fields.
-- Document the default value for each field, if applicable.
+- Document the default value for each field, if applicable, and apply it in controller translation even when API-server defaulting has not run.
 - For optional fields:
     - Use the `+optional` marker.
     - Use the `omitempty` json struct tag.
-    - Use pointer types (e.g. `*string`), unless the type has a nil zero value (e.g. slices/maps). An exception is if the field has a default value (`+kubebuilder:default=...`); then it it acceptable to use a non-pointer type.
+    - Use pointer types (e.g. `*string`), unless the type has a nil zero value (e.g. slices/maps). A non-pointer type is acceptable when omission and the zero value have the same meaning, or validation rejects the zero value. Use pointers when an explicit zero, false, or empty string must be distinguished from omission.
 - For required fields:
     - Use the `+required` marker.
     - Required fields MUST NOT set the `omitempty` json struct tag.

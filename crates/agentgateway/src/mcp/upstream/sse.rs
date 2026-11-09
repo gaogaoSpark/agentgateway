@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryFutureExt};
 use headers::HeaderMapExt;
+use http_body_util::BodyExt as _;
 use rmcp::model::{
 	ClientJsonRpcMessage, ClientNotification, ClientRequest, JsonRpcRequest, ServerJsonRpcMessage,
 };
@@ -92,7 +93,7 @@ impl ClientCore {
 
 		ctx.apply(&mut req).map_err(ClientError::new)?;
 
-		let resp = self.http_client.call(req).await.map_err(ClientError::new)?;
+		let resp = self.http_client.call(req).await?;
 
 		if !resp.status().is_success() {
 			return Err(ClientError::Status(Box::new(resp)));

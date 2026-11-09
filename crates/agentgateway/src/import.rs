@@ -11,6 +11,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+/// LiteLLM's `ROUTER_MAX_FALLBACKS`, the recursion depth cap for fallback attempts.
+const DEFAULT_MAX_FALLBACKS: usize = 5;
+
 /// A source-specific configuration adapter.
 pub trait ConfigImporter: Send + Sync {
 	fn source(&self) -> &'static str;
@@ -24,6 +27,9 @@ pub struct ImportPlan {
 	pub models: Vec<ImportedModel>,
 	pub routes: IndexMap<String, ImportedRoute>,
 	pub findings: Vec<ImportFinding>,
+	/// Outlier-detection policy applied to emitted model backends that do not override it. Populated from
+	/// source-wide health settings (for example LiteLLM `router_settings.cooldown_time`).
+	pub model_health: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -31,6 +37,7 @@ pub struct ImportedProvider {
 	pub name: String,
 	pub provider: String,
 	pub params: Map<String, Value>,
+	pub request_headers: IndexMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -45,7 +52,12 @@ pub struct ImportedModel {
 	pub provider: ImportedModelProvider,
 	pub params: Map<String, Value>,
 	pub defaults: Map<String, Value>,
+	pub request_headers: IndexMap<String, String>,
+	pub request_headers_override_defaults: bool,
 	pub weight: usize,
+	/// False when the deployment overrides source-wide health settings, so
+	/// [`ImportPlan::model_health`] is not applied to it.
+	pub inherits_model_health: bool,
 }
 
 #[derive(Debug, Default)]
@@ -142,6 +154,7 @@ fn emit(source: &str, plan: ImportPlan, options: &ImportOptions) -> anyhow::Resu
 		models,
 		routes,
 		findings,
+		model_health,
 	} = plan;
 	let model_by_name: HashMap<_, _> = models
 		.iter()
@@ -190,6 +203,17 @@ fn emit(source: &str, plan: ImportPlan, options: &ImportOptions) -> anyhow::Resu
 					"defaults".to_string(),
 					Value::Object(model.defaults.clone()),
 				);
+			}
+			if model.request_headers_override_defaults || !model.request_headers.is_empty() {
+				value.insert(
+					"requestHeaders".to_string(),
+					json!({"set": model.request_headers}),
+				);
+			}
+			if model.inherits_model_health
+				&& let Some(health) = &model_health
+			{
+				value.insert("health".to_string(), health.clone());
 			}
 			Value::Object(value)
 		})
@@ -245,11 +269,20 @@ fn emit(source: &str, plan: ImportPlan, options: &ImportOptions) -> anyhow::Resu
 		let providers = providers
 			.into_iter()
 			.map(|provider| {
-				json!({
-					"name": provider.name,
-					"provider": provider.provider,
-					"params": provider.params,
-				})
+				let mut value = Map::from_iter([
+					("name".to_string(), json!(provider.name)),
+					("provider".to_string(), json!(provider.provider)),
+					("params".to_string(), Value::Object(provider.params)),
+				]);
+				if !provider.request_headers.is_empty() {
+					value.insert(
+						"defaults".to_string(),
+						json!({
+							"requestHeaders": {"set": provider.request_headers}
+						}),
+					);
+				}
+				Value::Object(value)
 			})
 			.collect();
 		llm.insert("providers".to_string(), Value::Array(providers));
@@ -261,9 +294,9 @@ fn emit(source: &str, plan: ImportPlan, options: &ImportOptions) -> anyhow::Resu
 		.as_object_mut()
 		.expect("default standalone config must be an object")
 		.insert("llm".to_string(), Value::Object(llm));
-	let yaml = crate::yamlviajson::to_string(&config)?;
-	let _: crate::types::local::LocalConfig = crate::yamlviajson::from_str(&yaml)
-		.context("generated agentgateway configuration is invalid")?;
+	let yaml = crate::yaml::to_string(&config)?;
+	let _: crate::types::local::LocalConfig =
+		crate::yaml::from_str(&yaml).context("generated agentgateway configuration is invalid")?;
 	Ok(ImportResult {
 		source: source.to_string(),
 		config,
@@ -308,6 +341,32 @@ struct LiteLlmCredential {
 	source_path: String,
 	provider_hint: Option<String>,
 	params: Map<String, Value>,
+	upstream_headers: LiteLlmUpstreamHeaders,
+}
+
+#[derive(Debug, Default)]
+struct LiteLlmUpstreamHeaders {
+	organization: LiteLlmOrganization,
+	extra_headers: LiteLlmExtraHeaders,
+}
+
+impl LiteLlmUpstreamHeaders {
+	fn any_present(&self) -> bool {
+		self.organization.present || self.extra_headers.present
+	}
+}
+
+#[derive(Debug, Default)]
+struct LiteLlmOrganization {
+	present: bool,
+	value: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct LiteLlmExtraHeaders {
+	present: bool,
+	values: IndexMap<String, String>,
+	exact_findings: Vec<ImportFinding>,
 }
 
 #[derive(Debug)]
@@ -316,6 +375,8 @@ struct LiteLlmCredentials {
 	ambiguous: HashSet<String>,
 	used: HashSet<String>,
 	emitted: HashMap<(String, String), String>,
+	reported_request_headers: HashSet<String>,
+	reported_organization_providers: HashSet<(String, String)>,
 }
 
 impl ConfigImporter for LiteLlmImporter {
@@ -325,7 +386,7 @@ impl ConfigImporter for LiteLlmImporter {
 
 	fn import(&self, input: &str) -> anyhow::Result<ImportPlan> {
 		let config: LiteLlmConfig =
-			crate::yamlviajson::from_str(input).context("invalid LiteLLM configuration")?;
+			crate::yaml::from_str(input).context("invalid LiteLLM configuration")?;
 		if config.model_list.is_empty() {
 			bail!("LiteLLM configuration does not contain any model_list entries");
 		}
@@ -343,13 +404,15 @@ impl ConfigImporter for LiteLlmImporter {
 			let deployment = counts.entry(model.model_name.clone()).or_default();
 			*deployment += 1;
 			let internal_name = imported_model_name(self.source(), &model.model_name, *deployment);
-			let Some((public_name, mut imported, credential_name)) = import_litellm_model(
-				internal_name.clone(),
-				model,
-				&source_path,
-				use_rpm_weights,
-				&mut plan.findings,
-			) else {
+			let Some((public_name, mut imported, credential_name, model_upstream_headers)) =
+				import_litellm_model(
+					internal_name.clone(),
+					model,
+					&source_path,
+					use_rpm_weights,
+					&mut plan.findings,
+				)
+			else {
 				continue;
 			};
 			if let Some(credential_name) = credential_name {
@@ -357,6 +420,7 @@ impl ConfigImporter for LiteLlmImporter {
 					self.source(),
 					&source_path,
 					&credential_name,
+					&model_upstream_headers,
 					&mut imported,
 					&mut plan,
 				);
@@ -385,6 +449,50 @@ impl ConfigImporter for LiteLlmImporter {
 			apply_fallbacks(fallbacks, source_path, &mut plan);
 		}
 
+		let router_default_fallbacks = config.router_settings.get("default_fallbacks");
+		let litellm_default_fallbacks = config.litellm_settings.get("default_fallbacks");
+		if router_default_fallbacks.is_some() && litellm_default_fallbacks.is_some() {
+			plan.findings.push(ImportFinding {
+				source_path: "litellm_settings.default_fallbacks".to_string(),
+				status: ImportStatus::Manual,
+				message:
+					"litellm_settings.default_fallbacks is shadowed by router_settings.default_fallbacks; the router_settings value was applied"
+						.to_string(),
+			});
+		}
+		let default_fallbacks = router_default_fallbacks
+			.map(|default_fallbacks| ("router_settings.default_fallbacks", default_fallbacks))
+			.or_else(|| {
+				litellm_default_fallbacks
+					.map(|default_fallbacks| ("litellm_settings.default_fallbacks", default_fallbacks))
+			});
+		let max_fallbacks = config
+			.router_settings
+			.get("max_fallbacks")
+			.and_then(Value::as_u64)
+			.map(|max_fallbacks| max_fallbacks as usize)
+			.unwrap_or(DEFAULT_MAX_FALLBACKS);
+		let mut removed_fallback_targets = false;
+		if max_fallbacks == 0 {
+			// LiteLLM raises before attempting any fallback group, so no failover survives, not even
+			// the explicitly configured groups applied above.
+			for route in plan.routes.values_mut() {
+				if !route.fallback_groups.is_empty() {
+					route.fallback_groups = Vec::new();
+					removed_fallback_targets = true;
+				}
+			}
+		}
+		if let Some((source_path, default_fallbacks)) = default_fallbacks {
+			apply_default_fallbacks(
+				default_fallbacks,
+				source_path,
+				fallbacks.map(|(_, fallbacks)| fallbacks),
+				max_fallbacks,
+				&mut plan,
+			);
+		}
+
 		if let Some(strategy) = config.router_settings.get("routing_strategy") {
 			let (status, message) = match strategy.as_str() {
 				Some("simple-shuffle") => (
@@ -409,15 +517,65 @@ impl ConfigImporter for LiteLlmImporter {
 				message,
 			});
 		}
+		apply_litellm_health(&config.router_settings, &mut plan);
 		for setting in config.router_settings.keys() {
-			if matches!(setting.as_str(), "fallbacks" | "routing_strategy") {
-				continue;
+			match setting.as_str() {
+				"fallbacks"
+				| "routing_strategy"
+				| "default_fallbacks"
+				| "allowed_fails"
+				| "allowed_fails_policy"
+				| "cooldown_time"
+				| "disable_cooldowns" => continue,
+				"max_fallbacks" => {
+					let (status, message) = match config.router_settings.get(setting).and_then(Value::as_u64)
+					{
+						None => (
+							ImportStatus::Manual,
+							"max_fallbacks must be a non-negative integer; the LiteLLM default of 5 was assumed"
+								.to_string(),
+						),
+						Some(0) if removed_fallback_targets => (
+							ImportStatus::Exact,
+							"max_fallbacks: 0 disables LiteLLM fallbacks; emitted failover targets were removed"
+								.to_string(),
+						),
+						Some(0) => (
+							ImportStatus::Exact,
+							"max_fallbacks: 0 disables LiteLLM fallbacks".to_string(),
+						),
+						Some(_) if default_fallbacks.is_none() => (
+							ImportStatus::Manual,
+							"No automatic mapping is available; review this router setting".to_string(),
+						),
+						Some(_) => (
+							ImportStatus::Exact,
+							"max_fallbacks bounds the flattened failover chain length".to_string(),
+						),
+					};
+					plan.findings.push(ImportFinding {
+						source_path: format!("router_settings.{setting}"),
+						status,
+						message,
+					});
+				},
+				"context_window_fallbacks" | "content_policy_fallbacks" => {
+					plan.findings.push(ImportFinding {
+						source_path: format!("router_settings.{setting}"),
+						status: ImportStatus::Manual,
+						message: format!(
+							"LiteLLM {setting} is conditional on specific error types and cannot be represented by agentgateway's unconditional priority failover; configure equivalent behavior manually"
+						),
+					});
+				},
+				_ => {
+					plan.findings.push(ImportFinding {
+						source_path: format!("router_settings.{setting}"),
+						status: ImportStatus::Manual,
+						message: "No automatic mapping is available; review this router setting".to_string(),
+					});
+				},
 			}
-			plan.findings.push(ImportFinding {
-				source_path: format!("router_settings.{setting}"),
-				status: ImportStatus::Manual,
-				message: "No automatic mapping is available; review this router setting".to_string(),
-			});
 		}
 		for (section, values) in [
 			("general_settings", &config.general_settings),
@@ -438,7 +596,7 @@ impl ConfigImporter for LiteLlmImporter {
 			}
 		}
 		for setting in config.litellm_settings.keys() {
-			if setting == "fallbacks" {
+			if matches!(setting.as_str(), "fallbacks" | "default_fallbacks") {
 				continue;
 			}
 			if setting == "database_url" {
@@ -469,6 +627,180 @@ fn report_litellm_database(findings: &mut Vec<ImportFinding>, source_path: &str)
 		message: "LiteLLM database configuration was not reused; generated config uses a new agentgateway SQLite database. Configure PostgreSQL manually if desired"
 			.to_string(),
 	});
+}
+
+/// Maps LiteLLM router-level cooldown settings onto an agentgateway health eviction policy.
+///
+/// LiteLLM cools a deployment down globally, whereas agentgateway attaches outlier detection to
+/// each model backend, so the resolved policy is applied to every emitted model via
+/// [`ImportPlan::model_health`]. Deployments with their own `cooldown_time` and exception-specific
+/// `allowed_fails_policy` thresholds are left for manual migration.
+fn apply_litellm_health(router_settings: &Map<String, Value>, plan: &mut ImportPlan) {
+	if router_settings.contains_key("allowed_fails_policy") {
+		plan.findings.push(ImportFinding {
+			source_path: "router_settings.allowed_fails_policy".to_string(),
+			status: ImportStatus::Manual,
+			message: "LiteLLM exception-specific allowed_fails_policy thresholds conflict with the single model health eviction threshold and were not mapped"
+				.to_string(),
+		});
+	}
+
+	if let Some(disabled) = router_settings.get("disable_cooldowns") {
+		match disabled.as_bool() {
+			Some(true) => {
+				// Priority failover enables eviction by default when no health policy is set, so
+				// omitting `health` only matches LiteLLM when no fallbacks were imported.
+				let has_failover = plan
+					.routes
+					.values()
+					.any(|route| !route.fallback_groups.is_empty());
+				let (status, message) = if has_failover {
+					(
+						ImportStatus::Manual,
+						"LiteLLM cooldowns are disabled, but agentgateway enables eviction by default for priority failover routes; disable eviction on the generated fallback routes manually",
+					)
+				} else {
+					(
+						ImportStatus::Exact,
+						"LiteLLM cooldowns are disabled; no model health eviction policy was emitted",
+					)
+				};
+				plan.findings.push(ImportFinding {
+					source_path: "router_settings.disable_cooldowns".to_string(),
+					status,
+					message: message.to_string(),
+				});
+				report_unmapped_litellm_health(
+					router_settings,
+					status,
+					"LiteLLM cooldowns are disabled",
+					&mut plan.findings,
+				);
+				return;
+			},
+			Some(false) => plan.findings.push(ImportFinding {
+				source_path: "router_settings.disable_cooldowns".to_string(),
+				status: ImportStatus::Exact,
+				message: "LiteLLM cooldowns remain enabled".to_string(),
+			}),
+			None => {
+				plan.findings.push(ImportFinding {
+					source_path: "router_settings.disable_cooldowns".to_string(),
+					status: ImportStatus::Manual,
+					message:
+						"LiteLLM disable_cooldowns must be a boolean; model health settings were not mapped"
+							.to_string(),
+				});
+				report_unmapped_litellm_health(
+					router_settings,
+					ImportStatus::Manual,
+					"disable_cooldowns is not a boolean",
+					&mut plan.findings,
+				);
+				return;
+			},
+		}
+	}
+
+	if router_settings.contains_key("allowed_fails_policy") {
+		report_unmapped_litellm_health(
+			router_settings,
+			ImportStatus::Manual,
+			"allowed_fails_policy requires manual migration",
+			&mut plan.findings,
+		);
+		return;
+	}
+
+	let allowed_fails = router_settings.get("allowed_fails");
+	let cooldown_time = router_settings.get("cooldown_time");
+	let (Some(allowed_fails), Some(cooldown_time)) = (allowed_fails, cooldown_time) else {
+		if allowed_fails.is_some() {
+			plan.findings.push(ImportFinding {
+				source_path: "router_settings.allowed_fails".to_string(),
+				status: ImportStatus::Manual,
+				message: "LiteLLM allowed_fails requires cooldown_time before a model health eviction policy can be mapped"
+					.to_string(),
+			});
+		}
+		if cooldown_time.is_some() {
+			plan.findings.push(ImportFinding {
+				source_path: "router_settings.cooldown_time".to_string(),
+				status: ImportStatus::Manual,
+				message: "LiteLLM cooldown_time requires allowed_fails before a model health eviction policy can be mapped"
+					.to_string(),
+			});
+		}
+		return;
+	};
+
+	let consecutive_failures = allowed_fails
+		.as_i64()
+		.and_then(|value| i32::try_from(value).ok())
+		.filter(|count| *count >= 0)
+		.and_then(|count| count.checked_add(1));
+	let cooldown_seconds = cooldown_time.as_i64().filter(|seconds| *seconds > 0);
+	if consecutive_failures.is_none() || cooldown_seconds.is_none() {
+		plan.findings.push(ImportFinding {
+			source_path: "router_settings.allowed_fails".to_string(),
+			status: ImportStatus::Manual,
+			message: if consecutive_failures.is_none() {
+				"LiteLLM allowed_fails must be a non-negative integer whose value plus one fits the agentgateway threshold and was not mapped"
+					.to_string()
+			} else {
+				"LiteLLM allowed_fails was not mapped because cooldown_time is invalid".to_string()
+			},
+		});
+		plan.findings.push(ImportFinding {
+			source_path: "router_settings.cooldown_time".to_string(),
+			status: ImportStatus::Manual,
+			message: if cooldown_seconds.is_none() {
+				"LiteLLM cooldown_time must be a positive integer number of seconds and was not mapped"
+					.to_string()
+			} else {
+				"LiteLLM cooldown_time was not mapped because allowed_fails is invalid".to_string()
+			},
+		});
+		return;
+	}
+
+	let consecutive_failures = consecutive_failures.expect("validated above");
+	let cooldown_seconds = cooldown_seconds.expect("validated above");
+	plan.model_health = Some(json!({
+		"eviction": {
+			"consecutiveFailures": consecutive_failures,
+			"duration": format!("{cooldown_seconds}s"),
+		}
+	}));
+	plan.findings.push(ImportFinding {
+		source_path: "router_settings.allowed_fails".to_string(),
+		status: ImportStatus::Approximate,
+		message: "Mapped LiteLLM allowed_fails + 1 to the model health eviction consecutiveFailures threshold; agentgateway counts consecutive failures rather than failures within a window"
+			.to_string(),
+	});
+	plan.findings.push(ImportFinding {
+		source_path: "router_settings.cooldown_time".to_string(),
+		status: ImportStatus::Approximate,
+		message: "Mapped LiteLLM cooldown_time to the model health eviction duration".to_string(),
+	});
+}
+
+/// Records `allowed_fails` and `cooldown_time` when they are consumed without emitting a policy.
+fn report_unmapped_litellm_health(
+	router_settings: &Map<String, Value>,
+	status: ImportStatus,
+	reason: &str,
+	findings: &mut Vec<ImportFinding>,
+) {
+	for setting in ["allowed_fails", "cooldown_time"] {
+		if router_settings.contains_key(setting) {
+			findings.push(ImportFinding {
+				source_path: format!("router_settings.{setting}"),
+				status,
+				message: format!("LiteLLM {setting} was not mapped because {reason}"),
+			});
+		}
+	}
 }
 
 impl LiteLlmCredentials {
@@ -550,6 +882,16 @@ impl LiteLlmCredentials {
 
 			let mut params = Map::new();
 			move_litellm_provider_params(&mut credential_values, &mut params);
+			let extra_headers = take_litellm_extra_headers(
+				&mut credential_values,
+				&format!("{source_path}.credential_values"),
+				findings,
+			);
+			let organization = take_litellm_organization(
+				&mut credential_values,
+				&format!("{source_path}.credential_values.organization"),
+				findings,
+			);
 			report_unmapped_fields(
 				findings,
 				&format!("{source_path}.credential_values"),
@@ -563,6 +905,10 @@ impl LiteLlmCredentials {
 				source_path,
 				provider_hint,
 				params,
+				upstream_headers: LiteLlmUpstreamHeaders {
+					organization,
+					extra_headers,
+				},
 			});
 		}
 
@@ -591,6 +937,8 @@ impl LiteLlmCredentials {
 			ambiguous,
 			used: HashSet::new(),
 			emitted: HashMap::new(),
+			reported_request_headers: HashSet::new(),
+			reported_organization_providers: HashSet::new(),
 		}
 	}
 
@@ -614,6 +962,7 @@ impl LiteLlmCredentials {
 		source: &str,
 		model_source_path: &str,
 		credential_name: &str,
+		model_upstream_headers: &LiteLlmUpstreamHeaders,
 		model: &mut ImportedModel,
 		plan: &mut ImportPlan,
 	) {
@@ -664,16 +1013,68 @@ impl LiteLlmCredentials {
 		}
 		}
 
-		if credential.params.is_empty() {
+		let can_reference = model
+			.params
+			.iter()
+			.filter(|(key, _)| key.as_str() != "model")
+			.all(|(key, value)| credential.params.get(key) == Some(value));
+		let mut organization_findings = Vec::new();
+		let credential_request_headers = request_headers_for_provider(
+			&provider,
+			credential.upstream_headers.organization.value.as_deref(),
+			&credential.upstream_headers.extra_headers.values,
+			&format!("{}.credential_values.organization", credential.source_path),
+			&mut organization_findings,
+		);
+		let credential_organization_emitted =
+			can_reference || !model_upstream_headers.organization.present;
+		if credential_organization_emitted
+			&& credential.upstream_headers.organization.value.is_some()
+			&& self
+				.reported_organization_providers
+				.insert((credential.name.clone(), provider.clone()))
+		{
+			plan.findings.extend(organization_findings);
+		}
+		let credential_extra_headers_emitted =
+			can_reference || !model_upstream_headers.extra_headers.present;
+		if credential_extra_headers_emitted
+			&& self
+				.reported_request_headers
+				.insert(credential.name.clone())
+		{
+			plan.findings.extend(
+				credential
+					.upstream_headers
+					.extra_headers
+					.exact_findings
+					.iter()
+					.cloned(),
+			);
+		}
+		if credential.params.is_empty() && credential_request_headers.is_empty() {
 			plan.findings.push(ImportFinding {
-			source_path: reference_path,
-			status: ImportStatus::Manual,
-			message: format!(
-				"LiteLLM credential {credential_name:?} contains no supported provider values and was not applied"
-			),
-		});
+				source_path: reference_path,
+				status: ImportStatus::Manual,
+				message: format!(
+					"LiteLLM credential {credential_name:?} contains no supported provider values and was not applied"
+				),
+			});
 			return;
 		}
+
+		let organization = if model_upstream_headers.organization.present {
+			model_upstream_headers.organization.value.as_deref()
+		} else {
+			credential.upstream_headers.organization.value.as_deref()
+		};
+		let extra_headers = if model_upstream_headers.extra_headers.present {
+			&model_upstream_headers.extra_headers.values
+		} else {
+			&credential.upstream_headers.extra_headers.values
+		};
+		model.request_headers = build_request_headers(&provider, organization, extra_headers);
+		model.request_headers_override_defaults = model_upstream_headers.any_present();
 		if first_use {
 			plan.findings.push(ImportFinding {
 				source_path: credential.source_path.clone(),
@@ -682,15 +1083,13 @@ impl LiteLlmCredentials {
 			});
 		}
 
-		let can_reference = model
-			.params
-			.iter()
-			.filter(|(key, _)| key.as_str() != "model")
-			.all(|(key, value)| credential.params.get(key) == Some(value));
 		if can_reference {
 			model
 				.params
 				.retain(|key, _| key == "model" || !credential.params.contains_key(key));
+			if !model.request_headers_override_defaults {
+				model.request_headers.clear();
+			}
 			let key = (credential.name.clone(), provider.clone());
 			let provider_name = if let Some(provider_name) = self.emitted.get(&key) {
 				provider_name.clone()
@@ -701,6 +1100,7 @@ impl LiteLlmCredentials {
 					name: provider_name.clone(),
 					provider,
 					params: credential.params.clone(),
+					request_headers: credential_request_headers,
 				});
 				self.emitted.insert(key, provider_name.clone());
 				provider_name
@@ -734,7 +1134,12 @@ fn import_litellm_model(
 	source_path: &str,
 	use_rpm_weights: bool,
 	findings: &mut Vec<ImportFinding>,
-) -> Option<(String, ImportedModel, Option<String>)> {
+) -> Option<(
+	String,
+	ImportedModel,
+	Option<String>,
+	LiteLlmUpstreamHeaders,
+)> {
 	let LiteLlmModel {
 		model_name: public_name,
 		litellm_params: mut params,
@@ -829,6 +1234,42 @@ fn import_litellm_model(
 		output_params.insert("model".to_string(), json!(upstream_model));
 	}
 	move_litellm_provider_params(&mut params, &mut output_params);
+	let organization = take_litellm_organization(
+		&mut params,
+		&format!("{source_path}.litellm_params.organization"),
+		findings,
+	);
+	let extra_headers = take_litellm_extra_headers(
+		&mut params,
+		&format!("{source_path}.litellm_params"),
+		findings,
+	);
+	findings.extend(extra_headers.exact_findings.iter().cloned());
+	let model_upstream_headers = LiteLlmUpstreamHeaders {
+		organization,
+		extra_headers,
+	};
+	let request_headers = request_headers_for_provider(
+		provider,
+		model_upstream_headers.organization.value.as_deref(),
+		&model_upstream_headers.extra_headers.values,
+		&format!("{source_path}.litellm_params.organization"),
+		findings,
+	);
+
+	let params_cooldown_override = params.remove("cooldown_time").is_some();
+	let health_override = params_cooldown_override
+		|| ["cooldown_time", "allowed_fails", "allowed_fails_policy"]
+			.iter()
+			.any(|key| model_info.contains_key(*key));
+	if params_cooldown_override {
+		findings.push(ImportFinding {
+			source_path: format!("{source_path}.litellm_params.cooldown_time"),
+			status: ImportStatus::Manual,
+			message: "Per-deployment LiteLLM cooldown_time was not mapped; router-level model health is not applied to this deployment"
+				.to_string(),
+		});
+	}
 
 	let rpm = params.remove("rpm");
 	let tpm = params.remove("tpm");
@@ -913,9 +1354,13 @@ fn import_litellm_model(
 			provider: ImportedModelProvider::Inline(provider.to_string()),
 			params: output_params,
 			defaults,
+			request_headers,
+			request_headers_override_defaults: false,
 			weight,
+			inherits_model_health: !health_override,
 		},
 		credential_name,
+		model_upstream_headers,
 	))
 }
 
@@ -955,6 +1400,8 @@ fn map_provider(provider: &str) -> Option<&'static str> {
 		"deepinfra" => Some("deepinfra"),
 		"deepseek" => Some("deepseek"),
 		"fireworks_ai" | "fireworks" => Some("fireworks"),
+		"perplexity" => Some("perplexity"),
+		"nebius" => Some("nebius"),
 		_ => None,
 	}
 }
@@ -972,6 +1419,209 @@ fn move_litellm_provider_params(source: &mut Map<String, Value>, target: &mut Ma
 			normalize_environment_references(api_key),
 		);
 	}
+}
+
+fn take_litellm_extra_headers(
+	source: &mut Map<String, Value>,
+	source_prefix: &str,
+	findings: &mut Vec<ImportFinding>,
+) -> LiteLlmExtraHeaders {
+	let Some(value) = source.remove("extra_headers") else {
+		return LiteLlmExtraHeaders::default();
+	};
+	let Value::Object(headers) = value else {
+		findings.push(ImportFinding {
+			source_path: format!("{source_prefix}.extra_headers"),
+			status: ImportStatus::Manual,
+			message: "LiteLLM extra_headers must be an object of fixed string values and was not emitted"
+				.to_string(),
+		});
+		return LiteLlmExtraHeaders {
+			present: true,
+			..Default::default()
+		};
+	};
+	if headers.is_empty() {
+		return LiteLlmExtraHeaders {
+			present: true,
+			values: IndexMap::new(),
+			exact_findings: vec![ImportFinding {
+				source_path: format!("{source_prefix}.extra_headers"),
+				status: ImportStatus::Exact,
+				message: "Consumed empty LiteLLM extra_headers".to_string(),
+			}],
+		};
+	}
+
+	let mut parsed = Vec::new();
+	let mut names = IndexMap::<String, Vec<usize>>::new();
+	for (name, value) in headers {
+		let source_path = format!("{source_prefix}.extra_headers.{name}");
+		let Ok(header_name) = ::http::HeaderName::from_bytes(name.as_bytes()) else {
+			findings.push(ImportFinding {
+				source_path,
+				status: ImportStatus::Manual,
+				message: "LiteLLM extra header name is not a valid HTTP header name and was not emitted"
+					.to_string(),
+			});
+			continue;
+		};
+		let Value::String(value) = normalize_environment_references(value) else {
+			findings.push(ImportFinding {
+				source_path,
+				status: ImportStatus::Manual,
+				message: "LiteLLM extra header value must be a string and was not emitted".to_string(),
+			});
+			continue;
+		};
+		if value.parse::<::http::HeaderValue>().is_err() {
+			findings.push(ImportFinding {
+				source_path,
+				status: ImportStatus::Manual,
+				message: "LiteLLM extra header value is not a valid HTTP header value and was not emitted"
+					.to_string(),
+			});
+			continue;
+		}
+		let normalized_name = header_name.as_str().to_string();
+		let index = parsed.len();
+		names
+			.entry(normalized_name.clone())
+			.or_default()
+			.push(index);
+		parsed.push((source_path, normalized_name, value));
+	}
+
+	let mut result = IndexMap::new();
+	let mut exact_findings = Vec::new();
+	for indexes in names.values() {
+		let first_value = &parsed[indexes[0]].2;
+		let conflicting = indexes
+			.iter()
+			.skip(1)
+			.any(|index| parsed[*index].2 != *first_value);
+		for index in indexes {
+			let (source_path, name, value) = &parsed[*index];
+			if conflicting {
+				findings.push(ImportFinding {
+					source_path: source_path.clone(),
+					status: ImportStatus::Manual,
+					message: format!(
+						"Conflicting case-insensitive values for LiteLLM header {name:?} were not emitted"
+					),
+				});
+			} else {
+				result.insert(name.clone(), value.clone());
+				exact_findings.push(ImportFinding {
+					source_path: source_path.clone(),
+					status: ImportStatus::Exact,
+					message: format!("Mapped fixed upstream header {name:?}"),
+				});
+			}
+		}
+	}
+	LiteLlmExtraHeaders {
+		present: true,
+		values: result,
+		exact_findings,
+	}
+}
+
+fn take_litellm_organization(
+	source: &mut Map<String, Value>,
+	source_path: &str,
+	findings: &mut Vec<ImportFinding>,
+) -> LiteLlmOrganization {
+	let Some(value) = source.remove("organization") else {
+		return LiteLlmOrganization::default();
+	};
+	let Value::String(value) = normalize_environment_references(value) else {
+		findings.push(ImportFinding {
+			source_path: source_path.to_string(),
+			status: ImportStatus::Manual,
+			message: "LiteLLM organization must be a string and was not emitted".to_string(),
+		});
+		return LiteLlmOrganization {
+			present: true,
+			value: None,
+		};
+	};
+	if value.is_empty() {
+		findings.push(ImportFinding {
+			source_path: source_path.to_string(),
+			status: ImportStatus::Manual,
+			message:
+				"Empty LiteLLM organization may resolve from process-level defaults and was not emitted"
+					.to_string(),
+		});
+		return LiteLlmOrganization {
+			present: true,
+			value: None,
+		};
+	};
+	if value.parse::<::http::HeaderValue>().is_err() {
+		findings.push(ImportFinding {
+			source_path: source_path.to_string(),
+			status: ImportStatus::Manual,
+			message: "LiteLLM organization is not a valid HTTP header value and was not emitted"
+				.to_string(),
+		});
+		return LiteLlmOrganization {
+			present: true,
+			value: None,
+		};
+	}
+	LiteLlmOrganization {
+		present: true,
+		value: Some(value),
+	}
+}
+
+fn request_headers_for_provider(
+	provider: &str,
+	organization: Option<&str>,
+	extra_headers: &IndexMap<String, String>,
+	source_path: &str,
+	findings: &mut Vec<ImportFinding>,
+) -> IndexMap<String, String> {
+	if organization.is_some() {
+		if provider == "openAI" {
+			findings.push(ImportFinding {
+				source_path: source_path.to_string(),
+				status: ImportStatus::Exact,
+				message: "Mapped OpenAI organization to the upstream OpenAI-Organization header"
+					.to_string(),
+			});
+		} else {
+			findings.push(ImportFinding {
+				source_path: source_path.to_string(),
+				status: ImportStatus::Manual,
+				message: format!(
+					"LiteLLM organization was not emitted because provider {provider:?} is not OpenAI"
+				),
+			});
+		}
+	}
+	build_request_headers(provider, organization, extra_headers)
+}
+
+fn build_request_headers(
+	provider: &str,
+	organization: Option<&str>,
+	extra_headers: &IndexMap<String, String>,
+) -> IndexMap<String, String> {
+	let mut headers = IndexMap::new();
+	if provider == "openAI"
+		&& let Some(organization) = organization
+	{
+		headers.insert("openai-organization".to_string(), organization.to_string());
+	}
+	// OpenAI applies per-request extra headers after its organization default, so a
+	// fixed OpenAI-Organization entry in extra_headers intentionally wins here.
+	for (name, value) in extra_headers {
+		headers.insert(name.clone(), value.clone());
+	}
+	headers
 }
 
 fn move_string(
@@ -1089,6 +1739,225 @@ fn apply_fallbacks(value: &Value, source_path: &str, plan: &mut ImportPlan) {
 		message: "Mapped ordinary LiteLLM fallbacks to agentgateway priority-based failover"
 			.to_string(),
 	});
+}
+
+fn apply_default_fallbacks(
+	value: &Value,
+	source_path: &str,
+	explicit_fallbacks: Option<&Value>,
+	max_fallbacks: usize,
+	plan: &mut ImportPlan,
+) {
+	let Some(entries) = value.as_array() else {
+		plan.findings.push(ImportFinding {
+			source_path: source_path.to_string(),
+			status: ImportStatus::Unsupported,
+			message: "Default fallbacks must be a list of model names".to_string(),
+		});
+		return;
+	};
+	if entries.is_empty() {
+		plan.findings.push(ImportFinding {
+			source_path: source_path.to_string(),
+			status: ImportStatus::Exact,
+			message: "default_fallbacks is empty; no routes changed".to_string(),
+		});
+		return;
+	}
+
+	let mut seen = HashSet::new();
+	let mut defaults: Vec<String> = Vec::new();
+	let mut default_names: Vec<&str> = Vec::new();
+	for entry in entries {
+		let Some(name) = entry.as_str() else {
+			plan.findings.push(ImportFinding {
+				source_path: source_path.to_string(),
+				status: ImportStatus::Manual,
+				message: "Default fallback entry must be a string and was not emitted".to_string(),
+			});
+			continue;
+		};
+		if !seen.insert(name) {
+			continue;
+		}
+		default_names.push(name);
+		if plan.routes.contains_key(name) {
+			defaults.push(name.to_string());
+		} else {
+			plan.findings.push(ImportFinding {
+				source_path: source_path.to_string(),
+				status: ImportStatus::Manual,
+				message: format!("Default fallback target model {name:?} was not imported"),
+			});
+		}
+	}
+
+	if max_fallbacks == 0 {
+		// Fallbacks are already disabled at the call site; only the unknown-model re-assign survives,
+		// because LiteLLM resolves that during deployment lookup rather than in run_async_fallback.
+		if let Some(first) = defaults.first()
+			&& !plan.routes.contains_key("*")
+		{
+			plan.findings.push(ImportFinding {
+				source_path: source_path.to_string(),
+				status: ImportStatus::Manual,
+				message: format!(
+					"LiteLLM serves unknown model names via the first default fallback {first:?}; agentgateway returns 404 for unmatched model names because wildcard matching applies only to concrete llm.models entries; add a \"*\" model manually if unknown names must be served"
+				),
+			});
+		}
+		return;
+	}
+
+	let mut explicit: IndexMap<&str, Vec<&str>> = IndexMap::new();
+	for entry in explicit_fallbacks
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(Value::as_object)
+	{
+		for (source, targets) in entry {
+			let Some(targets) = targets.as_array() else {
+				continue;
+			};
+			explicit
+				.entry(source.as_str())
+				.or_insert_with(|| targets.iter().filter_map(Value::as_str).collect());
+		}
+	}
+
+	let mut wildcard_routes: Vec<String> = Vec::new();
+	let mut updates: Vec<(String, Vec<Vec<String>>)> = Vec::new();
+	for (route_name, route) in &plan.routes {
+		if route_name.contains('*') {
+			if !defaults.is_empty() {
+				wildcard_routes.push(route_name.clone());
+			}
+			continue;
+		}
+		let mut chain: Vec<&str> = Vec::new();
+		let mut visited: HashSet<&str> = HashSet::from([route_name.as_str()]);
+		extend_fallback_chain(
+			route_name,
+			0,
+			&explicit,
+			&default_names,
+			&plan.routes,
+			max_fallbacks,
+			&mut visited,
+			&mut chain,
+		);
+		let mut reached: HashSet<&str> = route.targets.iter().map(String::as_str).collect();
+		let mut groups: Vec<Vec<String>> = Vec::new();
+		for hop in chain {
+			let group: Vec<String> = plan.routes[hop]
+				.targets
+				.iter()
+				.filter(|target| reached.insert(target.as_str()))
+				.cloned()
+				.collect();
+			if !group.is_empty() {
+				groups.push(group);
+			}
+		}
+		if groups != route.fallback_groups {
+			updates.push((route_name.clone(), groups));
+		}
+	}
+
+	let changed = !updates.is_empty();
+	for (route_name, groups) in updates {
+		plan
+			.routes
+			.get_mut(&route_name)
+			.expect("route name taken from plan.routes")
+			.fallback_groups = groups;
+	}
+
+	for route_name in wildcard_routes {
+		plan.findings.push(ImportFinding {
+			source_path: source_path.to_string(),
+			status: ImportStatus::Manual,
+			message: format!(
+				"Default fallbacks cannot be attached to wildcard model {route_name:?}: failover requires a virtual model and virtual model names match exactly; configure failover for requests served by this wildcard manually"
+			),
+		});
+	}
+	plan.findings.push(if changed {
+		ImportFinding {
+			source_path: source_path.to_string(),
+			status: ImportStatus::Approximate,
+			message:
+				"Flattened LiteLLM fallback recursion (per-hop explicit fallbacks, default_fallbacks at hops without one, attempted models skipped) into static priority-ordered failover targets"
+					.to_string(),
+		}
+	} else {
+		ImportFinding {
+			source_path: source_path.to_string(),
+			status: ImportStatus::Exact,
+			message:
+				"default_fallbacks changed no routes; every chain already matches the explicit fallbacks or self-exclusion removed every candidate"
+					.to_string(),
+		}
+	});
+	if let Some(first) = defaults.first()
+		&& !plan.routes.contains_key("*")
+	{
+		plan.findings.push(ImportFinding {
+			source_path: source_path.to_string(),
+			status: ImportStatus::Manual,
+			message: format!(
+				"LiteLLM serves unknown model names via the first default fallback {first:?}; agentgateway returns 404 for unmatched model names because wildcard matching applies only to concrete llm.models entries; add a \"*\" model manually if unknown names must be served"
+			),
+		});
+	}
+}
+
+/// Walks the LiteLLM fallback graph depth-first in attempt order, appending every model group that
+/// would be tried after `node` fails.
+///
+/// Mirrors `run_async_fallback`: the budget check happens once per frame on entry, and `depth`
+/// increments per attempted sibling within a frame and is inherited by that sibling's own frame, so
+/// earlier siblings' attempts consume the descent budget of later siblings rather than capping the
+/// sibling list itself. Children that were never imported consume a depth slot and visitation like
+/// any attempted sibling, because LiteLLM attempts and fails them, but they are not emitted and
+/// their own fallback entries are not walked.
+#[allow(clippy::too_many_arguments)]
+fn extend_fallback_chain<'a>(
+	node: &'a str,
+	depth: usize,
+	explicit: &IndexMap<&'a str, Vec<&'a str>>,
+	defaults: &[&'a str],
+	routes: &'a IndexMap<String, ImportedRoute>,
+	max_fallbacks: usize,
+	visited: &mut HashSet<&'a str>,
+	chain: &mut Vec<&'a str>,
+) {
+	if depth >= max_fallbacks {
+		return;
+	}
+	let mut depth = depth;
+	let children = explicit.get(node).map(Vec::as_slice).unwrap_or(defaults);
+	for child in children.iter().copied() {
+		if !visited.insert(child) {
+			continue;
+		}
+		depth += 1;
+		if !routes.contains_key(child) {
+			continue;
+		}
+		chain.push(child);
+		extend_fallback_chain(
+			child,
+			depth,
+			explicit,
+			defaults,
+			routes,
+			max_fallbacks,
+			visited,
+			chain,
+		);
+	}
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -1209,6 +2078,16 @@ mod tests {
 	}
 
 	#[test]
+	fn imports_openai_organizations_and_fixed_upstream_headers() {
+		assert_litellm_golden("openai-compatible-headers");
+	}
+
+	#[test]
+	fn reports_invalid_or_ambiguous_upstream_headers() {
+		assert_litellm_golden("invalid-upstream-headers");
+	}
+
+	#[test]
 	fn reports_credential_conflicts_without_dropping_model_overrides() {
 		assert_litellm_golden("credential-conflicts");
 	}
@@ -1216,6 +2095,416 @@ mod tests {
 	#[test]
 	fn keeps_routing_for_a_single_model_with_fallbacks() {
 		assert_litellm_golden("single-model-fallback");
+	}
+
+	#[test]
+	fn maps_litellm_cooldown_settings_to_model_health_eviction() {
+		assert_litellm_golden("cooldown-eviction");
+	}
+
+	#[test]
+	fn does_not_emit_litellm_health_for_partial_or_invalid_pairs() {
+		let mut partial = ImportPlan::default();
+		apply_litellm_health(
+			json!({ "allowed_fails": 3 })
+				.as_object()
+				.expect("router settings object"),
+			&mut partial,
+		);
+		assert!(partial.model_health.is_none());
+		assert_eq!(partial.findings.len(), 1);
+		assert_eq!(partial.findings[0].status, ImportStatus::Manual);
+
+		let mut invalid = ImportPlan::default();
+		apply_litellm_health(
+			json!({ "allowed_fails": i32::MAX, "cooldown_time": 60 })
+				.as_object()
+				.expect("router settings object"),
+			&mut invalid,
+		);
+		assert!(invalid.model_health.is_none());
+		assert_eq!(
+			invalid
+				.findings
+				.iter()
+				.map(|finding| finding.status)
+				.collect::<Vec<_>>(),
+			vec![ImportStatus::Manual, ImportStatus::Manual]
+		);
+	}
+
+	#[test]
+	fn maps_zero_litellm_allowed_fails_to_single_failure_threshold() {
+		let mut plan = ImportPlan::default();
+		apply_litellm_health(
+			json!({ "allowed_fails": 0, "cooldown_time": 60 })
+				.as_object()
+				.expect("router settings object"),
+			&mut plan,
+		);
+		assert_eq!(
+			plan.model_health,
+			Some(json!({
+				"eviction": {
+					"consecutiveFailures": 1,
+					"duration": "60s",
+				}
+			}))
+		);
+		assert_eq!(
+			plan
+				.findings
+				.iter()
+				.map(|finding| finding.status)
+				.collect::<Vec<_>>(),
+			vec![ImportStatus::Approximate, ImportStatus::Approximate]
+		);
+
+		let mut negative = ImportPlan::default();
+		apply_litellm_health(
+			json!({ "allowed_fails": -1, "cooldown_time": 60 })
+				.as_object()
+				.expect("router settings object"),
+			&mut negative,
+		);
+		assert!(negative.model_health.is_none());
+	}
+
+	#[test]
+	fn does_not_emit_litellm_health_for_cooldown_only_input() {
+		let mut plan = ImportPlan::default();
+		apply_litellm_health(
+			json!({ "cooldown_time": 60 })
+				.as_object()
+				.expect("router settings object"),
+			&mut plan,
+		);
+		assert!(plan.model_health.is_none());
+		assert_eq!(plan.findings.len(), 1);
+		assert_eq!(
+			plan.findings[0].source_path,
+			"router_settings.cooldown_time"
+		);
+		assert_eq!(plan.findings[0].status, ImportStatus::Manual);
+	}
+
+	#[test]
+	fn does_not_emit_litellm_health_for_valid_threshold_with_invalid_duration() {
+		for cooldown_time in [json!(0), json!(-5), json!("60s")] {
+			let mut plan = ImportPlan::default();
+			apply_litellm_health(
+				json!({ "allowed_fails": 3, "cooldown_time": cooldown_time })
+					.as_object()
+					.expect("router settings object"),
+				&mut plan,
+			);
+			assert!(
+				plan.model_health.is_none(),
+				"cooldown_time {cooldown_time} should not be mapped"
+			);
+			assert_eq!(
+				plan
+					.findings
+					.iter()
+					.map(|finding| (finding.source_path.as_str(), finding.status))
+					.collect::<Vec<_>>(),
+				vec![
+					("router_settings.allowed_fails", ImportStatus::Manual),
+					("router_settings.cooldown_time", ImportStatus::Manual),
+				]
+			);
+			assert_eq!(
+				plan.findings[0].message,
+				"LiteLLM allowed_fails was not mapped because cooldown_time is invalid"
+			);
+		}
+	}
+
+	#[test]
+	fn disable_cooldowns_suppresses_litellm_health() {
+		let mut plan = ImportPlan::default();
+		apply_litellm_health(
+			json!({
+				"allowed_fails": 3,
+				"cooldown_time": 60,
+				"disable_cooldowns": true,
+			})
+			.as_object()
+			.expect("router settings object"),
+			&mut plan,
+		);
+		assert!(plan.model_health.is_none());
+		assert_eq!(
+			plan
+				.findings
+				.iter()
+				.map(|finding| (finding.source_path.as_str(), finding.status))
+				.collect::<Vec<_>>(),
+			vec![
+				("router_settings.disable_cooldowns", ImportStatus::Exact),
+				("router_settings.allowed_fails", ImportStatus::Exact),
+				("router_settings.cooldown_time", ImportStatus::Exact),
+			]
+		);
+	}
+
+	#[test]
+	fn keeps_litellm_health_findings_for_invalid_disable_cooldowns() {
+		let mut plan = ImportPlan::default();
+		apply_litellm_health(
+			json!({
+				"allowed_fails": 3,
+				"cooldown_time": 60,
+				"disable_cooldowns": "yes",
+			})
+			.as_object()
+			.expect("router settings object"),
+			&mut plan,
+		);
+		assert!(plan.model_health.is_none());
+		assert_eq!(
+			plan
+				.findings
+				.iter()
+				.map(|finding| (finding.source_path.as_str(), finding.status))
+				.collect::<Vec<_>>(),
+			vec![
+				("router_settings.disable_cooldowns", ImportStatus::Manual),
+				("router_settings.allowed_fails", ImportStatus::Manual),
+				("router_settings.cooldown_time", ImportStatus::Manual),
+			]
+		);
+	}
+
+	fn find_status(result: &ImportResult, source_path: &str) -> ImportStatus {
+		result
+			.findings
+			.iter()
+			.find(|finding| finding.source_path == source_path)
+			.unwrap_or_else(|| panic!("missing finding for {source_path}"))
+			.status
+	}
+
+	fn imported_models(result: &ImportResult) -> &Vec<Value> {
+		result.config["llm"]["models"]
+			.as_array()
+			.expect("generated models")
+	}
+
+	#[test]
+	fn disable_cooldowns_with_fallbacks_requires_manual_migration() {
+		let result = import_config(
+			"litellm",
+			r#"
+model_list:
+- model_name: primary
+  litellm_params:
+    model: openai/gpt-4o
+- model_name: backup
+  litellm_params:
+    model: openai/gpt-4o-mini
+router_settings:
+  fallbacks:
+  - primary: [backup]
+  allowed_fails: 3
+  cooldown_time: 60
+  disable_cooldowns: true
+"#,
+		)
+		.expect("import litellm config");
+
+		assert!(
+			imported_models(&result)
+				.iter()
+				.all(|model| model.get("health").is_none())
+		);
+		for source_path in [
+			"router_settings.disable_cooldowns",
+			"router_settings.allowed_fails",
+			"router_settings.cooldown_time",
+		] {
+			assert_eq!(find_status(&result, source_path), ImportStatus::Manual);
+		}
+	}
+
+	#[test]
+	fn leaves_litellm_cooldown_overrides_for_manual_migration() {
+		let result = import_config(
+			"litellm",
+			r#"
+model_list:
+- model_name: primary
+  litellm_params:
+    model: openai/gpt-4o
+    cooldown_time: 5
+- model_name: backup
+  litellm_params:
+    model: openai/gpt-4o-mini
+router_settings:
+  allowed_fails: 3
+  cooldown_time: 60
+"#,
+		)
+		.expect("import litellm config");
+
+		let health_by_model = imported_models(&result)
+			.iter()
+			.map(|model| {
+				(
+					model["params"]["model"].as_str().expect("upstream model"),
+					model.get("health").cloned(),
+				)
+			})
+			.collect::<HashMap<_, _>>();
+		assert_eq!(health_by_model["gpt-4o"], None);
+		assert_eq!(
+			health_by_model["gpt-4o-mini"],
+			Some(json!({
+				"eviction": {
+					"consecutiveFailures": 4,
+					"duration": "60s",
+				}
+			}))
+		);
+		assert_eq!(
+			find_status(&result, "model_list[0].litellm_params.cooldown_time"),
+			ImportStatus::Manual
+		);
+		assert_eq!(
+			find_status(&result, "router_settings.allowed_fails"),
+			ImportStatus::Approximate
+		);
+	}
+
+	#[test]
+	fn exception_specific_thresholds_suppress_generic_litellm_health() {
+		let result = import_config(
+			"litellm",
+			r#"
+model_list:
+- model_name: primary
+  litellm_params:
+    model: openai/gpt-4o
+router_settings:
+  allowed_fails: 3
+  cooldown_time: 60
+  allowed_fails_policy:
+    RateLimitErrorAllowedFails: 10
+"#,
+		)
+		.expect("import litellm config");
+
+		assert!(
+			imported_models(&result)
+				.iter()
+				.all(|model| model.get("health").is_none())
+		);
+		for source_path in [
+			"router_settings.allowed_fails_policy",
+			"router_settings.allowed_fails",
+			"router_settings.cooldown_time",
+		] {
+			assert_eq!(find_status(&result, source_path), ImportStatus::Manual);
+		}
+	}
+
+	#[test]
+	fn model_info_health_overrides_suppress_health_only_for_that_deployment() {
+		for (key, value) in [
+			("cooldown_time", "5"),
+			("allowed_fails", "0"),
+			("allowed_fails_policy", "{ RateLimitErrorAllowedFails: 1 }"),
+		] {
+			let result = import_config(
+				"litellm",
+				&format!(
+					r#"
+model_list:
+- model_name: primary
+  litellm_params:
+    model: openai/gpt-4o
+  model_info:
+    {key}: {value}
+- model_name: backup
+  litellm_params:
+    model: openai/gpt-4o-mini
+router_settings:
+  allowed_fails: 3
+  cooldown_time: 60
+"#
+				),
+			)
+			.expect("import litellm config");
+
+			let health_by_model = imported_models(&result)
+				.iter()
+				.map(|model| {
+					(
+						model["params"]["model"].as_str().expect("upstream model"),
+						model.get("health").cloned(),
+					)
+				})
+				.collect::<HashMap<_, _>>();
+			assert_eq!(health_by_model["gpt-4o"], None);
+			assert_eq!(
+				health_by_model["gpt-4o-mini"],
+				Some(json!({
+					"eviction": {
+						"consecutiveFailures": 4,
+						"duration": "60s",
+					}
+				}))
+			);
+			assert_eq!(
+				find_status(&result, &format!("model_list[0].model_info.{key}")),
+				ImportStatus::Manual
+			);
+		}
+	}
+
+	#[test]
+	fn applies_default_fallbacks_to_routes_without_explicit_fallbacks() {
+		assert_litellm_golden("default-fallbacks");
+	}
+
+	#[test]
+	fn reports_shadowed_and_noop_default_fallbacks() {
+		assert_litellm_golden("default-fallbacks-shadowed");
+	}
+
+	#[test]
+	fn reports_wildcard_default_fallback_limitations() {
+		assert_litellm_golden("default-fallbacks-wildcard");
+	}
+
+	#[test]
+	fn flattens_branching_fallbacks_with_depth_budget() {
+		assert_litellm_golden("default-fallbacks-branching");
+	}
+
+	#[test]
+	fn disables_fallbacks_when_max_fallbacks_is_zero() {
+		assert_litellm_golden("default-fallbacks-max-zero");
+	}
+
+	#[test]
+	fn reports_invalid_max_fallbacks() {
+		assert_litellm_golden("default-fallbacks-max-invalid");
+	}
+
+	#[test]
+	fn disables_explicit_fallbacks_when_max_fallbacks_is_zero_without_defaults() {
+		assert_litellm_golden("max-fallbacks-zero-without-defaults");
+	}
+
+	#[test]
+	fn reports_conditional_fallback_settings_as_manual() {
+		assert_litellm_golden("conditional-fallbacks");
+	}
+
+	#[test]
+	fn counts_unimported_fallback_targets_against_depth() {
+		assert_litellm_golden("default-fallbacks-unimported-depth");
 	}
 
 	#[test]

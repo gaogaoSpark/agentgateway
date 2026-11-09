@@ -2,16 +2,15 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use agent_core::durfmt;
 use prost_types::Timestamp;
-use quick_cache::sync::Cache;
 use serde_json::Value as JsonValue;
 
-use crate::cel::{BufferedBody, Expression, Value};
+use crate::cel::{Expression, Value};
+use crate::http::expiring_cache::{ExpiringCache, Lookup};
 use crate::http::ext_authz::proto::attribute_context::HttpRequest;
 use crate::http::ext_authz::proto::authorization_client::AuthorizationClient;
 use crate::http::ext_authz::proto::check_response::HttpResponse;
@@ -25,7 +24,7 @@ use crate::http::{
 };
 use crate::proxy::dtrace::{Severity, pol_event, pol_result_timed};
 use crate::proxy::httpproxy::PolicyClient;
-use crate::proxy::{ProxyError, ProxyResponse, dtrace};
+use crate::proxy::{ProxyError, ProxyResponseReason, dtrace};
 use crate::telemetry::log::{RequestLog, copy_span_writer};
 use crate::telemetry::metrics::{OutboundCallKind, OutboundCallSubtype};
 use crate::transport::stream::{TCPConnectionInfo, TLSConnectionInfo};
@@ -70,7 +69,7 @@ pub struct ExtAuthzDynamicMetadata(serde_json::Map<String, JsonValue>);
 #[apply(schema!)]
 pub struct BodyOptions {
 	/// Maximum request body size to send to the authorization service. Defaults to 8192 bytes.
-	#[serde(default)]
+	#[serde(default = "default_max_request_bytes")]
 	pub max_request_bytes: u32,
 	/// Whether to send a partial body when the request exceeds `maxRequestBytes`.
 	#[serde(default)]
@@ -83,7 +82,7 @@ pub struct BodyOptions {
 impl Default for BodyOptions {
 	fn default() -> Self {
 		Self {
-			max_request_bytes: 8192,
+			max_request_bytes: default_max_request_bytes(),
 			allow_partial_message: false,
 			pack_as_bytes: false,
 		}
@@ -158,14 +157,29 @@ impl Default for Protocol {
 pub struct CacheConfig {
 	/// CEL expressions that make up the cache key. Empty keys are accepted, but do not produce cache hits.
 	pub key: Vec<Arc<cel::Expression>>,
-	/// CEL expression that returns how long cached authorization results are reused.
-	/// The expression is evaluated after the authorization response has been applied
-	/// to the request, and must return either a duration or timestamp.
+	/// CEL expression that returns how long cached results are reused.
+	/// Must return either a duration or timestamp.
 	#[serde(deserialize_with = "crate::cel::de_duration_or_expression")]
 	pub ttl: Arc<cel::Expression>,
-	/// Maximum number of authorization results to keep in the cache.
+	/// Maximum number of results to keep in the cache.
 	#[serde(default = "default_cache_entries")]
 	pub max_entries: usize,
+}
+
+impl CacheConfig {
+	pub(crate) fn evaluate_ttl(&self, exec: &cel::Executor<'_>) -> Option<Duration> {
+		match exec.eval(&self.ttl).ok()? {
+			Value::Duration(ttl) => ttl.to_std().ok(),
+			Value::Timestamp(expires_at) => expires_at
+				.signed_duration_since(chrono::Utc::now().with_timezone(expires_at.offset()))
+				.to_std()
+				.ok(),
+			Value::Int(expires_at) => unix_epoch_ttl(expires_at as f64),
+			Value::UInt(expires_at) => unix_epoch_ttl(expires_at as f64),
+			Value::Float(expires_at) => unix_epoch_ttl(expires_at),
+			_ => None,
+		}
+	}
 }
 
 #[apply(schema!)]
@@ -190,10 +204,11 @@ pub struct ExtAuthz {
 	/// Warning: the safety of this feature depends on the cache key accurately capturing the fields
 	/// the server operates on. For example, if you return a different result based on header A but only
 	/// cache header B, users may get incorrect cache hits.
+	/// The TTL is evaluated after the authorization response has been applied to the request.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub cache: Option<CacheConfig>,
 	#[serde(skip, default = "default_cache_store")]
-	pub(crate) cache_store: Arc<Cache<CacheKey, CachedExtAuthzResponse>>,
+	pub(crate) cache_store: ExpiringCache<CacheKey, CachedPolicyResponse>,
 }
 
 impl ExtAuthz {
@@ -201,7 +216,7 @@ impl ExtAuthz {
 		self.cache_store = self
 			.cache
 			.as_ref()
-			.map(|cache| cache_store(effective_cache_entries(cache.max_entries)))
+			.map(|cache| ExpiringCache::new(effective_cache_entries(cache.max_entries)))
 			.unwrap_or_else(default_cache_store);
 		self
 	}
@@ -220,12 +235,12 @@ impl ExtAuthz {
 		req.extensions_mut().insert(source);
 		req.extensions_mut().insert(destination);
 
-		let response = self.check_http(client, &mut req).await?;
-		match response.direct_response {
-			Some(response) => Err(ProxyError::ExternalAuthorizationFailed(Some(
-				response.status(),
-			))),
-			None => Ok(()),
+		match self.check_http(client, &mut req).await {
+			Ok(_) => Ok(()),
+			Err(ProxyError::DirectResponse { response, .. }) => Err(
+				ProxyError::ExternalAuthorizationFailed(Some(response.status())),
+			),
+			Err(e) => Err(e),
 		}
 	}
 
@@ -236,53 +251,31 @@ impl ExtAuthz {
 		if cache.key.is_empty() {
 			return Err(CacheMissReason::EmptyKey);
 		}
-		let exec = cel::Executor::new_request(req);
-		let values = cache
-			.key
-			.iter()
-			.enumerate()
-			.map(|(index, expr)| {
-				exec
-					.eval(expr)
-					.and_then(CacheKeyValue::try_from_cel)
-					.map_err(|_| CacheMissReason::KeyEvaluationFailed { index })
-			})
-			.collect::<Result<Vec<_>, _>>()?;
-		Ok(CacheKey(values))
+		CacheKey::evaluate(&cel::Executor::new_request(req), &cache.key)
+			.map_err(|index| CacheMissReason::KeyEvaluationFailed { index })
 	}
 
 	fn lookup_cache(
 		&self,
 		req: &Request,
 	) -> (Option<CacheKey>, CacheLookup, Option<CachedPolicyResponse>) {
-		match self.cache_key(req) {
-			Ok(cache_key) => match self.cache_store.get(&cache_key) {
-				Some(cached) => {
-					let now = Instant::now();
-					let lookup = cached.lookup(now);
-					match lookup {
-						CacheLookup::Hit => (Some(cache_key), CacheLookup::Hit, Some(cached.response)),
-						CacheLookup::Refresh => (Some(cache_key), CacheLookup::Refresh, None),
-						CacheLookup::Miss(CacheMissReason::ExpiredEntry) => {
-							self
-								.cache_store
-								.remove_if(&cache_key, |cached| cached.is_expired(now));
-							(
-								Some(cache_key),
-								CacheLookup::Miss(CacheMissReason::ExpiredEntry),
-								None,
-							)
-						},
-						CacheLookup::Miss(reason) => (Some(cache_key), CacheLookup::Miss(reason), None),
-					}
-				},
-				None => (
-					Some(cache_key),
-					CacheLookup::Miss(CacheMissReason::NoEntry),
-					None,
-				),
-			},
-			Err(reason) => (None, CacheLookup::Miss(reason), None),
+		let cache_key = match self.cache_key(req) {
+			Ok(cache_key) => cache_key,
+			Err(reason) => return (None, CacheLookup::Miss(reason), None),
+		};
+		match self.cache_store.lookup(&cache_key) {
+			Lookup::Hit(response) => (Some(cache_key), CacheLookup::Hit, Some(response)),
+			Lookup::Refresh => (Some(cache_key), CacheLookup::Refresh, None),
+			Lookup::Expired => (
+				Some(cache_key),
+				CacheLookup::Miss(CacheMissReason::ExpiredEntry),
+				None,
+			),
+			Lookup::Vacant => (
+				Some(cache_key),
+				CacheLookup::Miss(CacheMissReason::NoEntry),
+				None,
+			),
 		}
 	}
 
@@ -292,7 +285,9 @@ impl ExtAuthz {
 	) -> Result<BufferedRequestBody, BufferRequestBodyError> {
 		let max_size = body_opts.max_request_bytes as usize;
 
-		let inspection = crate::http::inspect_body_with_limit(req.body_mut(), max_size)
+		let inspection = req
+			.body_mut()
+			.inspect(max_size)
 			.await
 			.map_err(BufferRequestBodyError::Read)?;
 		let (body, is_partial) = match inspection {
@@ -317,7 +312,7 @@ impl ExtAuthz {
 	}
 
 	/// Handle authorization failure with FailureMode configuration
-	fn handle_auth_failure(&self, error_msg: &str) -> Result<PolicyResponse, ProxyError> {
+	fn handle_auth_failure(&self) -> Result<PolicyResponse, ProxyError> {
 		match &self.failure_mode {
 			FailureMode::Allow => {
 				dtrace::pol_event!(
@@ -327,17 +322,9 @@ impl ExtAuthz {
 				Ok(PolicyResponse::default())
 			},
 			FailureMode::Deny => Err(ProxyError::ExternalAuthorizationFailed(None)),
-			FailureMode::DenyWithStatus(status_code) => {
-				let status = StatusCode::from_u16(*status_code).unwrap_or(StatusCode::FORBIDDEN);
-				let resp = ::http::Response::builder()
-					.status(status)
-					.body(http::Body::from(error_msg.to_string()))
-					.map_err(|e| ProxyError::Processing(e.into()))?;
-				Ok(PolicyResponse {
-					direct_response: Some(resp),
-					response_headers: None,
-				})
-			},
+			FailureMode::DenyWithStatus(status_code) => Err(ProxyError::ExternalAuthorizationFailed(
+				Some(StatusCode::from_u16(*status_code).unwrap_or(StatusCode::FORBIDDEN)),
+			)),
 		}
 	}
 
@@ -561,6 +548,10 @@ impl ExtAuthz {
 			}),
 		};
 		let mut authz_req = tonic::Request::new(authz_req);
+		// Set the default request timeout. This can be overridden by a timeout on the Backend object itself.
+		authz_req
+			.extensions_mut()
+			.insert(BackendRequestTimeout(Duration::from_secs(2)));
 		copy_span_writer(req.extensions(), authz_req.extensions_mut());
 		let mut span = policy_client.start_grpc_span(
 			&mut authz_req,
@@ -573,12 +564,13 @@ impl ExtAuthz {
 			span.record_grpc_result(&resp);
 		}
 
-		trace!("check response: {:?}", resp);
+		// Avoid logging header values, which may contain credentials added by the auth server.
+		trace!(status = ?resp.as_ref().map(|r| r.get_ref().status.as_ref().map(|s| s.code)).map_err(|e| e.code()), "check response");
 		let cr = match resp {
 			Ok(response) => response,
 			Err(e) => {
 				warn!("ext_authz request failed: {}", e);
-				return self.handle_auth_failure("Authorization service unavailable");
+				return self.handle_auth_failure();
 			},
 		};
 		let cr = cr.into_inner();
@@ -621,9 +613,9 @@ impl ExtAuthz {
 					body,
 					dynamic_metadata,
 				};
-				let response = cached.clone().apply(req)?;
+				let response = cached.clone().apply(req);
 				self.insert_cache(cache_key, req, CachedPolicyResponse::Grpc(cached));
-				return Ok(response);
+				return response;
 			}
 			let cached = CachedGrpcPolicyResponse::DenyWithoutResponse { dynamic_metadata };
 			let response = cached.clone().apply(req);
@@ -692,43 +684,16 @@ impl ExtAuthz {
 			);
 			return;
 		};
-		let Some(expires_at) = Instant::now().checked_add(ttl) else {
-			pol_event!(
-				Severity::Warn,
-				"skip inserting {key:?} into cache; invalid TTL overflow"
-			);
-			return;
-		};
 		pol_event!(
 			Severity::Info,
 			"inserting {key:?} into cache with TTL {}",
 			durfmt::format(ttl)
 		);
-		self.cache_store.insert(
-			key,
-			CachedExtAuthzResponse {
-				expires_at,
-				original_ttl: ttl,
-				refreshing: Arc::new(AtomicBool::new(false)),
-				response,
-			},
-		);
+		self.cache_store.insert(key, response, ttl);
 	}
 
 	fn cache_ttl(&self, req: &Request, cache: &CacheConfig) -> Option<Duration> {
-		let exec = cel::Executor::new_request(req);
-		let value = exec.eval(&cache.ttl).ok()?;
-		match value {
-			Value::Duration(ttl) => ttl.to_std().ok(),
-			Value::Timestamp(expires_at) => expires_at
-				.signed_duration_since(chrono::Utc::now().with_timezone(expires_at.offset()))
-				.to_std()
-				.ok(),
-			Value::Int(expires_at) => unix_epoch_ttl(expires_at as f64),
-			Value::UInt(expires_at) => unix_epoch_ttl(expires_at as f64),
-			Value::Float(expires_at) => unix_epoch_ttl(expires_at),
-			_ => None,
-		}
+		cache.evaluate_ttl(&cel::Executor::new_request(req))
 	}
 
 	pub async fn check_http(
@@ -866,7 +831,7 @@ impl ExtAuthz {
 			Ok(r) => r,
 			Err(e) => {
 				trace!("ext_authz failed {e}");
-				return self.handle_auth_failure(&e.to_string());
+				return self.handle_auth_failure();
 			},
 		};
 		if resp.status().is_success() {
@@ -880,9 +845,14 @@ impl ExtAuthz {
 			}
 			let mut dynamic_metadata = None;
 			if !metadata.is_empty() {
-				if let Ok(body) = crate::http::inspect_response_body(&mut resp).await {
-					resp.extensions_mut().insert(BufferedBody::from(body));
-				};
+				// Like `ContextBuilder::maybe_buffer_response_body`, make the response body
+				// available to CEL before evaluating expressions. This internal ext-authz
+				// response does not pass through the normal proxy response buffering hook,
+				// so inspect it whenever response metadata expressions are configured.
+				if let Err(e) = http::inspect_response_body(&mut resp).await {
+					warn!("ext_authz response body inspection failed: {e}");
+					return self.handle_auth_failure();
+				}
 				let m = metadata
 					.iter()
 					.filter_map(|(k, v)| match Self::eval_to_json(req, &resp, v) {
@@ -936,10 +906,10 @@ impl ExtAuthz {
 						.body(http::Body::empty())
 						.map_err(|e| ProxyError::Processing(e.into()))?;
 					if cache_key.is_none() {
-						return Ok(PolicyResponse {
-							direct_response: Some(resp),
-							response_headers: None,
-						});
+						return Err(ProxyError::direct_response_from(
+							ProxyResponseReason::ExtAuth,
+							resp,
+						));
 					}
 					let (parts, body) = crate::http::read_response_body(resp)
 						.await
@@ -949,23 +919,20 @@ impl ExtAuthz {
 						headers: parts.headers,
 						body,
 					};
-					let response = cached.clone().apply(req)?;
+					let response = cached.clone().apply(req);
 					self.insert_cache(cache_key, req, CachedPolicyResponse::Http(cached));
-					Ok(PolicyResponse {
-						direct_response: response.direct_response,
-						response_headers: response.response_headers,
-					})
+					response
 				},
 			};
 		}
 		trace!("ext_authz failed with code {}", resp.status());
 		if cache_key.is_none() || !should_cache_http_direct_response(resp.status()) {
-			return Ok(PolicyResponse {
-				direct_response: Some(resp),
-				response_headers: None,
-			});
+			return Err(ProxyError::direct_response_from(
+				ProxyResponseReason::ExtAuth,
+				resp,
+			));
 		}
-		let (parts, body) = crate::http::read_response_body(resp)
+		let (parts, body) = http::read_response_body(resp)
 			.await
 			.map_err(|e| ProxyError::Processing(e.into()))?;
 		let cached = CachedHttpPolicyResponse::DirectResponse {
@@ -973,9 +940,9 @@ impl ExtAuthz {
 			headers: parts.headers,
 			body,
 		};
-		let response = cached.clone().apply(req)?;
+		let response = cached.clone().apply(req);
 		self.insert_cache(cache_key, req, CachedPolicyResponse::Http(cached));
-		Ok(response)
+		response
 	}
 
 	fn build_metadata(
@@ -1049,10 +1016,8 @@ impl crate::store::BackendPolicyTrait for ExtAuthz {
 		client: &PolicyClient,
 		_log: &mut Option<&mut RequestLog>,
 		req: &mut Request,
-	) -> Result<PolicyResponse, ProxyResponse> {
-		Box::pin(self.check(client.clone(), req))
-			.await
-			.map_err(ProxyResponse::from)
+	) -> Result<PolicyResponse, ProxyError> {
+		Box::pin(self.check(client.clone(), req)).await
 	}
 
 	fn expressions(&self) -> impl Iterator<Item = &Expression> {
@@ -1066,10 +1031,8 @@ impl crate::store::RequestPolicyTrait for ExtAuthz {
 		client: &PolicyClient,
 		_log: &mut crate::telemetry::log::RequestLog,
 		req: &mut Request,
-	) -> Result<PolicyResponse, ProxyResponse> {
-		Box::pin(self.check(client.clone(), req))
-			.await
-			.map_err(ProxyResponse::from)
+	) -> Result<PolicyResponse, ProxyError> {
+		Box::pin(self.check(client.clone(), req)).await
 	}
 
 	fn expressions(&self) -> impl Iterator<Item = &cel::Expression> {
@@ -1110,6 +1073,26 @@ impl crate::store::RequestPolicyTrait for ExtAuthz {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct CacheKey(Vec<CacheKeyValue>);
+
+impl CacheKey {
+	/// Evaluates each key expression, returning the index of the first expression that fails.
+	pub(crate) fn evaluate(
+		exec: &cel::Executor<'_>,
+		keys: &[Arc<cel::Expression>],
+	) -> Result<Self, usize> {
+		keys
+			.iter()
+			.enumerate()
+			.map(|(index, expr)| {
+				exec
+					.eval(expr)
+					.and_then(CacheKeyValue::try_from_cel)
+					.map_err(|_| index)
+			})
+			.collect::<Result<Vec<_>, _>>()
+			.map(CacheKey)
+	}
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CacheLookup {
@@ -1214,39 +1197,7 @@ impl Hash for BytesKey {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CachedExtAuthzResponse {
-	expires_at: Instant,
-	original_ttl: Duration,
-	refreshing: Arc<AtomicBool>,
-	response: CachedPolicyResponse,
-}
-
-impl CachedExtAuthzResponse {
-	fn is_expired(&self, now: Instant) -> bool {
-		self.expires_at <= now
-	}
-
-	fn lookup(&self, now: Instant) -> CacheLookup {
-		let Some(remaining) = self.expires_at.checked_duration_since(now) else {
-			return CacheLookup::Miss(CacheMissReason::ExpiredEntry);
-		};
-		if remaining > cache_refresh_threshold(self.original_ttl) {
-			return CacheLookup::Hit;
-		}
-		if self
-			.refreshing
-			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-			.is_ok()
-		{
-			CacheLookup::Refresh
-		} else {
-			CacheLookup::Hit
-		}
-	}
-}
-
-#[derive(Clone, Debug)]
-enum CachedPolicyResponse {
+pub(crate) enum CachedPolicyResponse {
 	Grpc(CachedGrpcPolicyResponse),
 	Http(CachedHttpPolicyResponse),
 }
@@ -1261,7 +1212,7 @@ impl CachedPolicyResponse {
 }
 
 #[derive(Clone, Debug)]
-enum CachedGrpcPolicyResponse {
+pub(crate) enum CachedGrpcPolicyResponse {
 	Allow {
 		headers: Vec<HeaderValueOption>,
 		headers_to_remove: Vec<String>,
@@ -1304,10 +1255,7 @@ impl CachedGrpcPolicyResponse {
 					&query_parameters_to_set,
 					&query_parameters_to_remove,
 				)?;
-				Ok(PolicyResponse {
-					direct_response: None,
-					response_headers,
-				})
+				Ok(PolicyResponse { response_headers })
 			},
 			Self::Denied {
 				status,
@@ -1321,10 +1269,10 @@ impl CachedGrpcPolicyResponse {
 					.body(http::Body::from(body))
 					.map_err(|e| ProxyError::Processing(e.into()))?;
 				*resp.headers_mut() = headers;
-				Ok(PolicyResponse {
-					direct_response: Some(resp),
-					response_headers: None,
-				})
+				Err(ProxyError::direct_response_from(
+					ProxyResponseReason::ExtAuth,
+					resp,
+				))
 			},
 			Self::DenyWithoutResponse { dynamic_metadata } => {
 				insert_dynamic_metadata(req, dynamic_metadata);
@@ -1335,7 +1283,7 @@ impl CachedGrpcPolicyResponse {
 }
 
 #[derive(Clone, Debug)]
-enum CachedHttpPolicyResponse {
+pub(crate) enum CachedHttpPolicyResponse {
 	Allow {
 		headers: HeaderMap,
 		dynamic_metadata: Option<serde_json::Map<String, JsonValue>>,
@@ -1376,10 +1324,10 @@ impl CachedHttpPolicyResponse {
 					.body(http::Body::from(body))
 					.map_err(|e| ProxyError::Processing(e.into()))?;
 				*resp.headers_mut() = headers;
-				Ok(PolicyResponse {
-					direct_response: Some(resp),
-					response_headers: None,
-				})
+				Err(ProxyError::direct_response_from(
+					ProxyResponseReason::ExtAuth,
+					resp,
+				))
 			},
 		}
 	}
@@ -1409,12 +1357,12 @@ fn unix_epoch_ttl(expires_at: f64) -> Option<Duration> {
 	Duration::try_from_secs_f64(expires_at - now).ok()
 }
 
-fn cache_refresh_threshold(ttl: Duration) -> Duration {
-	std::cmp::min(ttl / 10, Duration::from_secs(5))
-}
-
 fn should_cache_http_direct_response(status: StatusCode) -> bool {
 	matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+fn default_max_request_bytes() -> u32 {
+	8192
 }
 
 pub(crate) fn default_cache_entries() -> usize {
@@ -1428,12 +1376,8 @@ pub(crate) fn effective_cache_entries(max_entries: usize) -> usize {
 	}
 }
 
-pub(crate) fn cache_store(max_entries: usize) -> Arc<Cache<CacheKey, CachedExtAuthzResponse>> {
-	Arc::new(Cache::new(max_entries))
-}
-
-pub(crate) fn default_cache_store() -> Arc<Cache<CacheKey, CachedExtAuthzResponse>> {
-	cache_store(DEFAULT_CACHE_ENTRIES)
+pub(crate) fn default_cache_store() -> ExpiringCache<CacheKey, CachedPolicyResponse> {
+	ExpiringCache::new(DEFAULT_CACHE_ENTRIES)
 }
 
 struct BufferedRequestBody {

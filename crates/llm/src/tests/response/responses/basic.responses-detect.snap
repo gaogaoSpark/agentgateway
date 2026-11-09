@@ -23,8 +23,26 @@ info:
       status: completed
       content:
         - type: output_text
-          annotations: []
-          logprobs: []
+          annotations:
+            - type: url_citation
+              start_index: 0
+              end_index: 5
+              title: Example
+              url: "https://example.com"
+            - type: file_citation
+              file_id: file_example
+              filename: example.txt
+              index: 0
+          logprobs:
+            - token: Hello
+              logprob: -0.1
+              bytes:
+                - 72
+                - 101
+                - 108
+                - 108
+                - 111
+              top_logprobs: []
           text: Hello! How can I assist you today?
       role: assistant
   parallel_tool_calls: true
@@ -52,6 +70,10 @@ info:
     input_tokens: 10
     input_tokens_details:
       cached_tokens: 0
+      cache_write_tokens: 6
+      cache_write_tokens_details:
+        ttl_30m_tokens: 4
+        ttl_12h_tokens: 2
     output_tokens: 10
     output_tokens_details:
       reasoning_tokens: 0
@@ -85,8 +107,35 @@ info:
         "content": [
           {
             "type": "output_text",
-            "annotations": [],
-            "logprobs": [],
+            "annotations": [
+              {
+                "type": "url_citation",
+                "start_index": 0,
+                "end_index": 5,
+                "title": "Example",
+                "url": "https://example.com"
+              },
+              {
+                "type": "file_citation",
+                "file_id": "file_example",
+                "filename": "example.txt",
+                "index": 0
+              }
+            ],
+            "logprobs": [
+              {
+                "token": "Hello",
+                "logprob": -0.1,
+                "bytes": [
+                  72,
+                  101,
+                  108,
+                  108,
+                  111
+                ],
+                "top_logprobs": []
+              }
+            ],
             "text": "Hello! How can I assist you today?"
           }
         ],
@@ -120,7 +169,12 @@ info:
     "usage": {
       "input_tokens": 10,
       "input_tokens_details": {
-        "cached_tokens": 0
+        "cached_tokens": 0,
+        "cache_write_tokens": 6,
+        "cache_write_tokens_details": {
+          "ttl_30m_tokens": 4,
+          "ttl_12h_tokens": 2
+        }
       },
       "output_tokens": 10,
       "output_tokens_details": {
@@ -136,6 +190,8 @@ info:
     "output_tokens": 10,
     "total_tokens": 20,
     "reasoning_tokens": 0,
+    "cache_creation_input_tokens": 6,
+    "cache_creation_12h_input_tokens": 2,
     "cached_input_tokens": 0,
     "service_tier": "default",
     "provider_model": "gpt-4o-2024-08-06"

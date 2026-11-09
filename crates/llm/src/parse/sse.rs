@@ -1,34 +1,62 @@
-use axum_core::body::Body;
-use bytes::Bytes;
+use agent_http::{Body, RawBody};
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use futures_util::stream::{self, BoxStream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio_sse_codec::{Event, Frame, SseDecoder};
-use tokio_util::codec::BytesCodec;
+use tokio_sse_codec::{Event, Frame, SseDecodeError, SseDecoder};
+use tokio_util::codec::{BytesCodec, Decoder};
 
 use super::passthrough::parser as passthrough_parser;
 use super::transform::{TransformEvent, parser as transform_parser};
 
 /// Append an OpenAI `[DONE]` event after a body closes successfully.
 pub fn append_done_on_success(body: Body) -> Body {
-	let done = crate::parse::encode_sse_event("", Bytes::from_static(b"[DONE]"));
-	let stream = stream::unfold(
-		(Some(body.into_data_stream().boxed()), Some(done)),
-		|(stream, done): (
-			Option<BoxStream<'static, Result<Bytes, axum_core::Error>>>,
-			Option<Bytes>,
-		)| async move {
-			let mut stream = stream?;
-			match stream.next().await {
-				Some(Ok(chunk)) => Some((Ok(chunk), (Some(stream), done))),
-				Some(Err(err)) => Some((Err(err), (None, None))),
-				None => done.map(|done| (Ok(done), (None, None))),
-			}
-		},
-	)
-	.fuse();
-	Body::from_stream(stream)
+	body.transform_stream(|body| {
+		let done = crate::parse::encode_sse_event("", Bytes::from_static(b"[DONE]"));
+		let stream = stream::unfold(
+			(Some(body.into_data_stream().boxed()), Some(done)),
+			|(stream, done): (
+				Option<BoxStream<'static, Result<Bytes, axum_core::Error>>>,
+				Option<Bytes>,
+			)| async move {
+				let mut stream = stream?;
+				match stream.next().await {
+					Some(Ok(chunk)) => Some((Ok(chunk), (Some(stream), done))),
+					Some(Err(err)) => Some((Err(err), (None, None))),
+					None => done.map(|done| (Ok(done), (None, None))),
+				}
+			},
+		)
+		.fuse();
+		RawBody::from_stream(stream)
+	})
+}
+
+/// Some upstreams end the stream with a `data: [DONE]` lacking the blank line that terminates
+/// it. Dispatch it rather than failing with `UnexpectedEof`; any other unterminated event still fails.
+struct DoneTolerantSseDecoder(SseDecoder<Bytes>);
+
+impl Decoder for DoneTolerantSseDecoder {
+	type Item = Frame<Bytes>;
+	type Error = SseDecodeError;
+
+	fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+		self.0.decode(src)
+	}
+
+	fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+		match self.0.decode_eof(src) {
+			Err(SseDecodeError::UnexpectedEof) => {
+				src.extend_from_slice(b"\n\n");
+				match self.0.decode_eof(src)? {
+					Some(Frame::Event(e)) if e.data.as_ref() == b"[DONE]" => Ok(Some(Frame::Event(e))),
+					_ => Err(SseDecodeError::UnexpectedEof),
+				}
+			},
+			res => res,
+		}
+	}
 }
 
 pub fn json_passthrough<F: DeserializeOwned>(
@@ -36,7 +64,7 @@ pub fn json_passthrough<F: DeserializeOwned>(
 	buffer_limit: usize,
 	mut f: impl FnMut(Option<anyhow::Result<F>>) + Send + 'static,
 ) -> Body {
-	let decoder = SseDecoder::<Bytes>::with_max_size(buffer_limit);
+	let decoder = DoneTolerantSseDecoder(SseDecoder::with_max_size(buffer_limit));
 
 	passthrough_parser(b, decoder, move |o| {
 		let Some(data) = unwrap_sse_data(o) else {
@@ -56,7 +84,7 @@ pub fn permissive_json_passthrough<F: DeserializeOwned>(
 	buffer_limit: usize,
 	mut f: impl FnMut(Option<anyhow::Result<F>>) + Send + 'static,
 ) -> Body {
-	let decoder = SseDecoder::<Bytes>::with_max_size(buffer_limit);
+	let decoder = DoneTolerantSseDecoder(SseDecoder::with_max_size(buffer_limit));
 
 	crate::parse::passthrough::full_passthrough_parser(b, decoder, move |o| {
 		let Some(data) = unwrap_sse_data(o) else {

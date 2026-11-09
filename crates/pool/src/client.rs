@@ -19,7 +19,7 @@ use futures_util::future::{Either, FutureExt, TryFutureExt, select};
 use futures_util::pin_mut;
 use http::uri::Scheme;
 use hyper::body::{Body, Bytes, Frame, SizeHint};
-use hyper::header::{HOST, HeaderValue};
+use hyper::header::{CONTENT_LENGTH, HOST, HeaderValue, TRAILER, TRANSFER_ENCODING};
 use hyper::rt::Timer;
 use hyper::{Method, Request, Response, Uri, Version};
 use tracing::{debug, trace, warn};
@@ -221,6 +221,14 @@ where
 				// This means we negotiated down in ALPN
 				*req.version_mut() = Version::HTTP_11;
 				trace!("Connection is HTTP/1, but request was HTTP/2");
+			}
+			if req.version() == Version::HTTP_11 && req.headers().contains_key(TRAILER) {
+				// HTTP/2 permits Content-Length alongside trailers, but HTTP/1 requires
+				// chunked framing. Force it even when the body has an exact size hint.
+				req.headers_mut().remove(CONTENT_LENGTH);
+				req
+					.headers_mut()
+					.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
 			}
 
 			let uri = req.uri().clone();
@@ -447,11 +455,28 @@ where
 			// Currently we do not allow exceeding the expected capacity (though it can be less than)
 			let expected = self.pool.settings.expected_http2_capacity;
 			let cur_max = std::cmp::min(conn.current_max_send_streams(), expected);
+			// The peer's SETTINGS arrive asynchronously and may change at any time, so the limit is
+			// read from the connection whenever the pool reserves or releases a stream.
+			let conn = Arc::new(parking_lot::Mutex::new(Some(conn)));
+			let peer_conn = Arc::downgrade(&conn);
+			let load = H2Load::new(cur_max, move || {
+				let conn = peer_conn.upgrade()?;
+				// This is called with the pool lock held, while polling the connection can acquire the
+				// pool lock (by dropping a stream). Do not block; fall back to the last known value.
+				let conn = conn.try_lock()?;
+				Some(std::cmp::min(
+					conn.as_ref()?.current_max_send_streams(),
+					expected,
+				))
+			});
 			trace!("http2 handshake complete, spawning background dispatcher task");
 			executor.execute(
-				conn
-					.map_err(|e| debug!("client connection error: {}", e))
-					.map(|_| ()),
+				poll_fn({
+					let driver = H2Driver(conn);
+					move |cx| driver.poll(cx)
+				})
+				.map_err(|e| debug!("client connection error: {}", e))
+				.map(|_| ()),
 			);
 
 			// Wait for 'conn' to ready up before we
@@ -462,7 +487,7 @@ where
 				tx,
 				// Important: we do NOT reserve the stream slot here yet; we are only establishing a connection
 				// not attaching any requests to it yet.
-				load: Arc::new(H2Load::new(cur_max)),
+				load: Arc::new(load),
 			})
 		} else {
 			// Perform the HTTP/1.1 handshake on the provided I/O stream.
@@ -663,6 +688,25 @@ fn is_schema_secure(uri: &Uri) -> bool {
 		.scheme_str()
 		.map(|scheme_str| matches!(scheme_str, "wss" | "https"))
 		.unwrap_or_default()
+}
+
+/// Drives an HTTP/2 connection whose stream limit the pool also reads.
+/// Only the driver may drop the connection: that drops any queued requests, which return their capacity
+/// to the pool and take the pool lock, which a reader may be holding.
+struct H2Driver<C>(Arc<parking_lot::Mutex<Option<C>>>);
+
+impl<C: Future + Unpin> H2Driver<C> {
+	fn poll(&self, cx: &mut Context<'_>) -> Poll<C::Output> {
+		let mut conn = self.0.lock();
+		Pin::new(conn.as_mut().expect("connection is only taken on drop")).poll(cx)
+	}
+}
+
+impl<C> Drop for H2Driver<C> {
+	fn drop(&mut self) {
+		let conn = self.0.lock().take();
+		drop(conn);
+	}
 }
 
 #[derive(Clone)]
@@ -898,16 +942,6 @@ impl Builder {
 
 	// HTTP/1 options
 
-	/// Sets the exact size of the read buffer to *always* use.
-	///
-	/// Note that setting this option unsets the `http1_max_buf_size` option.
-	///
-	/// Default is an adaptive read buffer.
-	pub fn http1_read_buf_exact_size(&mut self, sz: usize) -> &mut Self {
-		self.h1_builder.read_buf_exact_size(Some(sz));
-		self
-	}
-
 	/// Set the maximum buffer size for the connection.
 	///
 	/// Default is ~400kb.
@@ -919,130 +953,6 @@ impl Builder {
 	/// The minimum value allowed is 8192. This method panics if the passed `max` is less than the minimum.
 	pub fn http1_max_buf_size(&mut self, max: usize) -> &mut Self {
 		self.h1_builder.max_buf_size(max);
-		self
-	}
-
-	/// Set whether HTTP/1 connections will accept spaces between header names
-	/// and the colon that follow them in responses.
-	///
-	/// Newline codepoints (`\r` and `\n`) will be transformed to spaces when
-	/// parsing.
-	///
-	/// You probably don't need this, here is what [RFC 7230 Section 3.2.4.] has
-	/// to say about it:
-	///
-	/// > No whitespace is allowed between the header field-name and colon. In
-	/// > the past, differences in the handling of such whitespace have led to
-	/// > security vulnerabilities in request routing and response handling. A
-	/// > server MUST reject any received request message that contains
-	/// > whitespace between a header field-name and colon with a response code
-	/// > of 400 (Bad Request). A agentgateway MUST remove any such whitespace from a
-	/// > response message before forwarding the message downstream.
-	///
-	/// Note that this setting does not affect HTTP/2.
-	///
-	/// Default is false.
-	///
-	/// [RFC 7230 Section 3.2.4.]: https://tools.ietf.org/html/rfc7230#section-3.2.4
-	pub fn http1_allow_spaces_after_header_name_in_responses(&mut self, val: bool) -> &mut Self {
-		self
-			.h1_builder
-			.allow_spaces_after_header_name_in_responses(val);
-		self
-	}
-
-	/// Set whether HTTP/1 connections will accept obsolete line folding for
-	/// header values.
-	///
-	/// You probably don't need this, here is what [RFC 7230 Section 3.2.4.] has
-	/// to say about it:
-	///
-	/// > A server that receives an obs-fold in a request message that is not
-	/// > within a message/http container MUST either reject the message by
-	/// > sending a 400 (Bad Request), preferably with a representation
-	/// > explaining that obsolete line folding is unacceptable, or replace
-	/// > each received obs-fold with one or more SP octets prior to
-	/// > interpreting the field value or forwarding the message downstream.
-	///
-	/// > A agentgateway or gateway that receives an obs-fold in a response message
-	/// > that is not within a message/http container MUST either discard the
-	/// > message and replace it with a 502 (Bad Gateway) response, preferably
-	/// > with a representation explaining that unacceptable line folding was
-	/// > received, or replace each received obs-fold with one or more SP
-	/// > octets prior to interpreting the field value or forwarding the
-	/// > message downstream.
-	///
-	/// > A user agent that receives an obs-fold in a response message that is
-	/// > not within a message/http container MUST replace each received
-	/// > obs-fold with one or more SP octets prior to interpreting the field
-	/// > value.
-	///
-	/// Note that this setting does not affect HTTP/2.
-	///
-	/// Default is false.
-	///
-	/// [RFC 7230 Section 3.2.4.]: https://tools.ietf.org/html/rfc7230#section-3.2.4
-	pub fn http1_allow_obsolete_multiline_headers_in_responses(&mut self, val: bool) -> &mut Self {
-		self
-			.h1_builder
-			.allow_obsolete_multiline_headers_in_responses(val);
-		self
-	}
-
-	/// Sets whether invalid header lines should be silently ignored in HTTP/1 responses.
-	///
-	/// This mimics the behaviour of major browsers. You probably don't want this.
-	/// You should only want this if you are implementing a agentgateway whose main
-	/// purpose is to sit in front of browsers whose users access arbitrary content
-	/// which may be malformed, and they expect everything that works without
-	/// the agentgateway to keep working with the agentgateway.
-	///
-	/// This option will prevent Hyper's client from returning an error encountered
-	/// when parsing a header, except if the error was caused by the character NUL
-	/// (ASCII code 0), as Chrome specifically always reject those.
-	///
-	/// The ignorable errors are:
-	/// * empty header names;
-	/// * characters that are not allowed in header names, except for `\0` and `\r`;
-	/// * when `allow_spaces_after_header_name_in_responses` is not enabled,
-	///   spaces and tabs between the header name and the colon;
-	/// * missing colon between header name and colon;
-	/// * characters that are not allowed in header values except for `\0` and `\r`.
-	///
-	/// If an ignorable error is encountered, the parser tries to find the next
-	/// line in the input to resume parsing the rest of the headers. An error
-	/// will be emitted nonetheless if it finds `\0` or a lone `\r` while
-	/// looking for the next line.
-	pub fn http1_ignore_invalid_headers_in_responses(&mut self, val: bool) -> &mut Builder {
-		self.h1_builder.ignore_invalid_headers_in_responses(val);
-		self
-	}
-
-	/// Set whether HTTP/1 connections should try to use vectored writes,
-	/// or always flatten into a single buffer.
-	///
-	/// Note that setting this to false may mean more copies of body data,
-	/// but may also improve performance when an IO transport doesn't
-	/// support vectored writes well, such as most TLS implementations.
-	///
-	/// Setting this to true will force hyper to use queued strategy
-	/// which may eliminate unnecessary cloning on some TLS backends
-	///
-	/// Default is `auto`. In this mode hyper will try to guess which
-	/// mode to use
-	pub fn http1_writev(&mut self, enabled: bool) -> &mut Builder {
-		self.h1_builder.writev(enabled);
-		self
-	}
-
-	/// Set whether HTTP/1 connections will write header names as title case at
-	/// the socket level.
-	///
-	/// Note that this setting does not affect HTTP/2.
-	///
-	/// Default is false.
-	pub fn http1_title_case_headers(&mut self, val: bool) -> &mut Self {
-		self.h1_builder.title_case_headers(val);
 		self
 	}
 
@@ -1084,20 +994,6 @@ impl Builder {
 		self
 	}
 
-	/// Configures the maximum number of pending reset streams allowed before a GOAWAY will be sent.
-	///
-	/// This will default to the default value set by the [`h2` crate](https://crates.io/crates/h2).
-	/// As of v0.4.0, it is 20.
-	///
-	/// See <https://github.com/hyperium/hyper/issues/2877> for more information.
-	pub fn http2_max_pending_accept_reset_streams(
-		&mut self,
-		max: impl Into<Option<usize>>,
-	) -> &mut Self {
-		self.h2_builder.max_pending_accept_reset_streams(max.into());
-		self
-	}
-
 	/// Sets the [`SETTINGS_INITIAL_WINDOW_SIZE`][spec] option for HTTP2
 	/// stream-level flow control.
 	///
@@ -1118,41 +1014,6 @@ impl Builder {
 	/// If not set, hyper will use a default.
 	pub fn http2_initial_connection_window_size(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
 		self.h2_builder.initial_connection_window_size(sz.into());
-		self
-	}
-
-	/// Sets the initial maximum of locally initiated (send) streams.
-	///
-	/// This value will be overwritten by the value included in the initial
-	/// SETTINGS frame received from the peer as part of a [connection preface].
-	///
-	/// Passing `None` will do nothing.
-	///
-	/// If not set, hyper will use a default.
-	///
-	/// [connection preface]: https://httpwg.org/specs/rfc9113.html#preface
-	pub fn http2_initial_max_send_streams(&mut self, initial: impl Into<Option<usize>>) -> &mut Self {
-		self.h2_builder.initial_max_send_streams(initial);
-		self
-	}
-
-	/// Sets whether to use an adaptive flow control.
-	///
-	/// Enabling this will override the limits set in
-	/// `http2_initial_stream_window_size` and
-	/// `http2_initial_connection_window_size`.
-	pub fn http2_adaptive_window(&mut self, enabled: bool) -> &mut Self {
-		self.h2_builder.adaptive_window(enabled);
-		self
-	}
-
-	/// Sets the maximum frame size to use for HTTP2.
-	///
-	/// Passing `None` will do nothing.
-	///
-	/// If not set, hyper will use a default.
-	pub fn http2_max_frame_size(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
-		self.h2_builder.max_frame_size(sz);
 		self
 	}
 
@@ -1199,19 +1060,6 @@ impl Builder {
 		self
 	}
 
-	/// Sets the maximum number of HTTP2 concurrent locally reset streams.
-	///
-	/// See the documentation of [`h2::client::Builder::max_concurrent_reset_streams`] for more
-	/// details.
-	///
-	/// The default value is determined by the `h2` crate.
-	///
-	/// [`h2::client::Builder::max_concurrent_reset_streams`]: https://docs.rs/h2/client/struct.Builder.html#method.max_concurrent_reset_streams
-	pub fn http2_max_concurrent_reset_streams(&mut self, max: usize) -> &mut Self {
-		self.h2_builder.max_concurrent_reset_streams(max);
-		self
-	}
-
 	/// Provide a timer to be used for h2
 	///
 	/// See the documentation of [`h2::client::Builder::timer`] for more
@@ -1232,18 +1080,6 @@ impl Builder {
 		M: Timer + Clone + Send + Sync + 'static,
 	{
 		self.pool_timer = Some(timer::Timer::new(timer.clone()));
-		self
-	}
-
-	/// Set the maximum write buffer size for each HTTP/2 stream.
-	///
-	/// Default is currently 1MB, but may change.
-	///
-	/// # Panics
-	///
-	/// The value must be no larger than `u32::MAX`.
-	pub fn http2_max_send_buf_size(&mut self, max: usize) -> &mut Self {
-		self.h2_builder.max_send_buf_size(max);
 		self
 	}
 
@@ -1335,5 +1171,26 @@ impl Error {
 
 	fn tx(src: hyper::Error) -> Self {
 		e!(SendRequest, src)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn h2_driver_drops_connection_outside_lock() {
+		struct Conn(std::sync::Weak<parking_lot::Mutex<Option<Conn>>>);
+		impl Drop for Conn {
+			fn drop(&mut self) {
+				// Dropping the connection can take the pool lock; it must not happen under this one.
+				let shared = self.0.upgrade().expect("shared handle is alive");
+				assert!(shared.try_lock().is_some());
+			}
+		}
+		let shared = Arc::new_cyclic(|w| parking_lot::Mutex::new(Some(Conn(w.clone()))));
+		// The pool may still hold the shared handle; the driver must destroy the connection anyway.
+		drop(H2Driver(shared.clone()));
+		assert!(shared.lock().is_none());
 	}
 }

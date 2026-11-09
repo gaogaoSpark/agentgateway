@@ -2,7 +2,13 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useState } from 'react';
 
 import { getBudgetStatus } from '@/api/budgetsApi';
-import { getConfig, getEffectiveConfig, writeConfig } from '@/api/configApi';
+import {
+	getConfig,
+	getEffectiveConfig,
+	getRawConfig,
+	writeConfig,
+	writeRawConfig
+} from '@/api/configApi';
 import { getConfigDump } from '@/api/configDumpApi';
 import {
 	type ConfigResourceKind,
@@ -14,7 +20,13 @@ import {
 	updateConfigResource
 } from '@/api/configResourcesApi';
 import { getRuntimeInfo } from '@/api/runtimeApi';
-import { cloneConfig, configWarnings } from '@/config';
+import {
+	cloneConfig,
+	configWarnings,
+	enableTrafficConfig,
+	startupLlmConfig,
+	startupMcpConfig
+} from '@/config';
 import { validateGatewayConfig } from '@/configValidation';
 import type { GatewayConfig, LlmApiKeyPolicy, LlmConfig } from '@/types';
 
@@ -48,10 +60,26 @@ export function useHybridFileWriteOverrideKeys() {
 	return active;
 }
 
+/** Skips in-flight saves: a reset stops observing them, so a failure would never be shown. */
+export function resetFinishedSaves(...saves: { isPending: boolean; reset: () => void }[]) {
+	for (const save of saves) {
+		if (!save.isPending) save.reset();
+	}
+}
+
 export function useRawGatewayConfig(options?: { enabled?: boolean }) {
 	return useQuery({
 		queryKey: ['config'],
 		queryFn: getConfig,
+		enabled: options?.enabled ?? true,
+		retry: false
+	});
+}
+
+export function useRawConfigText(options?: { enabled?: boolean }) {
+	return useQuery({
+		queryKey: ['rawConfigText'],
+		queryFn: getRawConfig,
 		enabled: options?.enabled ?? true,
 		retry: false
 	});
@@ -202,7 +230,7 @@ async function requireWritableRuntime(queryClient: ReturnType<typeof useQueryCli
 	const runtime =
 		queryClient.getQueryData<Awaited<ReturnType<typeof getRuntimeInfo>>>(['runtime']) ??
 		(await getRuntimeInfo());
-	if (runtime.ui.configStoreMode == 'readOnly') {
+	if (runtime.ui.configStoreMode === 'readOnly') {
 		throw new Error('The UI is configured as read-only.');
 	}
 	return runtime;
@@ -211,23 +239,44 @@ async function requireWritableRuntime(queryClient: ReturnType<typeof useQueryCli
 function invalidateConfigViews(queryClient: ReturnType<typeof useQueryClient>) {
 	void queryClient.invalidateQueries({ queryKey: ['configResources'] });
 	void queryClient.invalidateQueries({ queryKey: ['config'] });
+	void queryClient.invalidateQueries({ queryKey: ['rawConfigText'] });
 	void queryClient.invalidateQueries({ queryKey: ['effectiveConfig'] });
 	void queryClient.invalidateQueries({ queryKey: ['runtime'] });
 	void queryClient.invalidateQueries({ queryKey: ['config_dump'] });
 	void queryClient.invalidateQueries({ queryKey: ['config_dump_mode'] });
 }
 
+async function requireWritableConfigFile(queryClient: ReturnType<typeof useQueryClient>) {
+	const runtime = await requireWritableRuntime(queryClient);
+	const overrideHybridFileWrite = takeHybridFileWriteOverride();
+	if (runtime.ui.configStoreMode === 'hybrid' && !overrideHybridFileWrite) {
+		throw new Error(
+			'File configuration is read-only in hybrid mode. Copy the diff and update the configuration file directly.'
+		);
+	}
+}
+
+/** Writes the configuration file text verbatim, keeping comments and formatting. */
+export function useUpdateRawConfig() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: async (text: string) => {
+			await requireWritableConfigFile(queryClient);
+			await writeRawConfig(text);
+			return text;
+		},
+		onSuccess: text => {
+			queryClient.setQueryData(['rawConfigText'], text);
+			invalidateConfigViews(queryClient);
+		}
+	});
+}
+
 export function useUpdateConfig() {
 	const queryClient = useQueryClient();
 	return useMutation({
-		mutationFn: async (updater: (config: GatewayConfig) => GatewayConfig | void) => {
-			const runtime = await requireWritableRuntime(queryClient);
-			const overrideHybridFileWrite = takeHybridFileWriteOverride();
-			if (runtime.ui.configStoreMode === 'hybrid' && !overrideHybridFileWrite) {
-				throw new Error(
-					'File configuration is read-only in hybrid mode. Copy the diff and update the configuration file directly.'
-				);
-			}
+		mutationFn: async (updater: (config: GatewayConfig) => GatewayConfig | undefined) => {
+			await requireWritableConfigFile(queryClient);
 			const current = queryClient.getQueryData<GatewayConfig>(['config']) ?? (await getConfig());
 			const next = cloneConfig(current);
 			const returned = updater(next);
@@ -240,6 +289,53 @@ export function useUpdateConfig() {
 			queryClient.setQueryData(['config'], next);
 			invalidateConfigViews(queryClient);
 		}
+	});
+}
+
+export function useEnableSurface() {
+	const queryClient = useQueryClient();
+	const update = useUpdateConfig();
+	return useMutation({
+		mutationFn: async ({
+			surface,
+			gateway
+		}: {
+			surface: 'llm' | 'mcp' | 'traffic';
+			gateway?: string;
+		}) => {
+			const runtime = await requireWritableRuntime(queryClient);
+			const hybrid = runtime.ui.configStoreMode === 'hybrid';
+			function apply(next: GatewayConfig) {
+				if (surface === 'llm') {
+					next.llm ??= startupLlmConfig(next, gateway);
+				} else if (surface === 'mcp') {
+					next.mcp ??= startupMcpConfig(next, gateway);
+				} else {
+					enableTrafficConfig(next);
+				}
+			}
+			if (!hybrid) {
+				await update.mutateAsync(next => {
+					apply(next);
+				});
+				return { hybrid };
+			}
+			const current = await getEffectiveConfig();
+			if (surface !== 'traffic' && current[surface]) return { hybrid };
+			const next = cloneConfig(current);
+			apply(next);
+			const gateways = Object.entries(next.gateways ?? {})
+				.filter(([name]) => !current.gateways?.[name])
+				.map(([name, value]) => ({ ...value, name }));
+			if (gateways.length) await putConfigResources('traffic.gateway', gateways);
+			if (surface === 'llm') {
+				await putConfigResources('llm.settings', [{ gateways: next.llm?.gateways }]);
+			} else if (surface === 'mcp') {
+				await putConfigResources('mcp.settings', [{ gateways: next.mcp?.gateways }]);
+			}
+			return { hybrid };
+		},
+		onSettled: () => invalidateConfigViews(queryClient)
 	});
 }
 

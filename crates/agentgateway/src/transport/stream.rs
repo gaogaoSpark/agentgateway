@@ -321,10 +321,6 @@ impl Socket {
 		&mut self.ext
 	}
 
-	pub fn must_ext<T: Send + Sync + 'static>(&self) -> &T {
-		self.ext().expect("expected required extension")
-	}
-
 	pub fn tcp(&self) -> &TCPConnectionInfo {
 		self.ext.get::<TCPConnectionInfo>().unwrap()
 	}
@@ -577,6 +573,10 @@ pub enum Extension {
 /// with other `HeaderMap`-typed extensions in the type-keyed `Extension` map.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectHeaders(pub http::HeaderMap);
+
+/// Original CONNECT request target, independent of HTTP version and Host headers.
+#[derive(Clone, Debug)]
+pub struct ConnectAuthority(pub http::uri::Authority);
 
 impl Default for Extension {
 	fn default() -> Self {

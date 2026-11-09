@@ -15,6 +15,8 @@
 |`request.bodyPrefix`|string|The request body buffered up to `maxBufferSize`. If the complete body exceeds the limit,<br>this contains the first `maxBufferSize` bytes.|
 |`request.startTime`|string|The time the request started|
 |`request.endTime`|string|The time the request completed|
+|`request.agent`|object|The agent harness that sent the request.|
+|`request.agent.session`|string|The agent session the request belongs to, from `standardAttributes.session` or detected from<br>well-known agent headers such as `x-claude-code-session-id`.|
 |`response`|object|`response` contains attributes about the HTTP response|
 |`response.code`|integer|The HTTP status code of the response.|
 |`response.grpcStatus`|integer|The gRPC status code of the response, when present.|
@@ -22,6 +24,9 @@
 |`response.body`|string|The response's body, buffered up to `maxBufferSize`. If the body exceeds the max buffer size,<br>this field is not available and will fail to evaluate.<br>Including this attribute in an expression will trigger the body to be buffered.|
 |`response.bodyPrefix`|string|The response body buffered up to `maxBufferSize`. If the complete body exceeds the limit,<br>this contains the first `maxBufferSize` bytes.|
 |`proxy`|object|`proxy` contains proxy timing information for the request.|
+|`proxy.error`|object|The final gateway error when the response was synthesized from a failed request.|
+|`proxy.error.reason`|string|Broad classification of the failure, such as `UpstreamFailure` or `Timeout`.|
+|`proxy.error.message`|string|Human-readable failure detail. Exact message is subject to change.|
 |`proxy.bind`|string|The bind that accepted the request.|
 |`proxy.gateway`|object|The selected Gateway.|
 |`proxy.gateway.namespace`|string|The namespace of the selected Gateway.|
@@ -42,13 +47,16 @@
 |`env.gateway`|string|The Gateway we are running as (when running on Kubernetes)|
 |`jwt`|object|`jwt` contains the claims from a verified JWT token. This is only present if the JWT policy is enabled.|
 |`jwt.rawToken`|string|The raw bearer token. Redacted by default; use `jwt.rawToken.unredacted()` to access the actual value.|
-|`apiKey`|object|`apiKey` contains the claims from a verified API Key. This is only present if the API Key policy is enabled.|
+|`jwt.*`|any||
+|`apiKey`|object|`apiKey` contains the claims from a verified API Key. This is only present if the API Key policy is enabled.<br>In addition to `key`, user-supplied metadata fields are flattened into this object; for example,<br>`apiKey.group`. Metadata values are plain JSON and are not treated as secrets.|
 |`apiKey.key`|string|The API key value. Redacted by default; use `apiKey.key.unredacted()` to access the actual value.|
+|`apiKey.*`|any||
 |`basicAuth`|object|`basicAuth` contains the claims from a verified basic authentication Key. This is only present if the Basic authentication policy is enabled.|
 |`basicAuth.username`|string||
 |`llm`|object|`llm` contains attributes about an LLM request or response. This is only present when using an `ai` backend.|
 |`llm.streaming`|boolean|Whether the LLM response is streamed. If it is streamed some fields may be inconsistent based on when accessed during the response flow.|
-|`llm.requestModel`|string|The model requested for the LLM request. This may differ from the actual model used.|
+|`llm.requestModel`|string|The model requested for the LLM request. Before LLM processing, this is extracted from<br>the incoming URL or body, before provider overrides. This may differ from the actual model used.|
+|`llm.originalModel`|string|The model the client asked for, before any virtual model, alias, provider override, or<br>request body rewrite. Equal to `requestModel` when the model was not rewritten.|
 |`llm.responseModel`|string|The model that actually served the LLM response.|
 |`llm.provider`|string|The provider of the LLM.|
 |`llm.inputTokens`|integer|The total number of tokens in the input/prompt, including tokens read from or written to<br>cache. This has consistent semantics across providers.|
@@ -56,6 +64,7 @@
 |`llm.inputImageTokens`|integer|The number of image tokens in the input/prompt.|
 |`llm.inputTextTokens`|integer|The number of text tokens in the input/prompt.<br>Note: this field is only set in multi-modal calls where the total token count is split out by<br>text/image/audio; for standard all-text calls, this is unset.|
 |`llm.inputAudioTokens`|integer|The number of audio tokens in the input/prompt.|
+|`llm.audioSeconds`|number|Seconds of input audio, for models billed by duration rather than tokens (such as `whisper-1`).|
 |`llm.cachedInputTokens`|integer|The number of tokens in the input/prompt read from cache (savings)|
 |`llm.cacheCreationInputTokens`|integer|Tokens written to cache (costs)|
 |`llm.outputTokens`|integer|The number of tokens in the output/completion.|
@@ -65,7 +74,7 @@
 |`llm.reasoningTokens`|integer|The number of reasoning tokens in the output/completion.|
 |`llm.totalTokens`|integer|The total number of input and output tokens for the request. Input tokens include tokens read<br>from or written to cache, giving this field consistent semantics across providers.|
 |`llm.providerTotalTokens`|integer|The provider-reported total number of tokens for the request. This is inconsistent across<br>providers because some include cached input tokens while others exclude them.|
-|`llm.serviceTier`|string|The service tier the provider served the request under.|
+|`llm.serviceTier`|enum|The service tier the provider served the request under.<br>Possible values: `standard`, `flex`, `priority`, `reserved`, `ultrafast`, `null`.|
 |`llm.timeToFirstToken`|string|Time from request start until the first response token is received.|
 |`llm.timePerOutputToken`|string|Average time from first response token to response completion per output token.|
 |`llm.countTokens`|integer|The number of tokens in the request, when using the token counting endpoint<br>These are not counted as 'input tokens' since they do not consume input tokens.|
@@ -86,24 +95,59 @@
 |`llm.params.max_tokens`|integer||
 |`llm.params.encoding_format`|string||
 |`llm.params.dimensions`|integer||
+|`llm.params.reasoning_effort`|enum|The reasoning effort requested by the client: OpenAI `reasoning_effort` or<br>`reasoning.effort`, Anthropic `output_config.effort`, or Gemini `thinkingLevel`.<br>Unset when the request does not specify one, in which case the provider default applies.<br>Possible values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `null`.|
 |`llm.cost`|object|The realized USD cost of the request from the model cost catalog.<br>Unset when the model could not be priced.|
 |`llm.cost.total`|number||
 |`llm.cost.input`|number||
 |`llm.cost.output`|number||
 |`llm.cost.cacheRead`|number||
 |`llm.cost.cacheWrite`|number||
+|`llm.cost.cacheWriteDetails`|object||
+|`llm.cost.cacheWriteDetails.1h`|number||
+|`llm.cost.cacheWriteDetails.12h`|number||
 |`llm.cost.reasoning`|number||
 |`llm.cost.inputAudio`|number||
 |`llm.cost.outputAudio`|number||
+|`llm.cost.pages`|number||
+|`llm.cost.audioDuration`|number||
 |`llm.costRates`|object|Effective model catalog rates in USD per 1M tokens after tier selection.<br>Unset when the model could not be priced.|
 |`llm.costRates.input`|number||
 |`llm.costRates.output`|number||
 |`llm.costRates.cacheRead`|number||
 |`llm.costRates.cacheWrite`|number||
+|`llm.costRates.cacheWriteDetails`|object||
+|`llm.costRates.cacheWriteDetails.1h`|number||
+|`llm.costRates.cacheWriteDetails.12h`|number||
 |`llm.costRates.reasoning`|number||
 |`llm.costRates.inputAudio`|number||
 |`llm.costRates.outputAudio`|number||
-|`llmRequest`|any|`llmRequest` contains the raw LLM request before processing. This is only present *during* LLM policies;<br>policies occurring after the LLM policy, such as logs, will not have this field present even for LLM requests.|
+|`llm.costRates.perPage`|number||
+|`llm.costRates.perAudioMinute`|number||
+|`llm.model`|object|Model catalog metadata for the model that served the request.<br>Unset when the model is not in the catalog.|
+|`llm.model.id`|string|The catalog model ID the request resolved to.|
+|`llm.model.name`|string|Human-readable display name.|
+|`llm.model.status`|string|Lifecycle stage (alpha, beta, deprecated); absent means generally available.|
+|`llm.model.released`|string|Release date, as YYYY-MM-DD or YYYY-MM.|
+|`llm.model.tags`|[]string|Freeform capability/routing tags for this model.|
+|`llm.model.limits`|object|Token limits.|
+|`llm.model.limits.context`|integer|Total context window, shared by input and output.|
+|`llm.model.limits.input`|integer|Maximum input tokens, when tighter than the context window allows.|
+|`llm.model.limits.output`|integer|Maximum output tokens.|
+|`llm.model.modalities`|object|Supported input and output modalities.|
+|`llm.model.modalities.input`|[]string|Input modalities, such as text, image, pdf, audio, or video.|
+|`llm.model.modalities.output`|[]string|Output modalities, such as text, image, audio, or video.|
+|`llm.model.capabilities`|object|Supported features. Absent fields are unknown.|
+|`llm.model.capabilities.reasoning`|boolean|Whether the model supports reasoning.|
+|`llm.model.capabilities.structuredOutput`|boolean|Whether the model supports JSON Schema structured outputs.|
+|`llm.model.capabilities.toolCall`|boolean|Whether the model supports tool calling.|
+|`llm.model.capabilities.temperature`|boolean|Whether the model accepts the temperature parameter.|
+|`llm.model.reasoning`|object|How reasoning can be controlled.|
+|`llm.model.reasoning.toggle`|boolean|Whether reasoning can be turned on and off.|
+|`llm.model.reasoning.effort`|[]string|Accepted effort levels.|
+|`llm.model.reasoning.budgetTokens`|object|Accepted reasoning token budget range.|
+|`llm.model.reasoning.budgetTokens.min`|integer|Minimum reasoning token budget.|
+|`llm.model.reasoning.budgetTokens.max`|integer|Maximum reasoning token budget.|
+|`llmRequest`|any|`llmRequest` contains the raw JSON LLM request during route and LLM policies.<br>Policies occurring after LLM processing, such as logs, will not have this field present.|
 |`source`|object|`source` contains attributes about the source of the request.|
 |`source.address`|string|The IP address of the downstream connection.|
 |`source.port`|integer|The port of the downstream connection.|
@@ -128,13 +172,16 @@
 |`destination.address`|string|The IP address of the downstream request destination at agentgateway.|
 |`destination.port`|integer|The port of the downstream request destination at agentgateway.|
 |`destination.hostname`|string|The requested destination hostname, when known. For TLS connections this is the sniffed SNI.|
-|`mcp`|object|`mcp` contains attributes about the MCP request.<br>Request-time CEL only includes identity fields such as `tool`, `prompt`, or `resource`.<br>Post-request CEL may also include fields like `methodName`, `sessionId`, and tool payloads.|
+|`mcp`|object|`mcp` contains attributes about the MCP request.<br>Request-time CEL includes identity fields (`tool`, `prompt`, `resource`,<br>`task`) plus `methodName`. Post-request CEL may also include fields like<br>`sessionId`, tool payloads, and list results.|
 |`mcp.methodName`|string||
 |`mcp.sessionId`|string||
+|`mcp.target`|object||
+|`mcp.target.name`|string|The MCP target for the current target-scoped operation.|
 |`mcp.tool`|object||
 |`mcp.tool.target`|string|The target handling the tool call after multiplexing resolution.|
 |`mcp.tool.name`|string|The resolved tool name sent to the upstream target.|
 |`mcp.tool.arguments`|object|The JSON arguments passed to the tool call.|
+|`mcp.tool.arguments.*`|any||
 |`mcp.tool.result`|any|The terminal tool result payload, if available.|
 |`mcp.tool.error`|any|The terminal JSON-RPC error payload, if available.|
 |`mcp.prompt`|object||
@@ -146,19 +193,41 @@
 |`mcp.task`|object||
 |`mcp.task.target`|string|The target handling the task.|
 |`mcp.task.name`|string|The task ID.|
+|`mcp.toolsList`|any|The terminal tools/list result returned to the client, if available.|
+|`mcp.promptsList`|any|The terminal prompts/list result returned to the client, if available.|
+|`mcp.resourcesList`|any|The terminal resources/list result returned to the client, if available.|
+|`mcp.resourceTemplatesList`|any|The terminal resources/templates/list result returned to the client, if available.|
+|`mcp.params`|any|Current request parameters, with the same structure as the `params` object in an MCP request.<br>Available only during request-phase CEL guardrails.|
+|`mcp.result`|any|Current response result, with the same structure as the `result` object in an MCP response.<br>Available only during response-phase CEL guardrails.|
 |`backend`|object|`backend` contains information about the backend being used.|
 |`backend.name`|string|The name of the backend being used. For example, `my-service` or `service/my-namespace/my-service:8080`.|
+|`backend.endpoint`|string|The resolved target for directly addressed backends, including the port for network endpoints.<br>Absent for Service backends, whose workload endpoints are selected separately.|
 |`backend.type`|enum|The type of backend.<br>Possible values: `ai`, `mcp`, `static`, `dynamic`, `service`, `unknown`.|
 |`backend.protocol`|enum|The protocol of backend.<br>Possible values: `http`, `tcp`, `a2a`, `mcp`, `llm`.|
 |`extauthz`|object|`extauthz` contains dynamic metadata from ext_authz filters|
+|`extauthz.*`|any||
 |`extproc`|object|`extproc` contains dynamic metadata from ext_proc filters|
+|`extproc.*`|any||
 |`mcpGuardrails`|object|`mcpGuardrails` contains dynamic metadata returned by mcpGuardrails policy processors.|
-|`guardrails`|[]object|`guardrails` contains one entry per prompt-guard guardrail intervention, in either the<br>request or response phase. Only present in CEL that runs after the request completes,<br>such as log and metric fields.|
-|`guardrails[].phase`|string|The phase the guardrail intervened in: `request` or `response`.|
-|`guardrails[].guard`|string|The guard kind that intervened, such as `bedrockGuardrails`.|
-|`guardrails[].action`|string|The action the guardrail took (mask/reject/audit/failOpen).|
+|`mcpGuardrails.*`|any||
+|`guardrails`|[]object|`guardrails` contains entries for prompt-guard guardrail evaluations, in either the<br>request or response phase. Only present in CEL that runs after the request completes,<br>such as log and metric fields.|
+|`guardrails[].phase`|string|The phase the guardrail was evaluated in: `request` or `response`.|
+|`guardrails[].guard`|string|The guard kind that was evaluated, such as `bedrockGuardrails`.|
+|`guardrails[].action`|enum|The action the guardrail took.<br>Possible values: `allow`, `failOpen`, `audit`, `mask`, `reject`.|
 |`guardrails[].guardrailId`|string|The configured guardrail identifier.|
 |`guardrails[].guardrailVersion`|string|The configured guardrail version.|
 |`guardrails[].actionReason`|string|The reason the guardrail reported for its action.|
 |`guardrails[].assessments`|array|Assessment detail reported by the guardrail provider, redacted to metadata<br>only. Content-bearing fields (such as the matched text) are never included.|
+|`upstreamCalls`|[]object|`upstreamCalls` lists the outbound calls made for this request, such as MCP target and policy calls.<br>It's only filled in for access log expressions that reference it.<br>Its request headers are the ones sent to the backend. `request.headers` still has the client's headers.|
+|`upstreamCalls[].kind`|enum|Call category: `Primary` (backend request) or `Policy` (policy callout).<br>Possible values: `Primary`, `Policy`, `Mirror`.|
+|`upstreamCalls[].subtype`|string|Call subtype: `Http`, `Llm`, `Mcp`, `ExtAuthz`, `Substrate`, `ExtProc`,<br>`Guardrail`, `RateLimit`, `Oidc`, `Callout`, or a custom subtype name.|
+|`upstreamCalls[].target`|string|The MCP target name for MCP calls, otherwise the connection address (host:port).|
+|`upstreamCalls[].request`|object||
+|`upstreamCalls[].request.headers`|object|Headers sent to the backend, after backend auth. Tunnel proxy credentials are left out.|
+|`upstreamCalls[].response`|object||
+|`upstreamCalls[].response.code`|integer|HTTP status code. Empty when no response came back.|
+|`upstreamCalls[].response.grpcStatus`|integer|gRPC status code, from the response headers or trailers.<br>Trailers that arrive after the access log is written aren't included.|
+|`upstreamCalls[].duration`|string|Time from before DNS resolution through response headers, including connection setup.|
+|`upstreamCalls[].error`|string|Error description when the call fails. Exact wording may change between versions.|
 |`metadata`|object|`metadata` contains values set by transformation metadata expressions.|
+|`metadata.*`|any||

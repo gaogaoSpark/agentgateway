@@ -5,8 +5,6 @@ pub mod timeout;
 pub mod budget;
 pub mod buffer;
 pub mod bufferbody;
-mod buflist;
-pub mod cors;
 pub mod delay;
 pub mod jwt;
 pub mod localratelimit;
@@ -21,14 +19,17 @@ pub mod basicauth;
 pub mod compression;
 pub mod csrf;
 pub mod envoy_proto_common;
+pub mod expiring_cache;
 pub mod ext_authz;
 pub mod ext_proc;
+#[cfg(any(test, feature = "internal_benches"))]
+#[path = "normalize_tests.rs"]
+mod normalize_tests;
 pub(crate) mod oauth;
 pub mod oidc;
 pub mod outlierdetection;
-mod peekbody;
-mod recordbody;
 pub mod remoteratelimit;
+pub mod session;
 pub mod sessionaffinity;
 pub mod sessionpersistence;
 pub mod substrate;
@@ -36,10 +37,11 @@ pub mod tests_common;
 pub mod transformation_cel;
 
 pub use agent_http::{
-	Body, BufferLimit, Error, Request, Response, buffer_limit, read_body_with_limit,
-	response_buffer_limit, x_headers,
+	Body, BodyContent, BodyInspection, BufferLimit, Error, PolicyResponse, RawBody, RecordedBody,
+	RecordedBodyHandle, Request, RequestBodyExt, Response, ResponseBodyExt, SyncResponse,
+	buffer_limit, merge_in_headers, read_body_with_limit, response_buffer_limit, x_headers,
 };
-pub use recordbody::{RecordedBody, RecordedBodyHandle};
+pub use agent_policy_cors as cors;
 
 pub(crate) fn mark_sensitive_headers(req: &mut Request, configured: &[HeaderName]) {
 	for (name, value) in req.headers_mut() {
@@ -88,34 +90,6 @@ pub(crate) fn strip_request_cookies_by_prefix(req: &mut Request, prefix: &str) {
 	}
 }
 
-// SendDirectResponse is a Response that has been buffered so that it is Send.
-pub struct SendDirectResponse(pub ::http::Response<Bytes>);
-
-impl Debug for SendDirectResponse {
-	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("SendDirectResponse")
-			.field("status", &self.0.status())
-			.finish()
-	}
-}
-
-impl Deref for SendDirectResponse {
-	type Target = ::http::Response<Bytes>;
-
-	fn deref(&self) -> &Self::Target {
-		&self.0
-	}
-}
-
-impl SendDirectResponse {
-	pub async fn new(response: Response) -> Result<Self, Error> {
-		let (head, bytes) = read_response_body(response).await?;
-		Ok(SendDirectResponse(::http::Response::from_parts(
-			head, bytes,
-		)))
-	}
-}
-
 pub fn version_str(v: &http::Version) -> &'static str {
 	match *v {
 		http::Version::HTTP_09 => "HTTP/0.9",
@@ -147,6 +121,13 @@ impl<'a> From<&'a mut Response> for RequestOrResponse<'a> {
 }
 
 impl RequestOrResponse<'_> {
+	pub fn replace_body_bytes(&mut self, bytes: Bytes) {
+		match self {
+			Self::Request(req) => req.replace_body_bytes(bytes),
+			Self::Response(resp) => resp.replace_body_bytes(bytes),
+		}
+	}
+
 	pub fn headers(&mut self) -> &mut http::HeaderMap {
 		match self {
 			RequestOrResponse::Request(r) => r.headers_mut(),
@@ -159,6 +140,7 @@ impl RequestOrResponse<'_> {
 			RequestOrResponse::Response(r) => r.body_mut(),
 		}
 	}
+
 	pub fn apply_header(
 		&mut self,
 		k: &HeaderOrPseudo,
@@ -251,29 +233,25 @@ impl RequestOrResponse<'_> {
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
-use std::ops::Deref;
-use std::pin::Pin;
 use std::str::FromStr;
-use std::task::{Context, Poll};
 
 pub use ::http::uri::{Authority, Scheme};
 pub use ::http::{
 	HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header, status, uri,
 };
-use axum_core::BoxError;
 use bytes::Bytes;
 use cel::Value;
 use http::uri::PathAndQuery;
-use http_body::{Frame, SizeHint};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tower_serve_static::private::mime;
 use url::{Url, form_urlencoded};
 
 use crate::cel::{BackendContext, DestinationContext, LLMContext, RequestTime, SourceContext};
 use crate::client::PoolKey;
-use crate::proxy::{ProxyError, ProxyResponse};
+use crate::proxy::ProxyError;
 use crate::transport::stream::TCPConnectionInfo;
 use crate::types::agent::{HeaderValueMatch, PathMatch};
+use crate::types::frontend::PathNormalization;
 
 /// Represents either an HTTP header or an HTTP/2 pseudo-header
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -488,7 +466,10 @@ pub(crate) fn request_header_matches(
 }
 
 /// Extract the value for a pseudo header from the request
-pub fn get_pseudo_header_value(pseudo: &HeaderOrPseudo, req: &Request) -> Option<String> {
+pub fn get_pseudo_header_value<B>(
+	pseudo: &HeaderOrPseudo,
+	req: &::http::Request<B>,
+) -> Option<String> {
 	match pseudo {
 		HeaderOrPseudo::Method => Some(req.method().to_string()),
 		HeaderOrPseudo::Scheme => req.uri().scheme().map(|s| s.to_string()),
@@ -509,7 +490,7 @@ pub fn get_pseudo_header_value(pseudo: &HeaderOrPseudo, req: &Request) -> Option
 }
 
 /// Return all present request pseudo headers without introducing defaults
-pub fn get_request_pseudo_headers(req: &Request) -> Vec<(HeaderOrPseudo, String)> {
+pub fn get_request_pseudo_headers<B>(req: &::http::Request<B>) -> Vec<(HeaderOrPseudo, String)> {
 	let mut out = Vec::with_capacity(4);
 	if let Some(v) = get_pseudo_header_value(&HeaderOrPseudo::Method, req) {
 		out.push((HeaderOrPseudo::Method, v));
@@ -546,6 +527,237 @@ pub fn modify_req_uri(
 	let uri = Uri::from_parts(parts)?;
 	*req.uri_mut() = uri;
 	Ok(())
+}
+
+pub fn normalize_path_for_proxy(
+	req: &mut Request,
+	normalize: &[PathNormalization],
+) -> Result<(), ProxyError> {
+	if normalize.is_empty() {
+		return Ok(());
+	}
+
+	let Some(orig) = req.uri().path_and_query() else {
+		return Ok(());
+	};
+
+	let path = normalize_path(orig.path(), normalize).map_err(|e| {
+		tracing::debug!(path = orig.path(), "rejecting request path: {e}");
+		ProxyError::InvalidRequest
+	})?;
+	let Some(path) = path else {
+		return Ok(());
+	};
+
+	modify_req_uri(req, |uri| set_path_keep_query(uri, path)).map_err(ProxyError::Processing)
+}
+
+/// Replaces the path of `uri`, keeping its query.
+pub fn set_path_keep_query(uri: &mut uri::Parts, mut path: String) -> anyhow::Result<()> {
+	if let Some(query) = uri.path_and_query.as_ref().and_then(|pq| pq.query()) {
+		path.push('?');
+		path.push_str(query);
+	}
+	uri.path_and_query = Some(PathAndQuery::from_maybe_shared(path)?);
+	Ok(())
+}
+
+/// Applies the configured rules in a fixed order, see [`PathNormalization`]
+fn normalize_path(path: &str, normalize: &[PathNormalization]) -> anyhow::Result<Option<String>> {
+	let decode_unreserved = normalize.contains(&PathNormalization::DecodeUnreserved);
+	let reject_escaped_slash = normalize.contains(&PathNormalization::RejectEscapedSlash);
+	let unescape_slash = normalize.contains(&PathNormalization::UnescapeSlash);
+	let apply_merge_slash = normalize.contains(&PathNormalization::MergeSlash);
+	let apply_dot_segment = normalize.contains(&PathNormalization::DotSegment);
+
+	let mut path = Cow::Borrowed(path);
+	if (decode_unreserved || apply_dot_segment || reject_escaped_slash || unescape_slash)
+		&& let Some(normalized) = decode_percent(
+			path.as_ref(),
+			decode_unreserved,
+			apply_dot_segment,
+			reject_escaped_slash,
+			unescape_slash,
+		)? {
+		path = Cow::Owned(normalized);
+	}
+	// Many backends (IIS, Windows, some Java and Node servers) treat `\` as a separator.
+	if (apply_merge_slash || apply_dot_segment) && path.contains('\\') {
+		path = Cow::Owned(path.replace('\\', "/"));
+	}
+	if apply_merge_slash && let Some(normalized) = merge_adjacent_slashes(path.as_ref()) {
+		path = Cow::Owned(normalized);
+	}
+	if apply_dot_segment {
+		if let Some(normalized) = strip_dot_segment_params(path.as_ref()) {
+			path = Cow::Owned(normalized);
+		}
+		if let Some(normalized) = remove_dot_segments(path.as_ref()) {
+			path = Cow::Owned(normalized);
+		}
+	}
+	Ok(match path {
+		Cow::Borrowed(_) => None,
+		Cow::Owned(path) => Some(path),
+	})
+}
+
+/// Rewrites percent-encoded octets in `path`.
+///
+/// With `decode_unreserved`, unreserved characters (RFC 3986 section 2.3) are decoded. With
+/// `decode_dot`, only `%2E` is decoded, so dot segments cannot hide behind encoding.
+///
+/// Escaped slashes (`%2F`, `%5C`) are rejected with `reject_escaped_slash`, or decoded to `/` with
+/// `unescape_slash`.
+///
+/// Every other octet is kept encoded with uppercase hex digits. Malformed escapes and `%00` are
+/// rejected, as backends disagree on how to interpret them.
+fn decode_percent(
+	path: &str,
+	decode_unreserved: bool,
+	decode_dot: bool,
+	reject_escaped_slash: bool,
+	unescape_slash: bool,
+) -> anyhow::Result<Option<String>> {
+	const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+	let Some(first) = path.find('%') else {
+		return Ok(None);
+	};
+	let hex = |b: Option<&u8>| b.and_then(|b| (*b as char).to_digit(16));
+	let bytes = path.as_bytes();
+	let mut out = String::with_capacity(path.len());
+	out.push_str(&path[..first]);
+	let mut i = first;
+	while i < bytes.len() {
+		if bytes[i] != b'%' {
+			let next = path[i..].find('%').map_or(bytes.len(), |n| i + n);
+			out.push_str(&path[i..next]);
+			i = next;
+			continue;
+		}
+		let (Some(hi), Some(lo)) = (hex(bytes.get(i + 1)), hex(bytes.get(i + 2))) else {
+			anyhow::bail!("invalid percent-encoding in path");
+		};
+		let b = (hi << 4 | lo) as u8;
+		match b {
+			0 => anyhow::bail!("escaped NUL in path"),
+			b'.' if decode_dot => out.push('.'),
+			b'/' | b'\\' if reject_escaped_slash => {
+				anyhow::bail!("escaped slash in path")
+			},
+			b'/' | b'\\' if unescape_slash => out.push('/'),
+			b if decode_unreserved
+				&& (b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')) =>
+			{
+				out.push(b as char)
+			},
+			b => {
+				out.push('%');
+				out.push(HEX[usize::from(b >> 4)] as char);
+				out.push(HEX[usize::from(b & 0xF)] as char);
+			},
+		}
+		i += 3;
+	}
+	Ok((out != path).then_some(out))
+}
+
+fn merge_adjacent_slashes(path: &str) -> Option<String> {
+	let first_double_slash = path.as_bytes().windows(2).position(|w| w == b"//")?;
+	let mut out = String::with_capacity(path.len());
+	out.push_str(&path[..first_double_slash + 1]);
+	let mut prev_was_slash = true;
+
+	for ch in path[first_double_slash + 1..].chars() {
+		if ch == '/' {
+			if !prev_was_slash {
+				out.push(ch);
+			}
+			prev_was_slash = true;
+		} else {
+			out.push(ch);
+			prev_was_slash = false;
+		}
+	}
+
+	Some(out)
+}
+
+/// Drops parameters from `.` and `..` segments, as servlet containers do: `/a/..;x/b` is `/a/../b`.
+fn strip_dot_segment_params(path: &str) -> Option<String> {
+	if !path.contains(".;") {
+		return None;
+	}
+	let stripped = path
+		.split('/')
+		.map(|segment| match segment.split_once(';') {
+			Some((dots @ ("." | ".."), _)) => dots,
+			_ => segment,
+		})
+		.collect::<Vec<_>>()
+		.join("/");
+	(stripped != path).then_some(stripped)
+}
+
+fn remove_dot_segments(path: &str) -> Option<String> {
+	if !needs_dot_segment_normalization(path) {
+		return None;
+	}
+
+	let mut input = path;
+	let mut output = String::with_capacity(path.len());
+
+	while !input.is_empty() {
+		if let Some(rest) = input.strip_prefix("../") {
+			input = rest;
+		} else if let Some(rest) = input.strip_prefix("./") {
+			input = rest;
+		} else if input.starts_with("/./") {
+			input = &input[2..];
+		} else if input == "/." {
+			input = "/";
+		} else if input.starts_with("/../") {
+			input = &input[3..];
+			pop_last_segment(&mut output);
+		} else if input == "/.." {
+			input = "/";
+			pop_last_segment(&mut output);
+		} else if input == "." || input == ".." {
+			input = "";
+		} else {
+			let segment_end = if let Some(rest) = input.strip_prefix('/') {
+				rest.find('/').map(|idx| idx + 1).unwrap_or(input.len())
+			} else {
+				input.find('/').unwrap_or(input.len())
+			};
+			output.push_str(&input[..segment_end]);
+			input = &input[segment_end..];
+		}
+	}
+
+	Some(output)
+}
+
+fn pop_last_segment(output: &mut String) {
+	if let Some(last_slash) = output.rfind('/') {
+		output.truncate(last_slash);
+	} else {
+		output.clear();
+	}
+}
+
+fn needs_dot_segment_normalization(path: &str) -> bool {
+	path == "."
+		|| path == ".."
+		|| path == "/."
+		|| path == "/.."
+		|| path.starts_with("./")
+		|| path.starts_with("../")
+		|| path.contains("/./")
+		|| path.contains("/../")
+		|| path.ends_with("/.")
+		|| path.ends_with("/..")
 }
 
 pub fn modify_uri(
@@ -597,6 +809,15 @@ pub fn modify_url(
 	f(&mut url)?;
 	*uri = url_to_uri(&url)?;
 	Ok(())
+}
+
+pub(crate) fn query_parameter<'a>(uri: &'a Uri, name: &str) -> Option<Cow<'a, str>> {
+	for (key, value) in form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
+		if key == name {
+			return Some(value);
+		}
+	}
+	None
 }
 
 pub fn modify_query_parameters<S, R, KSet, VSet, KRemove>(
@@ -735,27 +956,19 @@ pub fn get_host(req: &Request) -> Result<&str, ProxyError> {
 	Ok(host)
 }
 
-pub fn get_host_with_port(req: &Request) -> Result<&str, ProxyError> {
-	// We expect a normalized request, so this will always be in the URI
-	// TODO: handle absolute HTTP/1.1 form
-	let host = req
-		.uri()
-		.authority()
-		.map(|a| a.as_str())
-		.ok_or(ProxyError::InvalidRequest)?;
-	Ok(host)
-}
-
+/// Read with the request's size limit and remaining body deadline.
 pub async fn read_req_body(req: Request) -> Result<Bytes, axum_core::Error> {
 	let lim = buffer_limit(&req);
 	read_body_with_limit(req.into_body(), lim).await
 }
 
+/// Read with the response's size limit and remaining body deadline.
 pub async fn read_resp_body(resp: Response) -> Result<Bytes, axum_core::Error> {
 	let lim = response_buffer_limit(&resp);
 	read_body_with_limit(resp.into_body(), lim).await
 }
 
+/// Read with the response's size limit and remaining body deadline, retaining its headers.
 pub async fn read_response_body(
 	resp: Response,
 ) -> Result<(::http::response::Parts, Bytes), axum_core::Error> {
@@ -764,136 +977,16 @@ pub async fn read_response_body(
 	read_body_with_limit(b, lim).await.map(|b| (h, b))
 }
 
-/// Result of inspecting a body without consuming it from the caller's perspective.
-#[derive(Debug)]
-#[must_use]
-pub enum BodyInspection {
-	/// The complete body fit within the configured limit.
-	Complete(Bytes),
-	/// The body exceeded the limit. Contains the first `limit` bytes.
-	Partial(Bytes),
-}
-
+/// Inspect within the remaining body deadline.
 pub async fn inspect_body(req: &mut Request) -> anyhow::Result<BodyInspection> {
 	let lim = buffer_limit(req);
-	inspect_body_with_limit(req.body_mut(), lim).await
+	req.body_mut().inspect(lim).await
 }
 
+/// Inspect within the remaining body deadline.
 pub async fn inspect_response_body(resp: &mut Response) -> anyhow::Result<BodyInspection> {
 	let lim = response_buffer_limit(resp);
-	inspect_body_with_limit(resp.body_mut(), lim).await
-}
-
-pub async fn inspect_body_with_limit(
-	body: &mut Body,
-	limit: usize,
-) -> anyhow::Result<BodyInspection> {
-	let mut bytes = peekbody::inspect_body(body, limit.saturating_add(1)).await?;
-	if bytes.len() > limit {
-		bytes.truncate(limit);
-		Ok(BodyInspection::Partial(bytes))
-	} else {
-		Ok(BodyInspection::Complete(bytes))
-	}
-}
-
-#[derive(Debug, Default)]
-#[must_use]
-pub struct PolicyResponse {
-	pub direct_response: Option<Response>,
-	pub response_headers: Option<crate::http::HeaderMap>,
-}
-
-impl PolicyResponse {
-	pub fn apply(self, hm: &mut HeaderMap) -> Result<(), ProxyResponse> {
-		if let Some(mut dr) = self.direct_response {
-			merge_in_headers(self.response_headers, dr.headers_mut());
-			Err(ProxyResponse::DirectResponse(Box::new(dr)))
-		} else {
-			merge_in_headers(self.response_headers, hm);
-			Ok(())
-		}
-	}
-	pub fn should_short_circuit(&self) -> bool {
-		self.direct_response.is_some()
-	}
-	pub fn with_response(self, other: Response) -> Self {
-		PolicyResponse {
-			direct_response: Some(other),
-			response_headers: self.response_headers,
-		}
-	}
-	pub fn merge(self, other: Self) -> Self {
-		if other.direct_response.is_some() {
-			other
-		} else {
-			match (self.response_headers, other.response_headers) {
-				(None, None) => PolicyResponse::default(),
-				(a, b) => PolicyResponse {
-					direct_response: None,
-					response_headers: Some({
-						let mut hm = HeaderMap::new();
-						merge_in_headers(a, &mut hm);
-						merge_in_headers(b, &mut hm);
-						hm
-					}),
-				},
-			}
-		}
-	}
-}
-
-pub fn merge_in_headers(additional_headers: Option<HeaderMap>, dest: &mut HeaderMap) {
-	if let Some(rh) = additional_headers {
-		for (k, v) in rh.into_iter() {
-			let Some(k) = k else { continue };
-			dest.insert(k, v);
-		}
-	}
-}
-
-pin_project_lite::pin_project! {
-	/// DropBody is simply a Body wrapper that holds onto another item such that it is dropped when the body
-	/// is complete.
-	#[derive(Debug)]
-	pub struct DropBody<B, D> {
-		#[pin]
-		body: B,
-		dropper: D,
-	}
-}
-
-impl<B, D> DropBody<B, D>
-where
-	D: Send + 'static,
-	B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
-	B::Error: Into<BoxError>,
-{
-	#[allow(clippy::new_ret_no_self)]
-	pub fn new(body: B, dropper: D) -> Body {
-		Body::new(Self { body, dropper })
-	}
-}
-
-impl<B: http_body::Body + Unpin, D> http_body::Body for DropBody<B, D> {
-	type Data = B::Data;
-	type Error = B::Error;
-
-	fn poll_frame(
-		self: Pin<&mut Self>,
-		cx: &mut Context<'_>,
-	) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-		let this = self.project();
-		this.body.poll_frame(cx)
-	}
-
-	fn is_end_stream(&self) -> bool {
-		self.body.is_end_stream()
-	}
-
-	fn size_hint(&self) -> SizeHint {
-		self.body.size_hint()
-	}
+	resp.body_mut().inspect(lim).await
 }
 
 // DebugExtensions is a wrapper that logs a requests known-extensions in the Debug implementation.
@@ -979,6 +1072,26 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn merge_headers_preserves_set_cookies() {
+		let mut dest = HeaderMap::new();
+		dest.append(header::SET_COOKIE, "upstream=1".parse().unwrap());
+		let mut additional = HeaderMap::new();
+		additional.append(header::SET_COOKIE, "oidc=1".parse().unwrap());
+		additional.append(header::SET_COOKIE, "transaction=1".parse().unwrap());
+		additional.insert(header::LOCATION, "/after-login".parse().unwrap());
+
+		merge_in_headers(Some(additional), &mut dest);
+
+		let cookies: Vec<_> = dest
+			.get_all(header::SET_COOKIE)
+			.iter()
+			.map(|value| value.to_str().unwrap())
+			.collect();
+		assert_eq!(cookies, ["upstream=1", "oidc=1", "transaction=1"]);
+		assert_eq!(dest.get(header::LOCATION).unwrap(), "/after-login");
+	}
+
+	#[test]
 	fn test_modify_query_parameters_for_relative_uri() {
 		let mut uri = "/resource?keep=1&set=old&set=older&remove=gone"
 			.parse()
@@ -1026,6 +1139,19 @@ mod tests {
 		assert_eq!(req.headers().get("x-test").unwrap(), "value");
 		let body = read_body_with_limit(req.into_body(), 100).await.unwrap();
 		assert_eq!(body, "body");
+	}
+
+	#[tokio::test]
+	async fn replace_body_bytes_preserves_buffer_limit() {
+		let mut req = ::http::Request::new(Body::empty());
+		req.extensions_mut().insert(BufferLimit::new(4));
+		req
+			.body_mut()
+			.replace_bytes(Bytes::from_static(b"too large"));
+		assert!(matches!(
+			inspect_body(&mut req).await.unwrap(),
+			BodyInspection::Partial(_)
+		));
 	}
 
 	#[test]

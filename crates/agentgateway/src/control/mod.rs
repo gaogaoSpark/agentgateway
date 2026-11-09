@@ -13,7 +13,6 @@ use rustls::pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use secrecy::{ExposeSecret, SecretString};
 use tonic::body::Body;
-use tower::Service;
 
 use crate::client::{ApplicationTransport, Transport};
 use crate::http::HeaderValue;
@@ -274,6 +273,7 @@ impl tower::Service<::http::Request<tonic::body::Body>> for GrpcChannel {
 						req,
 						target,
 						connection: transport.into(),
+						dynamic_backend: false,
 					})
 					.await?,
 			)
@@ -287,7 +287,13 @@ impl agent_xds::ClientTrait for GrpcChannel {
 		req: ::http::Request<Body>,
 	) -> Pin<Box<dyn Future<Output = Result<::http::Response<axum_core::body::Body>, Error>> + Send>>
 	{
-		self.call(req)
+		let mut this = self.clone();
+		Box::pin(async move {
+			tower::Service::call(&mut this, req)
+				.await
+				// We are leaving agentgateway code so no longer need our specialized body; Boxing is fine here.
+				.map(|resp| resp.map(http::Body::into_boxed))
+		})
 	}
 
 	fn box_clone(&self) -> Box<dyn ClientTrait> {

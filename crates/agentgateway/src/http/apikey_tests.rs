@@ -179,7 +179,7 @@ async fn test_apikey_query_parameter_extracts_and_strips() {
 
 	let mut req = ::http::Request::builder()
 		.uri("http://example.com/data?api_key=test-api-key&keep=yes")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)
@@ -203,7 +203,7 @@ async fn test_apikey_cookie_extracts_and_strips() {
 	let mut req = ::http::Request::builder()
 		.uri("http://example.com/data")
 		.header("cookie", "keep=yes; api_key=test-api-key")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)
@@ -237,7 +237,7 @@ async fn test_apikey_sha256_extracts_and_strips() {
 
 	let mut req = ::http::Request::builder()
 		.header(crate::http::header::AUTHORIZATION, "Bearer test-api-key")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)
@@ -270,7 +270,7 @@ async fn test_apikey_sha256_extracts_and_strips() {
 			crate::http::header::AUTHORIZATION,
 			"Bearer plaintext-api-key",
 		)
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)
@@ -325,7 +325,7 @@ async fn test_apikey_sha256_rejects_invalid_key() {
 
 	let mut req = ::http::Request::builder()
 		.header(crate::http::header::AUTHORIZATION, "Bearer invalid-api-key")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let err = crate::test_helpers::test_policy(&auth, &mut req)
@@ -334,9 +334,7 @@ async fn test_apikey_sha256_rejects_invalid_key() {
 
 	assert!(matches!(
 		err,
-		ProxyResponse::Error(ProxyError::APIKeyAuthenticationFailure(
-			Error::InvalidCredentials
-		))
+		ProxyError::APIKeyAuthenticationFailure(Error::InvalidCredentials)
 	));
 }
 
@@ -367,7 +365,7 @@ async fn test_apikey_permissive_invalid_key_ok_and_keeps_header() {
 
 	let mut req = ::http::Request::builder()
 		.header(crate::http::header::AUTHORIZATION, "Bearer invalid-api-key")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)
@@ -393,7 +391,7 @@ async fn test_apikey_permissive_valid_key_inserts_claims_and_removes_header() {
 
 	let mut req = ::http::Request::builder()
 		.header(crate::http::header::AUTHORIZATION, "Bearer test-api-key")
-		.body(axum::body::Body::empty())
+		.body(crate::http::Body::empty())
 		.unwrap();
 
 	let _ = crate::test_helpers::test_policy(&auth, &mut req)

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::Hash;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
 
@@ -7,12 +8,12 @@ use agent_xds::{RejectedConfig, XdsUpdate};
 use anyhow::Context;
 use futures_core::Stream;
 use hashbrown::{Equivalent, HashMap as HbHashMap};
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use tokio::sync::watch;
 use tracing::{Level, instrument, warn};
 
 use crate::cel::ContextBuilder;
-use crate::http::auth::{BackendAuth, BackendAuthKind};
+use crate::http::auth::BackendAuth;
 use crate::http::authorization::{HTTPAuthorizationSet, NetworkAuthorizationSet};
 use crate::http::backendtls::BackendTLS;
 use crate::http::ext_proc::InferenceRouting;
@@ -28,8 +29,8 @@ use crate::types::agent::{
 	A2aPolicy, Backend, BackendKey, BackendTargetRef, BackendTrafficPolicy, BackendWithPolicies,
 	Bind, BindKey, BindSnapshot, FrontendPolicy, JwtAuthentication, Listener, ListenerKey,
 	ListenerName, ListenerSet, McpAuthentication, PolicyInheritance, PolicyKey, PolicyTarget, Route,
-	RouteBackendReference, RouteGroupKey, RouteKey, RouteMatch, RouteName, RouteSet, TCPRoute,
-	TCPRouteSet, TargetedPolicy, TrafficPolicy,
+	RouteBackendReference, RouteGroupKey, RouteKey, RouteName, RouteSet, TCPRoute, TCPRouteSet,
+	TargetedPolicy, TrafficPolicy,
 };
 use crate::types::agent_xds::Diagnostics;
 use crate::types::discovery::NamespacedHostname;
@@ -51,6 +52,22 @@ enum ResourceKind {
 	ModelRouter(RouteKey),
 	Listener(ListenerKey),
 	Backend(ListenerKey),
+}
+
+fn xds_resource_kind(resource: &ADPResource) -> &'static str {
+	match resource.kind.as_ref() {
+		Some(XdsKind::Bind(_)) => "bind",
+		Some(XdsKind::Listener(_)) => "listener",
+		Some(XdsKind::Route(_)) => "route",
+		Some(XdsKind::TcpRoute(_)) => "tcp_route",
+		Some(XdsKind::ModelRoute(_)) => "model_route",
+		Some(XdsKind::Backend(_)) => "backend",
+		Some(XdsKind::Policy(_)) => "policy",
+		Some(XdsKind::Workload(_)) => "workload",
+		Some(XdsKind::Service(_)) => "service",
+		Some(XdsKind::RouteGroup(_)) => "route_group",
+		None => "unknown",
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -148,6 +165,7 @@ pub struct FrontendPolices {
 	pub tcp: Option<frontend::TCP>,
 	pub network_authorization: Option<NetworkAuthorizationSet>,
 	pub network_ext_authz: Option<Arc<ext_authz::ExtAuthz>>,
+	pub substrate_egress_actor_resolution: Option<substrate::EgressActorResolution>,
 	pub proxy: Option<frontend::Proxy>,
 	pub connect: Option<frontend::Connect>,
 	pub access_log: Option<frontend::LoggingPolicy>,
@@ -178,6 +196,11 @@ impl FrontendPolices {
 			FrontendPolicy::NetworkExtAuthz(p) => {
 				self.network_ext_authz.get_or_insert_with(|| p.clone());
 			},
+			FrontendPolicy::SubstrateEgressActorResolution(p) => {
+				self
+					.substrate_egress_actor_resolution
+					.get_or_insert_with(|| p.clone());
+			},
 			FrontendPolicy::Proxy(p) => {
 				self.proxy.get_or_insert_with(|| p.clone());
 			},
@@ -200,6 +223,7 @@ impl FrontendPolices {
 	}
 	pub fn register_cel_expressions(&self, ctx: &mut ContextBuilder) {
 		if let Some(frontend::LoggingPolicy {
+			preset: _,
 			filter,
 			add: fields_add,
 			remove: _,
@@ -262,6 +286,7 @@ pub struct BackendPolicies {
 	pub request_header_modifier: Option<filters::HeaderModifier>,
 	pub response_header_modifier: BackendPolicy<filters::HeaderModifier>,
 	pub request_redirect: Option<filters::RequestRedirect>,
+	pub url_rewrite: Option<filters::UrlRewrite>,
 	pub request_mirror: Vec<filters::RequestMirror>,
 	pub transformation: BackendPolicy<http::transformation_cel::Transformation>,
 
@@ -317,6 +342,7 @@ impl BackendPolicies {
 				.response_header_modifier
 				.or(self.response_header_modifier),
 			request_redirect: other.request_redirect.or(self.request_redirect),
+			url_rewrite: other.url_rewrite.or(self.url_rewrite),
 			request_mirror: if other.request_mirror.is_empty() {
 				self.request_mirror
 			} else {
@@ -342,12 +368,8 @@ impl BackendPolicies {
 		self.authorization.register_expressions(ctx);
 		self.ext_authz.register_expressions(ctx);
 		self.transformation.register_expressions(ctx);
-		if let Some(BackendAuth {
-			kind: Some(BackendAuthKind::Aws(aws)),
-			..
-		}) = self.backend_auth.as_ref()
-		{
-			for expr in aws.cel_expressions() {
+		if let Some(backend_auth) = self.backend_auth.as_ref() {
+			for expr in backend_auth.cel_expressions() {
 				ctx.register_expression(expr);
 			}
 		}
@@ -362,6 +384,11 @@ impl BackendPolicies {
 		if let Some(session_affinity) = self.session_affinity.as_ref() {
 			session_affinity.register_expressions(ctx);
 		}
+		if let Some(guardrails) = self.mcp_guardrails.as_ref() {
+			for expr in guardrails.expressions() {
+				ctx.register_expression(expr);
+			}
+		}
 	}
 }
 
@@ -369,7 +396,7 @@ impl BackendPolicies {
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutePolicies {
-	pub local_rate_limit: RequestPolicy<Vec<http::localratelimit::RateLimit>>,
+	pub local_rate_limit: RequestPolicy<http::localratelimit::RateLimits>,
 	pub remote_rate_limit: RequestPolicy<remoteratelimit::RemoteRateLimit>,
 	pub authorization: RequestPolicy<HTTPAuthorizationSet>,
 	pub jwt: RequestPolicy<JwtAuthentication>,
@@ -398,6 +425,7 @@ pub struct RoutePolicies {
 	pub request_mirror: RequestPolicy<Vec<filters::RequestMirror>>,
 	pub cors: RequestPolicy<http::cors::Cors>,
 	pub buffer: RequestPolicy<http::buffer::Buffer>,
+	pub compression: RequestPolicy<http::compression::Compression>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -467,6 +495,7 @@ impl RoutePolicies {
 			&self.url_rewrite as &dyn PolicyExpressions,
 			&self.cors as &dyn PolicyExpressions,
 			&self.buffer as &dyn PolicyExpressions,
+			&self.compression as &dyn PolicyExpressions,
 		]
 		.into_iter()
 	}
@@ -480,7 +509,7 @@ impl RoutePolicies {
 
 #[derive(Debug, Default, Clone)]
 pub struct LLMRequestPolicies {
-	pub local_rate_limit: Option<Arc<Vec<http::localratelimit::RateLimit>>>,
+	pub local_rate_limit: Option<Arc<http::localratelimit::RateLimits>>,
 	pub remote_rate_limit: Option<Arc<http::remoteratelimit::RemoteRateLimit>>,
 	pub llm: Option<Arc<llm::Policy>>,
 }
@@ -560,7 +589,7 @@ impl LLMRequestPolicies {
 
 #[derive(Debug, Default)]
 pub struct LLMResponsePolicies {
-	pub local_rate_limit: Vec<http::localratelimit::RateLimit>,
+	pub local_rate_limit: Vec<http::localratelimit::ChargedBucket>,
 	pub remote_rate_limit: Option<http::remoteratelimit::LLMResponseAmend>,
 	pub request_traceparent: Option<HeaderValue>,
 	pub prompt_guard: Vec<ResponseGuard>,
@@ -581,12 +610,6 @@ pub struct RoutePath<'a> {
 	pub service: Option<&'a NamespacedHostname>,
 	pub routes: Vec<&'a RouteName>,
 	pub route_inlines: Vec<&'a [TrafficPolicy]>,
-}
-
-impl<'a> RoutePath<'a> {
-	pub fn final_route(&self) -> Option<&'a RouteName> {
-		self.routes.last().copied()
-	}
 }
 
 impl Store {
@@ -729,7 +752,7 @@ impl Store {
 		new.iter().any(|listener| {
 			old
 				.get(&listener.key)
-				.is_some_and(|old_listener| old_listener != listener)
+				.is_some_and(|old_listener| !old_listener.serving_eq(listener))
 		}) || old.iter().any(|listener| !new.contains(&listener.key))
 	}
 
@@ -751,53 +774,6 @@ impl Store {
 
 	fn model_router_route_key(listener: &ListenerKey) -> RouteKey {
 		strng::format!("llm:request:{listener}")
-	}
-
-	fn model_router_matches() -> Vec<RouteMatch> {
-		let mut matches = [
-			"/v1/models",
-			"/models",
-			"/v1/messages/count_tokens",
-			"/v1/chat/completions",
-			"/v1/messages",
-			"/v1/responses",
-			"/v1/responses/compact",
-			"/v1/images/generations",
-			"/v1/images/edits",
-			"/v1/images/variations",
-			"/v1/embeddings",
-			"/v1/rerank",
-			"/v2/rerank",
-		]
-		.into_iter()
-		.map(|path| RouteMatch {
-			path: agent::PathMatch::Exact(strng::new(path)),
-			method: None,
-			headers: vec![],
-			query: vec![],
-		})
-		.collect::<Vec<_>>();
-		matches.push(RouteMatch {
-			path: agent::PathMatch::Regex(
-				regex::Regex::new(r"^/v(?:[0-9]+|[0-9]+beta[0-9]+)/projects/[^/]+/locations/[^/]+/publishers/[^/]+/models/[^/]+:(?:rawPredict|streamRawPredict|generateContent|streamGenerateContent|countTokens)$")
-					.expect("valid Vertex model route regex"),
-			),
-			method: None,
-			headers: vec![],
-			query: vec![],
-		});
-		matches.push(RouteMatch {
-			path: agent::PathMatch::Regex(
-				// Gemini API shape has no publisher segment and uses versions like v1beta;
-				// v1alpha is what the SDKs emit for preview features.
-				regex::Regex::new(r"^/v[0-9]+(?:(?:alpha|beta)[0-9]*)?/models/[^/]+:(?:generateContent|streamGenerateContent|countTokens)$")
-					.expect("valid Gemini model route regex"),
-			),
-			method: None,
-			headers: vec![],
-			query: vec![],
-		});
-		matches
 	}
 
 	fn rebuild_model_router(&mut self, listener: &ListenerKey, router_key: &str) {
@@ -842,6 +818,13 @@ impl Store {
 			}
 		}
 
+		// Most specific patterns first, so a wildcard does not shadow exact or prefix matches.
+		models.sort_by_key(|model| {
+			std::cmp::Reverse(crate::llm::model_router::model_match_specificity(
+				&model.name,
+			))
+		});
+
 		if implicit_route && models.is_empty() && virtual_models.is_empty() {
 			return;
 		}
@@ -875,7 +858,7 @@ impl Store {
 					kind: None,
 				},
 				hostnames: vec![],
-				matches: Self::model_router_matches(),
+				matches: crate::llm::model_router::serving_route_matches(),
 				backends: vec![RouteBackendReference {
 					weight: 1,
 					target: agent::BackendReference::Backend(backend_key).into(),
@@ -971,33 +954,57 @@ impl Store {
 		tokio_stream::wrappers::UnboundedReceiverStream::new(sub)
 	}
 
+	/// Returns policies oldest first for consumers where the first policy wins.
+	fn policies_for_target_oldest_first<Q>(
+		&self,
+		target: &Q,
+	) -> impl DoubleEndedIterator<Item = &Arc<TargetedPolicy>> + use<'_, Q>
+	where
+		Q: Hash + Equivalent<PolicyTarget> + ?Sized,
+	{
+		let keys = self.policies_by_target.get(target);
+		if keys.is_none_or(|keys| keys.len() <= 1) {
+			return Either::Left(
+				keys
+					.into_iter()
+					.flatten()
+					.filter_map(|key| self.policies_by_key.get(key)),
+			);
+		}
+		let mut policies = keys
+			.into_iter()
+			.flatten()
+			.filter_map(|key| self.policies_by_key.get(key))
+			.collect_vec();
+		policies.sort_unstable_by(|a, b| {
+			a.creation_timestamp
+				.cmp(&b.creation_timestamp)
+				.then_with(|| a.key.cmp(&b.key))
+		});
+		Either::Right(policies.into_iter())
+	}
+
+	/// Returns policies newest first for route merging, where later policies overwrite earlier ones.
+	fn policies_for_target_newest_first<Q>(
+		&self,
+		target: &Q,
+	) -> impl DoubleEndedIterator<Item = &Arc<TargetedPolicy>> + use<'_, Q>
+	where
+		Q: Hash + Equivalent<PolicyTarget> + ?Sized,
+	{
+		self.policies_for_target_oldest_first(target).rev()
+	}
+
 	pub fn route_policies(&self, path: &RoutePath<'_>) -> RoutePolicies {
 		let listener_name = &path.listener;
-		let gateway = self
-			.policies_by_target
-			.get(&listener_name.as_gateway_target_ref());
-		let listener_set = listener_name
-			.as_listenerset_target_ref()
-			.and_then(|r| self.policies_by_target.get(&r));
-		let listener_set_section = listener_name
-			.as_listenerset_listener_target_ref()
-			.and_then(|r| self.policies_by_target.get(&r));
-		let listener = self
-			.policies_by_target
-			.get(&listener_name.as_listener_target_ref());
-		let service = path
-			.service
-			.and_then(|s| self.policies_by_target.get(&s.as_policy_target_ref()));
 
+		// Route policy fields are merged with last-writer-wins semantics. Visit policies at
+		// each attachment level newest first so the oldest policy is applied last and wins.
 		let mut route_rules = Vec::new();
 		for (idx, route) in path.routes.iter().enumerate() {
 			route_rules.extend(
 				self
-					.policies_by_target
-					.get(&route.as_route_target_ref())
-					.into_iter()
-					.flatten()
-					.filter_map(|n| self.policies_by_key.get(n))
+					.policies_for_target_newest_first(&route.as_route_target_ref())
 					.filter_map(|p| {
 						p.policy
 							.as_traffic_route_phase()
@@ -1006,11 +1013,7 @@ impl Store {
 			);
 			route_rules.extend(
 				self
-					.policies_by_target
-					.get(&route.as_route_rule_target_ref())
-					.into_iter()
-					.flatten()
-					.filter_map(|n| self.policies_by_key.get(n))
+					.policies_for_target_newest_first(&route.as_route_rule_target_ref())
 					.filter_map(|p| {
 						p.policy
 							.as_traffic_route_phase()
@@ -1022,20 +1025,30 @@ impl Store {
 			}
 		}
 
-		let shared_rules = gateway
-			.iter()
-			.copied()
-			.flatten()
-			.chain(listener_set.iter().copied().flatten())
-			.chain(listener_set_section.iter().copied().flatten())
-			.chain(listener.iter().copied().flatten())
-			.chain(service.iter().copied().flatten())
-			.filter_map(|n| self.policies_by_key.get(n))
-			.filter_map(|p| {
-				p.policy
-					.as_traffic_route_phase()
-					.map(|inner| (p.inheritance, inner))
-			});
+		let shared_rules =
+			self
+				.policies_for_target_newest_first(&listener_name.as_gateway_target_ref())
+				.chain(
+					listener_name
+						.as_listenerset_target_ref()
+						.into_iter()
+						.flat_map(|target| self.policies_for_target_newest_first(&target)),
+				)
+				.chain(
+					listener_name
+						.as_listenerset_listener_target_ref()
+						.into_iter()
+						.flat_map(|target| self.policies_for_target_newest_first(&target)),
+				)
+				.chain(self.policies_for_target_newest_first(&listener_name.as_listener_target_ref()))
+				.chain(path.service.into_iter().flat_map(|service| {
+					self.policies_for_target_newest_first(&service.as_policy_target_ref())
+				}))
+				.filter_map(|p| {
+					p.policy
+						.as_traffic_route_phase()
+						.map(|inner| (p.inheritance, inner))
+				});
 
 		let rules = shared_rules.chain(route_rules);
 
@@ -1150,6 +1163,9 @@ impl Store {
 				TrafficPolicy::Buffer(p) => {
 					pol.buffer.set_if_unset(p);
 				},
+				TrafficPolicy::Compression(p) => {
+					pol.compression.merge_with_inheritance(p, lock_inheritance);
+				},
 				TrafficPolicy::SubstrateIngress(p) => {
 					pol
 						.substrate_ingress
@@ -1175,24 +1191,33 @@ impl Store {
 		pol
 	}
 
-	pub fn gateway_policies(&self, name: &ListenerName) -> GatewayPolicies {
-		let gateway = self.policies_by_target.get(&name.as_gateway_target_ref());
-		let listener = self.policies_by_target.get(&name.as_listener_target_ref());
-		let listener_set = name
-			.as_listenerset_target_ref()
-			.and_then(|r| self.policies_by_target.get(&r));
-		let listener_set_section = name
-			.as_listenerset_listener_target_ref()
-			.and_then(|r| self.policies_by_target.get(&r));
-		let rules = listener
-			.iter()
-			.copied()
-			.flatten()
-			.chain(listener_set_section.iter().copied().flatten())
-			.chain(listener_set.iter().copied().flatten())
-			.chain(gateway.iter().copied().flatten())
-			.filter_map(|n| self.policies_by_key.get(n))
+	pub fn gateway_policies(&self, bind: &BindKey, listener: &Listener) -> GatewayPolicies {
+		let name = &listener.name;
+		// The serving listener may be a snapshot from connection setup; use the current inline policies.
+		let current = self.get_bind_listener(bind, &listener.key);
+		let inline = current
+			.as_deref()
+			.map_or(&listener.inline_policies, |l| &l.inline_policies);
+		// Gateway policy fields use first-writer-wins semantics. Visit policies at each
+		// attachment level oldest first so the oldest policy wins. Listener inline policies
+		// take precedence over policies attached to the listener.
+		let attached = self
+			.policies_for_target_oldest_first(&name.as_listener_target_ref())
+			.chain(
+				name
+					.as_listenerset_listener_target_ref()
+					.into_iter()
+					.flat_map(|target| self.policies_for_target_oldest_first(&target)),
+			)
+			.chain(
+				name
+					.as_listenerset_target_ref()
+					.into_iter()
+					.flat_map(|target| self.policies_for_target_oldest_first(&target)),
+			)
+			.chain(self.policies_for_target_oldest_first(&name.as_gateway_target_ref()))
 			.filter_map(|p| p.policy.as_traffic_gateway_phase());
+		let rules = inline.iter().chain(attached);
 
 		let mut authz = Vec::new();
 		let mut pol = GatewayPolicies::default();
@@ -1319,40 +1344,34 @@ impl Store {
 		gateway: Option<&ListenerName>,
 		routes: &[&RouteName],
 	) -> BackendPolicies {
-		let backend_rules =
-			backend.and_then(|t| self.policies_by_target.get(&PolicyTargetRef::Backend(t)));
-		let sub_backend_rules =
-			sub_backend.and_then(|t| self.policies_by_target.get(&PolicyTargetRef::Backend(t)));
-		let listener_rules =
-			gateway.and_then(|t| self.policies_by_target.get(&t.as_listener_target_ref()));
-		let gateway_rules =
-			gateway.and_then(|t| self.policies_by_target.get(&t.as_gateway_target_ref()));
-
 		// Collect route policies across the full delegation chain, child (most specific) first.
 		// For each route: rule-level before route-level, matching route_policies() ordering.
-		let mut route_based_keys: Vec<&PolicyKey> = Vec::new();
+		let mut route_based_policies = Vec::new();
 		for route in routes.iter().rev() {
-			if let Some(keys) = self
-				.policies_by_target
-				.get(&route.as_route_rule_target_ref())
-			{
-				route_based_keys.extend(keys.iter());
-			}
-			if let Some(keys) = self.policies_by_target.get(&route.as_route_target_ref()) {
-				route_based_keys.extend(keys.iter());
-			}
+			route_based_policies
+				.extend(self.policies_for_target_oldest_first(&route.as_route_rule_target_ref()));
+			route_based_policies
+				.extend(self.policies_for_target_oldest_first(&route.as_route_target_ref()));
 		}
 
 		// Route chain (child->parent) > SubBackend > Backend/Service > Gateway
-		let rules = route_based_keys
-			.into_iter()
-			.chain(sub_backend_rules.iter().copied().flatten())
-			.chain(backend_rules.iter().copied().flatten())
-			.chain(listener_rules.iter().copied().flatten())
-			.chain(gateway_rules.iter().copied().flatten())
-			.unique()
-			.filter_map(|n| self.policies_by_key.get(n))
-			.filter_map(|p| p.policy.as_backend());
+		let rules =
+			route_based_policies
+				.into_iter()
+				.chain(sub_backend.into_iter().flat_map(|target| {
+					self.policies_for_target_oldest_first(&PolicyTargetRef::Backend(target))
+				}))
+				.chain(backend.into_iter().flat_map(|target| {
+					self.policies_for_target_oldest_first(&PolicyTargetRef::Backend(target))
+				}))
+				.chain(gateway.into_iter().flat_map(|target| {
+					self.policies_for_target_oldest_first(&target.as_listener_target_ref())
+				}))
+				.chain(gateway.into_iter().flat_map(|target| {
+					self.policies_for_target_oldest_first(&target.as_gateway_target_ref())
+				}))
+				.unique_by(|policy| policy.key.clone())
+				.filter_map(|p| p.policy.as_backend());
 		let rules = inline_policies
 			.iter()
 			.rev()
@@ -1407,6 +1426,9 @@ impl Store {
 				},
 				BackendTrafficPolicy::RequestRedirect(p) => {
 					pol.request_redirect.get_or_insert_with(|| p.clone());
+				},
+				BackendTrafficPolicy::UrlRewrite(p) => {
+					pol.url_rewrite.get_or_insert_with(|| p.clone());
 				},
 				BackendTrafficPolicy::Transformation(p) => {
 					pol.transformation.set_if_unset(p);
@@ -1478,34 +1500,14 @@ impl Store {
 			.collect_vec()
 	}
 
-	pub fn all_access_log_policies(&self) -> Vec<Arc<crate::types::agent::AccessLogPolicy>> {
-		self
-			.binds
-			.iter()
-			.flat_map(|(bind_key, bind)| {
-				self
-					.listeners
-					.get(bind_key)
-					.into_iter()
-					.flat_map(|listeners| listeners.iter())
-					.map(|listener| {
-						self.listener_frontend_policies(&listener.name, Some(bind.address.port()), None)
-					})
-			})
-			.filter_map(|fp| fp.access_log_otlp)
-			.unique_by(|p| Arc::as_ptr(p) as usize)
-			.collect_vec()
-	}
-
 	pub fn frontend_policies(&self, gateway: PolicyTargetRef) -> FrontendPolices {
-		let gw_rules = self.policies_by_target.get(&gateway);
 		let parent_gateway = match gateway {
 			PolicyTargetRef::Gateway {
 				gateway_name,
 				gateway_namespace,
 				listener_name: None,
 				port: Some(_),
-			} => self.policies_by_target.get(&PolicyTargetRef::Gateway {
+			} => Some(PolicyTargetRef::Gateway {
 				gateway_name,
 				gateway_namespace,
 				listener_name: None,
@@ -1513,12 +1515,13 @@ impl Store {
 			}),
 			_ => None,
 		};
-		let rules = gw_rules
-			.iter()
-			.copied()
-			.flatten()
-			.chain(parent_gateway.iter().copied().flatten())
-			.filter_map(|n| self.policies_by_key.get(n))
+		let rules = self
+			.policies_for_target_oldest_first(&gateway)
+			.chain(
+				parent_gateway
+					.into_iter()
+					.flat_map(|target| self.policies_for_target_oldest_first(&target)),
+			)
 			.filter_map(|p| p.policy.as_frontend());
 
 		let mut pol = FrontendPolices::default();
@@ -1536,33 +1539,34 @@ impl Store {
 		port: Option<u16>,
 		service: Option<PolicyTargetRef>,
 	) -> FrontendPolices {
-		let gateway = self.policies_by_target.get(&name.as_gateway_target_ref());
-		let listener = self.policies_by_target.get(&name.as_listener_target_ref());
-		let listener_set = name
-			.as_listenerset_target_ref()
-			.and_then(|r| self.policies_by_target.get(&r));
-		let listener_set_section = name
-			.as_listenerset_listener_target_ref()
-			.and_then(|r| self.policies_by_target.get(&r));
-		let svc = service.and_then(|s| self.policies_by_target.get(&s));
-		let gateway_port = port.and_then(|port| {
-			self.policies_by_target.get(&PolicyTargetRef::Gateway {
-				gateway_name: name.gateway_name.as_ref(),
-				gateway_namespace: name.gateway_namespace.as_ref(),
-				listener_name: None,
-				port: Some(port),
-			})
+		let gateway_port = port.map(|port| PolicyTargetRef::Gateway {
+			gateway_name: name.gateway_name.as_ref(),
+			gateway_namespace: name.gateway_namespace.as_ref(),
+			listener_name: None,
+			port: Some(port),
 		});
-		let rules = svc
-			.iter()
-			.copied()
-			.flatten()
-			.chain(listener.iter().copied().flatten())
-			.chain(listener_set_section.iter().copied().flatten())
-			.chain(listener_set.iter().copied().flatten())
-			.chain(gateway_port.iter().copied().flatten())
-			.chain(gateway.iter().copied().flatten())
-			.filter_map(|n| self.policies_by_key.get(n))
+		let rules = service
+			.into_iter()
+			.flat_map(|target| self.policies_for_target_oldest_first(&target))
+			.chain(self.policies_for_target_oldest_first(&name.as_listener_target_ref()))
+			.chain(
+				name
+					.as_listenerset_listener_target_ref()
+					.into_iter()
+					.flat_map(|target| self.policies_for_target_oldest_first(&target)),
+			)
+			.chain(
+				name
+					.as_listenerset_target_ref()
+					.into_iter()
+					.flat_map(|target| self.policies_for_target_oldest_first(&target)),
+			)
+			.chain(
+				gateway_port
+					.into_iter()
+					.flat_map(|target| self.policies_for_target_oldest_first(&target)),
+			)
+			.chain(self.policies_for_target_oldest_first(&name.as_gateway_target_ref()))
 			.filter_map(|p| p.policy.as_frontend());
 		let mut pol = FrontendPolices::default();
 		rules.for_each(|r| pol.set_if_empty(r));
@@ -1668,6 +1672,9 @@ impl Store {
 			&& let Some(o) = self.policies_by_target.get_mut(&old.target)
 		{
 			o.remove(&pol);
+			if o.is_empty() {
+				self.policies_by_target.remove(&old.target);
+			}
 		}
 	}
 	#[instrument(
@@ -1808,6 +1815,9 @@ impl Store {
 			// Remove the old target. We may add it back, though.
 			if let Some(o) = self.policies_by_target.get_mut(&old.target) {
 				o.remove(&pol.key);
+				if o.is_empty() {
+					self.policies_by_target.remove(&old.target);
+				}
 			}
 		}
 		self
@@ -1834,7 +1844,7 @@ impl Store {
 		let listeners = self.listeners.entry(bind_name.clone()).or_default();
 		if listeners
 			.get(&listener_key)
-			.is_some_and(|current| current != &lis)
+			.is_some_and(|current| !current.serving_eq(&lis))
 			&& self.binds.contains_key(&bind_name)
 		{
 			serving_listener_changed = true;
@@ -1930,7 +1940,7 @@ impl Store {
 		res: ADPResource,
 		diagnostics: &mut Diagnostics,
 	) -> anyhow::Result<()> {
-		trace!(%name, "insert resource {res:?}");
+		trace!(%name, kind = %xds_resource_kind(&res), "insert resource");
 		match res.kind {
 			Some(XdsKind::Bind(w)) => {
 				self
@@ -2135,14 +2145,18 @@ impl StoreUpdater {
 	pub fn new(state: Arc<RwLock<Store>>) -> StoreUpdater {
 		Self { state }
 	}
-	pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Store> {
-		self.state.read().expect("mutex acquired")
+	#[track_caller]
+	pub fn read(&self) -> crate::store::ReadGuard<'_, Store> {
+		thread_local! {
+			static BINDS_READ_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+		}
+		crate::store::ReadGuard::new(&self.state, &BINDS_READ_DEPTH)
 	}
 	pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, Store> {
 		self.state.write().expect("mutex acquired")
 	}
 	pub fn dump(&self) -> Dump {
-		let store = self.state.read().expect("mutex");
+		let store = self.read();
 
 		// Services all have hostname, so use that as the key
 		let binds: Vec<_> = store
@@ -2382,6 +2396,30 @@ impl agent_xds::Handler<ADPResource> for StoreUpdater {
 			}
 		}
 
+		// Reclaim excess capacity after the batch, leaving headroom for future updates.
+		macro_rules! shrink {
+			($($field:ident),+ $(,)?) => {
+				$(
+					let map = &mut state.$field;
+					if map.capacity() > 1024 && map.len() < map.capacity() / 4 {
+						map.shrink_to(map.len() * 2);
+					}
+				)+
+			};
+		}
+		shrink!(
+			binds,
+			resources,
+			policies_by_key,
+			policies_by_target,
+			backends,
+			model_routes,
+			model_routers,
+			listeners,
+			http_routes,
+			tcp_routes,
+		);
+
 		if rejects.is_empty() {
 			Ok(())
 		} else {
@@ -2424,6 +2462,175 @@ mod tests {
 			listener_name: strng::literal!("listener"),
 			listener_set: None,
 		}
+	}
+
+	#[test]
+	fn xds_insert_trace_logs_identity_without_api_key() {
+		use agent_xds::{Handler, XdsResource};
+
+		const SENTINEL: &str = "trace-must-not-contain-subscription-key";
+
+		#[derive(Clone)]
+		struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+		impl std::io::Write for LogWriter {
+			fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+				self.0.lock().unwrap().extend_from_slice(buf);
+				Ok(buf.len())
+			}
+
+			fn flush(&mut self) -> std::io::Result<()> {
+				Ok(())
+			}
+		}
+
+		let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let writer = LogWriter(logs.clone());
+		let subscriber = tracing_subscriber::fmt()
+			.with_ansi(false)
+			.without_time()
+			.with_max_level(tracing::Level::TRACE)
+			.with_writer(move || writer.clone())
+			.finish();
+
+		tracing::subscriber::with_default(subscriber, || {
+			let updater = StoreUpdater::new(Arc::new(RwLock::new(Store::with_ipv6_enabled(true))));
+			let policy = XdsPolicy {
+				key: "gateways/default/policies/subscriptions".to_string(),
+				target: Some(crate::types::proto::agent::PolicyTarget {
+					kind: Some(crate::types::proto::agent::policy_target::Kind::Gateway(
+						crate::types::proto::agent::policy_target::GatewayTarget {
+							name: "default".to_string(),
+							namespace: "default".to_string(),
+							listener: Some("default".to_string()),
+							port: None,
+						},
+					)),
+				}),
+				kind: Some(crate::types::proto::agent::policy::Kind::Traffic(
+					crate::types::proto::agent::TrafficPolicySpec {
+						kind: Some(
+							crate::types::proto::agent::traffic_policy_spec::Kind::ApiKeyAuth(
+								crate::types::proto::agent::traffic_policy_spec::ApiKey {
+									api_keys: vec![
+										crate::types::proto::agent::traffic_policy_spec::api_key::User {
+											key: SENTINEL.to_string(),
+											..Default::default()
+										},
+									],
+									mode: crate::types::proto::agent::traffic_policy_spec::api_key::Mode::Strict
+										as i32,
+									authorization_location: Some(crate::types::proto::agent::AuthorizationLocation {
+										kind: Some(
+											crate::types::proto::agent::authorization_location::Kind::Header(
+												crate::types::proto::agent::authorization_location::Header {
+													name: "api-key".to_string(),
+													prefix: None,
+												},
+											),
+										),
+									}),
+								},
+							),
+						),
+						..Default::default()
+					},
+				)),
+				..Default::default()
+			};
+			let mut updates = vec![XdsUpdate::Update(XdsResource {
+				name: strng::literal!("policy/subscriptions"),
+				resource: ADPResource {
+					kind: Some(XdsKind::Policy(policy)),
+				},
+			})]
+			.into_iter();
+
+			updater
+				.handle(Box::new(&mut updates))
+				.expect("subscription policy accepted");
+		});
+
+		let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+		assert!(logs.contains("name=policy/subscriptions"), "{logs}");
+		assert!(logs.contains("kind=policy"), "{logs}");
+		assert!(!logs.contains(SENTINEL), "{logs}");
+	}
+
+	#[test]
+	fn xds_invalid_gcp_credential_warns_without_blocking_other_backends() {
+		use agent_xds::{Handler, XdsResource};
+
+		use crate::types::proto::agent::{
+			BackendAuthPolicy, BackendPolicySpec, Gcp, ResourceName, StaticBackend, backend,
+			backend_auth_policy, backend_policy_spec,
+		};
+
+		fn backend(key: &str, credential: Option<&str>) -> XdsBackend {
+			XdsBackend {
+				key: key.to_string(),
+				name: Some(ResourceName {
+					name: key.rsplit_once('/').expect("key has name").1.to_string(),
+					namespace: key
+						.split_once('/')
+						.expect("key has namespace")
+						.0
+						.to_string(),
+					kind: None,
+				}),
+				kind: Some(backend::Kind::Static(StaticBackend {
+					host: "backend.example.com".to_string(),
+					port: 80,
+					unix_path: String::new(),
+				})),
+				inline_policies: credential
+					.map(|credential| BackendPolicySpec {
+						kind: Some(backend_policy_spec::Kind::Auth(BackendAuthPolicy {
+							kind: Some(backend_auth_policy::Kind::Gcp(Gcp {
+								credential: Some(credential.to_string()),
+								token_type: None,
+							})),
+							credentials: vec![],
+						})),
+					})
+					.into_iter()
+					.collect(),
+			}
+		}
+
+		let updater = StoreUpdater::new(Arc::new(RwLock::new(Store::with_ipv6_enabled(true))));
+		let mut updates = vec![
+			XdsUpdate::Update(XdsResource {
+				name: strng::literal!("backend/default/bad-gcp"),
+				resource: ADPResource {
+					kind: Some(XdsKind::Backend(backend(
+						"default/bad-gcp",
+						Some(
+							r#"{"type":"service_account","project_id":"project","private_key_id":"key-id","private_key":"PRIVATE_KEY"}"#,
+						),
+					))),
+				},
+			}),
+			XdsUpdate::Update(XdsResource {
+				name: strng::literal!("backend/default/healthy"),
+				resource: ADPResource {
+					kind: Some(XdsKind::Backend(backend("default/healthy", None))),
+				},
+			}),
+		]
+		.into_iter();
+
+		let rejects = updater
+			.handle(Box::new(&mut updates))
+			.expect_err("the invalid GCP credential should produce a warning");
+		let rejects = RejectedConfig::format_json(&rejects);
+		assert!(rejects.contains("\"warn\":"));
+		assert!(!rejects.contains("\"error\":"));
+		assert!(!rejects.contains("PRIVATE_KEY"));
+
+		let store = updater.read();
+		assert!(store.backend(&strng::literal!("default/bad-gcp")).is_some());
+		assert!(store.backend(&strng::literal!("default/healthy")).is_some());
 	}
 
 	#[tokio::test]
@@ -2477,6 +2684,67 @@ mod tests {
 	}
 
 	#[test]
+	fn listener_inline_policies_take_precedence_and_track_store() {
+		fn cors(origin: &str) -> TrafficPolicy {
+			TrafficPolicy::CORS(RequestPolicy::single(
+				http::cors::Cors::try_from(http::cors::CorsSerde {
+					allow_credentials: false,
+					allow_headers: vec![],
+					allow_methods: vec![],
+					allow_origins: vec![origin.to_string()],
+					expose_headers: vec![],
+					max_age: None,
+				})
+				.unwrap(),
+			))
+		}
+		let selected_origin =
+			|pol: &GatewayPolicies| serde_json::to_value(&pol.cors).unwrap()["allowOrigins"][0].clone();
+
+		let bind = strng::literal!("8080/ns/gw");
+		let name = listener();
+		let mut store = Store::with_ipv6_enabled(true);
+		let target = PolicyTarget::Gateway(ListenerTarget {
+			gateway_name: name.gateway_name.clone(),
+			gateway_namespace: name.gateway_namespace.clone(),
+			listener_name: Some(name.listener_name.clone()),
+			port: None,
+		});
+		store.insert_policy(TargetedPolicy {
+			key: strng::literal!("attached"),
+			name: None,
+			target,
+			creation_timestamp: 0,
+			inheritance: Default::default(),
+			policy: (
+				cors("https://attached.example.com"),
+				agent::PolicyPhase::Gateway,
+			)
+				.into(),
+		});
+		let snapshot = Listener {
+			key: strng::literal!("gw.listener"),
+			name,
+			inline_policies: vec![cors("https://inline.example.com")],
+			..Default::default()
+		};
+		store.insert_listener(snapshot.clone(), bind.clone());
+		assert_eq!(
+			selected_origin(&store.gateway_policies(&bind, &snapshot)),
+			"https://inline.example.com"
+		);
+
+		// A connection may hold an older snapshot; the current listener's inline policies apply.
+		let mut updated = snapshot.clone();
+		updated.inline_policies = vec![];
+		store.insert_listener(updated, bind.clone());
+		assert_eq!(
+			selected_origin(&store.gateway_policies(&bind, &snapshot)),
+			"https://attached.example.com"
+		);
+	}
+
+	#[test]
 	fn moving_listener_before_binds_arrive_keeps_only_latest_assignment() {
 		let listener_key = strng::literal!("gw.http");
 		let listener = Listener {
@@ -2489,6 +2757,7 @@ mod tests {
 			},
 			hostname: strng::EMPTY,
 			protocol: ListenerProtocol::HTTP,
+			..Default::default()
 		};
 		let old_bind = strng::literal!("8080/ns/gw");
 		let new_bind = strng::literal!("8443/ns/gw");
@@ -2547,6 +2816,7 @@ mod tests {
 			},
 			hostname: strng::EMPTY,
 			protocol: ListenerProtocol::HTTP,
+			..Default::default()
 		};
 		let tls_listener = Listener {
 			key: tls_key.clone(),
@@ -2558,6 +2828,7 @@ mod tests {
 			},
 			hostname: strng::EMPTY,
 			protocol: ListenerProtocol::TLS(None),
+			..Default::default()
 		};
 		let bind_8080 = strng::literal!("8080/ns/gw");
 		let bind_8443 = strng::literal!("8443/ns/gw");
@@ -2645,10 +2916,12 @@ mod tests {
 		let pol = timeout::Policy {
 			request_timeout: Some(Duration::from_secs(request_timeout_secs)),
 			backend_request_timeout: None,
+			response_idle_timeout: None,
 		};
 		insert_traffic_policy(
 			store,
 			key,
+			0,
 			PolicyTarget::Route(route_target),
 			Default::default(),
 			TrafficPolicy::Timeout(pol.clone()),
@@ -2659,6 +2932,7 @@ mod tests {
 	fn insert_traffic_policy(
 		store: &mut Store,
 		key: &str,
+		creation_timestamp: i64,
 		target: PolicyTarget,
 		inheritance: PolicyInheritance,
 		policy: TrafficPolicy,
@@ -2668,6 +2942,7 @@ mod tests {
 			key: policy_key.clone(),
 			name: None,
 			target: target.clone(),
+			creation_timestamp,
 			inheritance,
 			policy: policy.into(),
 		};
@@ -2684,6 +2959,7 @@ mod tests {
 
 	fn create_access_log_policy(remove_item: &str) -> FrontendPolicy {
 		FrontendPolicy::AccessLog(LoggingPolicy {
+			preset: None,
 			filter: None,
 			add: Arc::new(OrderedStringMap::default()),
 			remove: Arc::new(FzHashSet::new(vec![remove_item.into()])),
@@ -2704,55 +2980,6 @@ mod tests {
 				vec![],
 			)),
 		))
-	}
-
-	#[test]
-	fn model_router_matches_only_standard_endpoints() {
-		let matches = Store::model_router_matches();
-		assert!(matches.iter().any(|route_match| {
-			matches!(
-				route_match.path,
-				agent::PathMatch::Exact(ref path) if path == "/v1/chat/completions"
-			)
-		}));
-		assert!(
-			matches
-				.iter()
-				.all(|route_match| { !matches!(route_match.path, agent::PathMatch::PathPrefix(_)) })
-		);
-		let regexes = matches
-			.iter()
-			.filter_map(|route_match| match &route_match.path {
-				agent::PathMatch::Regex(regex) => Some(regex),
-				_ => None,
-			})
-			.collect::<Vec<_>>();
-		let matches_any = |path: &str| regexes.iter().any(|regex| regex.is_match(path));
-		assert!(matches_any(
-			"/v1/projects/project/locations/us-central1/publishers/google/models/gemini:rawPredict"
-		));
-		assert!(matches_any(
-			"/v1/projects/project/locations/global/publishers/google/models/gemini-2.5-flash:generateContent"
-		));
-		assert!(matches_any(
-			"/v1/projects/project/locations/global/publishers/google/models/gemini-2.5-flash:streamGenerateContent"
-		));
-		assert!(matches_any(
-			"/v1/projects/project/locations/global/publishers/google/models/gemini-2.5-flash:countTokens"
-		));
-		assert!(matches_any(
-			"/v1beta/models/gemini-2.5-flash:generateContent"
-		));
-		assert!(matches_any(
-			"/v1beta/models/gemini-2.5-flash:streamGenerateContent"
-		));
-		assert!(matches_any("/v1beta/models/gemini-2.5-flash:countTokens"));
-		assert!(matches_any(
-			"/v1alpha/models/gemini-2.5-flash:generateContent"
-		));
-		assert!(matches_any("/v1/models/gemini-2.5-flash:generateContent"));
-		assert!(!matches_any("/v1beta/models/gemini-2.5-flash:rawPredict"));
-		assert!(!matches_any("/arbitrary/v1/chat/completions"));
 	}
 
 	#[test]
@@ -2801,6 +3028,7 @@ mod tests {
 					)),
 				}),
 				backend_policies: vec![],
+				..Default::default()
 			})),
 			ai_policy: None,
 			authorization: None,
@@ -2824,6 +3052,51 @@ mod tests {
 			.get_listener_routes(&listener_key)
 			.expect("listener should have model router route");
 		assert!(routes.contains(&route_key));
+		let route = routes.iter().find(|route| route.key == route_key).unwrap();
+		let matches_path = |path: &str| {
+			let request = ::http::Request::builder()
+				.uri(path)
+				.body(crate::http::Body::empty())
+				.unwrap();
+			crate::http::route::best_match_for_route(route, &request).is_some()
+		};
+		for path in [
+			"/v1/messages",
+			"/v1/models",
+			"/v1/audio/transcriptions",
+			"/v1/ocr",
+			"/model/claude/converse",
+			"/model/claude/converse-stream",
+			"/model/claude/invoke",
+			"/model/claude/invoke-with-response-stream",
+			"/v1beta/models/gemini:generateContent",
+			"/v1beta/models/gemini:streamGenerateContent?alt=sse",
+			"/v1beta/models/gemini:countTokens",
+			"/v1/projects/p/locations/global/publishers/google/models/gemini:generateContent",
+			"/v1/projects/p/locations/global/publishers/google/models/gemini:streamGenerateContent",
+			"/v1/projects/p/locations/global/publishers/google/models/gemini:countTokens",
+			"/v1/projects/p/locations/us/publishers/anthropic/models/claude:rawPredict",
+			"/v1/projects/p/locations/us/publishers/anthropic/models/claude:streamRawPredict",
+		] {
+			assert!(matches_path(path), "{path}");
+		}
+		for path in [
+			"/",
+			"/custom",
+			"/other/v1/messages",
+			"/v1/messages/extra",
+			"/foo/v1/models",
+			"/other/model/claude/converse",
+			"/model/claude/converse/extra",
+			"/other/v1beta/models/gemini:generateContent",
+			"/v1beta/models/gemini:generateContent/extra",
+			"/v1beta/models/gemini:unsupported",
+			"/other/v1/projects/p/locations/us/publishers/anthropic/models/claude:rawPredict",
+			"/v1/projects/p/locations/us/publishers/anthropic/models/claude:rawPredict/extra",
+		] {
+			assert!(!matches_path(path), "{path}");
+		}
+
 		let backend = store
 			.backends
 			.get(&backend_key)
@@ -2863,6 +3136,7 @@ mod tests {
 					)),
 				}),
 				backend_policies: vec![],
+				..Default::default()
 			})),
 			ai_policy: None,
 			authorization: None,
@@ -2999,6 +3273,7 @@ mod tests {
 						kind: Some(backend_reference::Kind::Backend(format!("/default/{name}"))),
 					}),
 					backend_policies: vec![],
+					..Default::default()
 				})),
 				ai_policy: None,
 				authorization: None,
@@ -3145,6 +3420,7 @@ mod tests {
 				},
 				hostname: strng::literal!("example.com"),
 				protocol: ListenerProtocol::HTTP,
+				..Default::default()
 			}])),
 		};
 		let route = Route {
@@ -3206,6 +3482,7 @@ mod tests {
 				},
 				hostname: strng::literal!("example.com"),
 				protocol: ListenerProtocol::HTTP,
+				..Default::default()
 			}])),
 		}
 	}
@@ -3354,6 +3631,7 @@ mod tests {
 		let svc_timeout = timeout::Policy {
 			request_timeout: Some(Duration::from_secs(7)),
 			backend_request_timeout: None,
+			response_idle_timeout: None,
 		};
 
 		let xds_route = XdsRoute {
@@ -3385,6 +3663,7 @@ mod tests {
 					key: svc_policy_key.clone(),
 					name: None,
 					target: svc_policy_target.clone(),
+					creation_timestamp: 0,
 					inheritance: Default::default(),
 					policy: TrafficPolicy::Timeout(svc_timeout.clone()).into(),
 				}),
@@ -3438,23 +3717,23 @@ mod tests {
 		policy: FrontendPolicy,
 		port: Option<u16>,
 	) {
-		insert_policy_at_level_with_inheritance(
+		insert_policy_at_level_with_timestamp(
 			store,
 			listener,
 			policy_name,
 			for_listener,
-			Default::default(),
+			0,
 			policy,
 			port,
 		);
 	}
 
-	fn insert_policy_at_level_with_inheritance(
+	fn insert_policy_at_level_with_timestamp(
 		store: &mut Store,
 		listener: &ListenerName,
 		policy_name: &str,
 		for_listener: bool,
-		inheritance: PolicyInheritance,
+		creation_timestamp: i64,
 		policy: FrontendPolicy,
 		port: Option<u16>,
 	) {
@@ -3474,7 +3753,8 @@ mod tests {
 			key: policy_key.clone(),
 			name: None,
 			target: target.clone(),
-			inheritance,
+			creation_timestamp,
+			inheritance: Default::default(),
 			policy: agent::PolicyType::Frontend(policy),
 		};
 
@@ -3580,9 +3860,18 @@ mod tests {
 		store: &mut Store,
 		listener: &ListenerName,
 		name: &str,
+		creation_timestamp: i64,
 		policy: FrontendPolicy,
 	) {
-		insert_policy_at_level(store, listener, name, false, policy, None);
+		insert_policy_at_level_with_timestamp(
+			store,
+			listener,
+			name,
+			false,
+			creation_timestamp,
+			policy,
+			None,
+		);
 	}
 
 	fn resolve_two_gateway_access_log_policies(order_swapped: bool) -> FrontendPolices {
@@ -3593,13 +3882,13 @@ mod tests {
 		} else {
 			("policy-a", "policy-b")
 		};
-		let (first_pol, second_pol) = if order_swapped {
-			(otlp_access_log_policy(), stdout_access_log_policy())
+		let (first_pol, first_created, second_pol, second_created) = if order_swapped {
+			(otlp_access_log_policy(), 10, stdout_access_log_policy(), 20)
 		} else {
-			(stdout_access_log_policy(), otlp_access_log_policy())
+			(stdout_access_log_policy(), 20, otlp_access_log_policy(), 10)
 		};
-		insert_gateway_frontend_policy(&mut store, &listener, first, first_pol);
-		insert_gateway_frontend_policy(&mut store, &listener, second, second_pol);
+		insert_gateway_frontend_policy(&mut store, &listener, first, first_created, first_pol);
+		insert_gateway_frontend_policy(&mut store, &listener, second, second_created, second_pol);
 		store.listener_frontend_policies(&listener, None, None)
 	}
 
@@ -3652,28 +3941,18 @@ mod tests {
 		);
 	}
 
-	/// The stable policy key breaks ties between policies at the same attachment level, regardless
-	/// of insertion order. Conflicting policies select one winner rather than merge; the conflict
-	/// should surface through the controller's policy status. The core policy model does not carry
-	/// Kubernetes creation timestamps.
+	/// Conflicting policies at the same attachment level select the oldest policy as one unit,
+	/// regardless of key or insertion order.
 	#[test]
-	fn frontend_access_log_selection_is_deterministic() {
-		for attempt in 0..64 {
-			for order_swapped in [false, true] {
-				let pol = resolve_two_gateway_access_log_policies(order_swapped);
-				let access_log = pol
-					.access_log
-					.as_ref()
-					.expect("an access log policy should be selected");
-				assert!(
-					access_log.filter.is_some() && access_log.add.contains_key("request_body"),
-					"attempt {attempt}: policy-a should win independent of insertion order",
-				);
-				assert!(
-					!access_log.add.contains_key("probe.const"),
-					"attempt {attempt}: conflicting access log policies must not merge",
-				);
-			}
+	fn frontend_access_log_selection_prefers_oldest() {
+		for order_swapped in [false, true] {
+			let pol = resolve_two_gateway_access_log_policies(order_swapped);
+			let access_log = pol
+				.access_log
+				.as_ref()
+				.expect("an access log policy should be selected");
+			assert!(access_log.filter.is_none());
+			assert!(access_log.add.contains_key("probe.const"));
 		}
 	}
 
@@ -3720,6 +3999,50 @@ mod tests {
 	}
 
 	#[test]
+	fn same_level_route_policy_selects_oldest() {
+		let mut store = Store::default();
+		let listener = listener();
+		let route = route("r", "ns", Some("HTTPRoute"));
+		let newer = timeout::Policy {
+			request_timeout: Some(Duration::from_secs(1)),
+			..Default::default()
+		};
+		let older = timeout::Policy {
+			request_timeout: Some(Duration::from_secs(2)),
+			..Default::default()
+		};
+		insert_traffic_policy(
+			&mut store,
+			"a-newer",
+			20,
+			PolicyTarget::Route(route.clone()),
+			PolicyInheritance::Default,
+			TrafficPolicy::Timeout(newer),
+		);
+		insert_traffic_policy(
+			&mut store,
+			"z-older",
+			10,
+			PolicyTarget::Route(route.clone()),
+			PolicyInheritance::Default,
+			TrafficPolicy::Timeout(older.clone()),
+		);
+
+		let selected = store
+			.route_policies(&RoutePath {
+				listener: &listener,
+				service: None,
+				routes: vec![&route],
+				route_inlines: vec![&[]],
+			})
+			.timeout
+			.select("timeout", &request_for_policy_selection())
+			.as_deref()
+			.cloned();
+		assert_eq!(selected, Some(older));
+	}
+
+	#[test]
 	fn route_policies_include_listenerset_targets() {
 		let mut store = Store::default();
 		let listener_set = ResourceName::new(strng::new("my-ls"), strng::new("default"));
@@ -3736,14 +4059,17 @@ mod tests {
 		let set_timeout = timeout::Policy {
 			request_timeout: Some(Duration::from_secs(1)),
 			backend_request_timeout: None,
+			response_idle_timeout: None,
 		};
 		let section_timeout = timeout::Policy {
 			request_timeout: Some(Duration::from_secs(2)),
 			backend_request_timeout: None,
+			response_idle_timeout: None,
 		};
 		insert_traffic_policy(
 			&mut store,
 			"listenerset-timeout",
+			0,
 			PolicyTarget::ListenerSet(ListenerSetTarget {
 				name: strng::new("my-ls"),
 				namespace: strng::new("default"),
@@ -3755,6 +4081,7 @@ mod tests {
 		insert_traffic_policy(
 			&mut store,
 			"listenerset-section-timeout",
+			0,
 			PolicyTarget::ListenerSet(ListenerSetTarget {
 				name: strng::new("my-ls"),
 				namespace: strng::new("default"),
@@ -3821,6 +4148,7 @@ mod tests {
 		let parent_timeout = timeout::Policy {
 			request_timeout: Some(Duration::from_secs(1)),
 			backend_request_timeout: None,
+			response_idle_timeout: None,
 		};
 		let child_timeout = insert_route_timeout_policy(&mut store, "p-child", child_route.clone(), 2);
 		let parent_inline = [TrafficPolicy::Timeout(parent_timeout.clone())];
@@ -3851,10 +4179,12 @@ mod tests {
 		let gateway_timeout = timeout::Policy {
 			request_timeout: Some(Duration::from_secs(1)),
 			backend_request_timeout: None,
+			response_idle_timeout: None,
 		};
 		insert_traffic_policy(
 			&mut store,
 			"gateway-timeout",
+			0,
 			PolicyTarget::Gateway(agent::ListenerTarget {
 				gateway_name: listener.gateway_name.clone(),
 				gateway_namespace: listener.gateway_namespace.clone(),
@@ -3867,6 +4197,7 @@ mod tests {
 		insert_traffic_policy(
 			&mut store,
 			"listener-override",
+			0,
 			PolicyTarget::Gateway(agent::ListenerTarget {
 				gateway_name: listener.gateway_name.clone(),
 				gateway_namespace: listener.gateway_namespace.clone(),
@@ -3880,6 +4211,7 @@ mod tests {
 		insert_traffic_policy(
 			&mut store,
 			"route-host-rewrite",
+			0,
 			PolicyTarget::Route(route.clone()),
 			PolicyInheritance::Default,
 			TrafficPolicy::HostRewrite(agent::HostRedirectOverride::Auto),
@@ -3984,41 +4316,47 @@ mod tests {
 
 		assert!(
 			network_authz
-				.apply(&crate::cel::SourceContext {
-					address: "10.1.2.3".parse().unwrap(),
-					port: 12345,
-					raw_address: "10.1.2.3".parse().unwrap(),
-					raw_port: 12345,
-					tls: None,
-					unverified_workload: None,
-					connect_headers: http::HeaderMap::new(),
-				})
+				.apply(&crate::cel::Executor::new_source(
+					&crate::cel::SourceContext {
+						address: "10.1.2.3".parse().unwrap(),
+						port: 12345,
+						raw_address: "10.1.2.3".parse().unwrap(),
+						raw_port: 12345,
+						tls: None,
+						unverified_workload: None,
+						connect_headers: http::HeaderMap::new(),
+					}
+				))
 				.is_ok()
 		);
 		assert!(
 			network_authz
-				.apply(&crate::cel::SourceContext {
-					address: "192.168.1.2".parse().unwrap(),
-					port: 12345,
-					raw_address: "192.168.1.2".parse().unwrap(),
-					raw_port: 12345,
-					tls: None,
-					unverified_workload: None,
-					connect_headers: http::HeaderMap::new(),
-				})
+				.apply(&crate::cel::Executor::new_source(
+					&crate::cel::SourceContext {
+						address: "192.168.1.2".parse().unwrap(),
+						port: 12345,
+						raw_address: "192.168.1.2".parse().unwrap(),
+						raw_port: 12345,
+						tls: None,
+						unverified_workload: None,
+						connect_headers: http::HeaderMap::new(),
+					}
+				))
 				.is_ok()
 		);
 		assert!(
 			network_authz
-				.apply(&crate::cel::SourceContext {
-					address: "172.16.0.1".parse().unwrap(),
-					port: 12345,
-					raw_address: "172.16.0.1".parse().unwrap(),
-					raw_port: 12345,
-					tls: None,
-					unverified_workload: None,
-					connect_headers: http::HeaderMap::new(),
-				})
+				.apply(&crate::cel::Executor::new_source(
+					&crate::cel::SourceContext {
+						address: "172.16.0.1".parse().unwrap(),
+						port: 12345,
+						raw_address: "172.16.0.1".parse().unwrap(),
+						raw_port: 12345,
+						tls: None,
+						unverified_workload: None,
+						connect_headers: http::HeaderMap::new(),
+					}
+				))
 				.is_err()
 		);
 	}
@@ -4115,17 +4453,23 @@ mod tests {
 		let backend_attached_policy = TargetedPolicy {
 			key: backend_attached_policy_key.clone(),
 			name: None,
+			creation_timestamp: 0,
 			target: PolicyTarget::Backend(BackendTarget::Backend {
 				name: strng::new("test-backend"),
 				namespace: strng::new("test-ns"),
 				section: None,
+				kind: None,
 			}),
 			inheritance: Default::default(),
 			policy: PolicyType::Backend(BackendTrafficPolicy::RequestHeaderModifier(
 				HeaderModifier {
 					add: vec![],
-					set: vec![(strng::new("x-foo"), strng::new("bar"))],
+					set: vec![(
+						::http::HeaderName::from_static("x-foo"),
+						::http::HeaderValue::from_static("bar"),
+					)],
 					remove: vec![],
+					invalid: None,
 				},
 			)),
 		};
@@ -4136,17 +4480,23 @@ mod tests {
 		let section_policy = TargetedPolicy {
 			key: section_policy_key.clone(),
 			name: None,
+			creation_timestamp: 0,
 			target: PolicyTarget::Backend(BackendTarget::Backend {
 				name: strng::new("test-backend"),
 				namespace: strng::new("test-ns"),
 				section: Some(strng::new("target")),
+				kind: None,
 			}),
 			inheritance: Default::default(),
 			policy: PolicyType::Backend(BackendTrafficPolicy::RequestHeaderModifier(
 				HeaderModifier {
 					add: vec![],
-					set: vec![(strng::new("x-foo"), strng::new("bar3"))],
+					set: vec![(
+						::http::HeaderName::from_static("x-foo"),
+						::http::HeaderValue::from_static("bar3"),
+					)],
 					remove: vec![],
+					invalid: None,
 				},
 			)),
 		};
@@ -4156,8 +4506,12 @@ mod tests {
 		let backend_inline_policies = vec![BackendTrafficPolicy::RequestHeaderModifier(
 			HeaderModifier {
 				add: vec![],
-				set: vec![(strng::new("x-foo"), strng::new("bar2"))],
+				set: vec![(
+					::http::HeaderName::from_static("x-foo"),
+					::http::HeaderValue::from_static("bar2"),
+				)],
 				remove: vec![],
+				invalid: None,
 			},
 		)];
 
@@ -4167,6 +4521,7 @@ mod tests {
 				name: "test-backend",
 				namespace: "test-ns",
 				section: None,
+				kind: None,
 			},
 			&[&backend_inline_policies],
 			None,
@@ -4187,7 +4542,10 @@ mod tests {
 		);
 		assert_eq!(
 			modifier.set[0],
-			(strng::new("x-foo"), strng::new("bar2")),
+			(
+				::http::HeaderName::from_static("x-foo"),
+				::http::HeaderValue::from_static("bar2")
+			),
 			"Inline policy (bar2) should win over backend attached policy (bar)"
 		);
 
@@ -4197,6 +4555,7 @@ mod tests {
 				name: "test-backend",
 				namespace: "test-ns",
 				section: Some("target"),
+				kind: None,
 			},
 			&[&backend_inline_policies],
 			None,
@@ -4217,7 +4576,10 @@ mod tests {
 		);
 		assert_eq!(
 			modifier.set[0],
-			(strng::new("x-foo"), strng::new("bar2")),
+			(
+				::http::HeaderName::from_static("x-foo"),
+				::http::HeaderValue::from_static("bar2")
+			),
 			"Inline policy (bar2) should win over section attached policy (bar3)"
 		);
 
@@ -4227,6 +4589,7 @@ mod tests {
 				name: "test-backend",
 				namespace: "test-ns",
 				section: None,
+				kind: None,
 			},
 			&[],
 			None,
@@ -4244,7 +4607,10 @@ mod tests {
 		);
 		assert_eq!(
 			modifier.set[0],
-			(strng::new("x-foo"), strng::new("bar")),
+			(
+				::http::HeaderName::from_static("x-foo"),
+				::http::HeaderValue::from_static("bar")
+			),
 			"Backend attached policy (bar) should be used when no inline policies exist"
 		);
 
@@ -4254,6 +4620,7 @@ mod tests {
 				name: "test-backend",
 				namespace: "test-ns",
 				section: Some("target"),
+				kind: None,
 			},
 			&[],
 			None,
@@ -4274,7 +4641,10 @@ mod tests {
 		);
 		assert_eq!(
 			modifier.set[0],
-			(strng::new("x-foo"), strng::new("bar3")),
+			(
+				::http::HeaderName::from_static("x-foo"),
+				::http::HeaderValue::from_static("bar3")
+			),
 			"Section attached policy (bar3) should win over backend attached policy (bar)"
 		);
 	}
@@ -4319,6 +4689,7 @@ mod tests {
 				name: "test-backend",
 				namespace: "test-ns",
 				section: None,
+				kind: None,
 			},
 			&[&inline_policies],
 			None,
@@ -4410,6 +4781,7 @@ mod tests {
 		let targeted = TargetedPolicy {
 			key: policy_key.clone(),
 			name: None,
+			creation_timestamp: 0,
 			target: PolicyTarget::ListenerSet(ListenerSetTarget {
 				name: strng::new("my-ls"),
 				namespace: strng::new("default"),
@@ -4462,6 +4834,7 @@ mod tests {
 		let targeted = TargetedPolicy {
 			key: policy_key.clone(),
 			name: None,
+			creation_timestamp: 0,
 			target: PolicyTarget::ListenerSet(ListenerSetTarget {
 				name: strng::new("my-ls"),
 				namespace: strng::new("default"),

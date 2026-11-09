@@ -15,7 +15,16 @@ pub async fn run(
 	config: Arc<Config>,
 	config_resource_store: Option<config_store::ConfigResourceStore>,
 ) -> anyhow::Result<Bound> {
+	run_with_ui_assets(config, config_resource_store, &crate::ui::EMPTY_ASSETS_DIR).await
+}
+
+pub async fn run_with_ui_assets(
+	config: Arc<Config>,
+	config_resource_store: Option<config_store::ConfigResourceStore>,
+	ui_assets: &'static include_dir::Dir<'static>,
+) -> anyhow::Result<Bound> {
 	crate::transport::tls::warn_if_key_log_enabled();
+	crate::proxy::policy_host::install_policy_trace();
 	let (data_plane_handle, data_plane_pool) = new_data_plane_pool(config.num_worker_threads);
 
 	// Initialize OpenTelemetry resource defaults from gateway + proxy metadata
@@ -57,7 +66,9 @@ pub async fn run(
 	pprof_alloc::stats::smaps::PrometheusCollector::register(sub_registry);
 
 	// TODO: use for XDS
-	let control_client = client::Client::new(&config.dns, None, config.backend.clone(), None);
+	let control_client = client::Client::new(&config.dns, None, config.backend.clone(), None)
+		.with_callouts(&config.callouts)
+		.context("invalid callouts config")?;
 	let ca = if let Some(cfg) = &config.ca {
 		Some(Arc::new(caclient::CaClient::new(
 			control_client.clone(),
@@ -93,7 +104,9 @@ pub async fn run(
 		Arc::new(config.hbone.h2.clone()),
 		config.backend.clone(),
 		Some(metrics_handle.clone()),
-	);
+	)
+	.with_callouts(&config.callouts)
+	.context("invalid callouts config")?;
 
 	let model_catalog_sources = if let Some(store) = &config_resource_store {
 		config_store::merge_model_catalog_sources(
@@ -140,12 +153,21 @@ pub async fn run(
 		shutdown.trigger(),
 		drain_rx.clone(),
 		data_plane_handle.clone(),
+		ui_assets,
 	)
 	.await
 	.context("admin server starts")?;
-	if cfg!(feature = "ui") {
+	if !ui_assets.entries().is_empty() {
 		info!("serving UI at {}", ui_url(config.as_ref()).await);
 	}
+
+	let metrics_server = crate::management::metrics_server::Server::new(
+		config.stats_addr.clone(),
+		drain_rx.clone(),
+		registry,
+	)
+	.await
+	.context("stats server starts")?;
 
 	let pi = ProxyInputs {
 		cfg: config.clone(),
@@ -153,6 +175,7 @@ pub async fn run(
 		metrics: metrics_handle.clone(),
 		model_catalog,
 		admin: Some(admin_server.service()),
+		stats: Some(metrics_server.service()),
 		upstream: client.clone(),
 		ca,
 		spiffe,
@@ -181,14 +204,6 @@ pub async fn run(
 	// Run the admin server in the current tokio worker pool.
 	admin_server.spawn();
 
-	// Create and start the metrics server.
-	let metrics_server = crate::management::metrics_server::Server::new(
-		config.stats_addr.clone(),
-		drain_rx.clone(),
-		registry,
-	)
-	.await
-	.context("stats server starts")?;
 	// Run the metrics sever in the current tokio worker pool.
 	metrics_server.spawn();
 	Ok(Bound {
@@ -207,7 +222,7 @@ async fn ui_url(config: &Config) -> String {
 	let Ok(contents) = local_config.read_to_string().await else {
 		return admin_url();
 	};
-	let Ok(local) = crate::serdes::yamlviajson::from_str::<serde_json::Value>(&contents) else {
+	let Ok(local) = crate::serdes::yaml::from_str::<serde_json::Value>(&contents) else {
 		return admin_url();
 	};
 	let gateway_ref = match local.pointer("/ui/gateways") {

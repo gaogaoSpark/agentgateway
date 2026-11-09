@@ -63,7 +63,6 @@ func TestRouteCollection(t *testing.T) {
 
 func TestModels(t *testing.T) {
 	testutils.RunForDirectory(t, "testdata/models", func(t *testing.T, ctx plugins.PolicyCtx) (any, []ir.AgwResource) {
-		ctx.Collections.Settings.EnableAgentgatewayModels = true
 		sq, ri := testutils.Syncer(t, ctx, "Gateway", "AgentgatewayModel", "HTTPRoute", "InferencePool")
 		r := ri.Outputs.Resources.List()
 		return sq.Dump(), slices.SortBy(r, func(a ir.AgwResource) string {
@@ -88,7 +87,7 @@ func TestRouteDelegation(t *testing.T) {
 
 func TestGatewayCollection(t *testing.T) {
 	testutils.RunForDirectory(t, "testdata/gateways", func(t *testing.T, ctx plugins.PolicyCtx) (any, []ir.AgwResource) {
-		sq, ri := testutils.Syncer(t, ctx, "Gateway", "ListenerSet")
+		sq, ri := testutils.Syncer(t, ctx, "Gateway", "ListenerSet", "HTTPRoute")
 		r := ri.Outputs.Resources.List()
 		return sq.Dump(), slices.SortBy(r, func(a ir.AgwResource) string {
 			return a.ResourceName()
@@ -98,12 +97,13 @@ func TestGatewayCollection(t *testing.T) {
 
 func TestBackends(t *testing.T) {
 	testutils.RunForDirectory(t, "testdata/backends", func(t *testing.T, ctx plugins.PolicyCtx) (any, []any) {
+		ctx.Collections.Settings.EnableXBackend = true
 		dummyRoutes := setupDummyAncestorMapping(ctx)
 		ctx.Collections.HTTPRoutes = krt.JoinCollection([]krt.Collection[*gwv1.HTTPRoute]{
 			ctx.Collections.HTTPRoutes,
 			krt.NewStaticCollection(nil, dummyRoutes, ctx.Collections.KrtOpts.ToOptions("translator/GoldenHTTPRouteOverrides")...),
 		}, ctx.Collections.KrtOpts.ToOptions("translator/HTTPRoutesWithGoldenOverrides")...)
-		sq, ri := testutils.Syncer(t, ctx, "AgentgatewayBackend", "BackendTLSPolicy", "InferencePool")
+		sq, ri := testutils.Syncer(t, ctx, "AgentgatewayBackend", "BackendTLSPolicy", "InferencePool", "XBackend")
 		r := ri.Outputs.Resources.List()
 		r = slices.SortBy(r, func(a ir.AgwResource) string {
 			return a.ResourceName()
@@ -136,6 +136,9 @@ func TestBackends(t *testing.T) {
 func setupDummyAncestorMapping(ctx plugins.PolicyCtx) []*gwv1.HTTPRoute {
 	bes := []controllers.Object{}
 	for _, v := range ctx.Collections.Backends.List() {
+		bes = append(bes, v)
+	}
+	for _, v := range ctx.Collections.XBackends.List() {
 		bes = append(bes, v)
 	}
 	for _, v := range ctx.Collections.Services.List() {

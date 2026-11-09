@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent_core::prelude::Strng;
 pub use agent_core::serdes;
@@ -175,6 +175,10 @@ pub enum RouteType {
 	GeminiCountTokens,
 	/// Cohere /v2/rerank (document reranking)
 	Rerank,
+	/// OpenAI /v1/decisions
+	Decisions,
+	/// TypeSafe /v1/systemone
+	SystemOne,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -186,8 +190,12 @@ pub enum InputFormat {
 	Realtime,
 	/// Anthropic-shaped /v1/messages/count_tokens body
 	CountTokens,
-	Detect,
+	/// Forwarded as-is, with usage inspected from the response. The operation is what the model
+	/// router recognizes the request path as, if anything.
+	Detect(Option<DetectedOperation>),
 	Rerank,
+	Decisions,
+	SystemOne,
 	/// Native Gemini generateContent body
 	Gemini,
 	/// Native Gemini countTokens body
@@ -210,15 +218,32 @@ impl InputFormat {
 			InputFormat::Completions => true,
 			InputFormat::Messages => true,
 			InputFormat::Responses => true,
+			InputFormat::Decisions => false,
+			InputFormat::SystemOne => false,
 			InputFormat::Gemini => true,
 			InputFormat::Realtime => false,
 			InputFormat::Embeddings => false,
 			InputFormat::CountTokens => false,
 			InputFormat::GeminiCountTokens => false,
-			InputFormat::Detect => false,
+			InputFormat::Detect(_) => false,
 			InputFormat::Rerank => false,
 		}
 	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum DetectedOperation {
+	Chat,
+	GenerateContent,
+	Embeddings,
+	CountTokens,
+	Rerank,
+	Decisions,
+	Image,
+	Ocr,
+	Transcription,
+	Speech,
+	Compaction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +275,10 @@ pub struct LLMRequest {
 	pub input_format: InputFormat,
 	pub cache_convention: CacheTokenConvention,
 	pub request_model: Strng,
+	/// The model the client asked for, before any virtual model or alias rewrite. Unset when the
+	/// model was not rewritten.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub original_model: Option<Strng>,
 	pub provider: Strng,
 	pub streaming: bool,
 	pub params: LLMRequestParams,
@@ -263,8 +292,14 @@ pub struct LLMRequest {
 pub enum ProviderState {
 	Bedrock {
 		tool_names: Arc<conversion::bedrock::BedrockToolNameMap>,
+		namespaces: Arc<conversion::namespace_tools::NamespaceToolMap>,
+	},
+	OpenAICompletions {
+		namespaces: Arc<conversion::namespace_tools::NamespaceToolMap>,
 	},
 	VertexGemini,
+	SystemOneDecisions(Arc<conversion::systemone::from_decisions::State>),
+	DecisionsSystemOne(Arc<conversion::systemone::from_systemone::State>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
@@ -315,6 +350,55 @@ pub struct LLMRequestParams {
 	pub encoding_format: Option<Strng>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub dimensions: Option<u64>,
+	/// The reasoning effort requested by the client: OpenAI `reasoning_effort` or
+	/// `reasoning.effort`, Anthropic `output_config.effort`, or Gemini `thinkingLevel`.
+	/// Unset when the request does not specify one, in which case the provider default applies.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[dynamic(with_value = "reasoning_effort_to_value")]
+	pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+	None,
+	Minimal,
+	Low,
+	Medium,
+	High,
+	Xhigh,
+	Max,
+}
+
+impl ReasoningEffort {
+	/// Parses a provider effort or thinking level. Unknown values are None.
+	pub fn parse(effort: &str) -> Option<Self> {
+		Some(match effort.to_ascii_lowercase().as_str() {
+			"none" => Self::None,
+			"minimal" => Self::Minimal,
+			"low" => Self::Low,
+			"medium" => Self::Medium,
+			"high" => Self::High,
+			"xhigh" => Self::Xhigh,
+			"max" => Self::Max,
+			_ => return None,
+		})
+	}
+}
+
+fn reasoning_effort_to_value(effort: &Option<ReasoningEffort>) -> ::cel::Value<'_> {
+	let effort = match effort {
+		None => return ::cel::Value::Null,
+		Some(ReasoningEffort::None) => "none",
+		Some(ReasoningEffort::Minimal) => "minimal",
+		Some(ReasoningEffort::Low) => "low",
+		Some(ReasoningEffort::Medium) => "medium",
+		Some(ReasoningEffort::High) => "high",
+		Some(ReasoningEffort::Xhigh) => "xhigh",
+		Some(ReasoningEffort::Max) => "max",
+	};
+	::cel::Value::String(effort.into())
 }
 
 impl PartialEq for LLMRequestParams {
@@ -385,9 +469,20 @@ pub struct LLMResponse {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub total_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
+	pub pages: Option<u64>,
+	/// Seconds of input audio, for models billed by duration rather than tokens.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub audio_seconds: Option<f64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub reasoning_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cache_creation_input_tokens: Option<u64>,
+	/// Subset of cache_creation_input_tokens written with a 1h TTL (Anthropic `cache_creation.ephemeral_1h_input_tokens`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_creation_1h_input_tokens: Option<u64>,
+	/// Subset of cache_creation_input_tokens written with a 12h TTL (OpenAI `cache_write_tokens_details.ttl_12h_tokens`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_creation_12h_input_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cached_input_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -398,8 +493,89 @@ pub struct LLMResponse {
 	pub completion: Option<Vec<String>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub output_messages: Option<Vec<types::OutputMessage>>,
+	/// Per-pass usage when the provider ran several inference passes for one request (Anthropic
+	/// `usage.iterations`). When set, cost is priced per line instead of from the totals above.
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub usage_lines: Vec<UsageLine>,
 	#[serde(skip)]
 	pub first_token: Option<Instant>,
+	/// Timestamp of the most recently observed output token, used to compute
+	/// inter_chunk_latencies. Not the same as first_token once more than one token has arrived.
+	#[serde(skip)]
+	pub last_token_at: Option<Instant>,
+	/// Bucketed summary of gaps between consecutive output chunks, replayed into
+	/// the inter-chunk-latency histogram at request completion.
+	#[serde(skip)]
+	pub inter_chunk_latencies: TokenGapSummary,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct UsageLine {
+	/// Provider model that ran this pass; `None` means the response's model.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub model: Option<Strng>,
+	pub input_tokens: u64,
+	pub output_tokens: u64,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_creation_input_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_creation_1h_input_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cached_input_tokens: Option<u64>,
+}
+
+/// Upper bounds for bucketing inter-chunk gaps before they're replayed into the
+/// Prometheus histogram at request completion. MUST stay numerically identical
+/// to agentgateway::telemetry::metrics::OUTPUT_TOKEN_BUCKET — this crate can't
+/// import that private constant, so the two arrays are kept in sync by hand.
+const INTER_CHUNK_LATENCY_BUCKETS: [f64; 14] = [
+	0.001, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5,
+];
+
+/// Fixed-size bucketed summary of gaps between consecutive streamed output
+/// chunks. Avoids buffering one Duration per chunk (unbounded for very long
+/// streaming responses) while still letting the exact per-bucket counts and
+/// sum be replayed into the real histogram once labels are known, at request
+/// completion.
+#[derive(Debug, Clone)]
+pub struct TokenGapSummary {
+	// One (count, sum_of_values) pair per INTER_CHUNK_LATENCY_BUCKETS entry,
+	// plus one trailing overflow bucket for values above the last boundary.
+	buckets: [(u64, f64); INTER_CHUNK_LATENCY_BUCKETS.len() + 1],
+}
+
+impl Default for TokenGapSummary {
+	fn default() -> Self {
+		Self {
+			buckets: [(0, 0.0); INTER_CHUNK_LATENCY_BUCKETS.len() + 1],
+		}
+	}
+}
+
+impl TokenGapSummary {
+	pub fn record(&mut self, gap: Duration) {
+		let v = gap.as_secs_f64();
+		let idx = INTER_CHUNK_LATENCY_BUCKETS
+			.iter()
+			.position(|&upper| v <= upper)
+			.unwrap_or(INTER_CHUNK_LATENCY_BUCKETS.len());
+		let (count, sum) = &mut self.buckets[idx];
+		*count += 1;
+		*sum += v;
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.buckets.iter().all(|(c, _)| *c == 0)
+	}
+
+	/// (count, mean_value) pairs in bucket order, for replaying into a
+	/// Prometheus histogram at request completion.
+	pub fn iter(&self) -> impl Iterator<Item = (u64, f64)> + '_ {
+		self
+			.buckets
+			.iter()
+			.map(|&(count, sum)| (count, if count == 0 { 0.0 } else { sum / count as f64 }))
+	}
 }
 
 /// LogContentFields controls which response content is captured for observability.
@@ -448,7 +624,7 @@ impl Default for StreamingUsageGuard {
 }
 
 pub use types::{
-	ContentScope, OutputMessage, OutputMessagePart, RequestType, ResponseType,
+	ContentScope, OutputMessage, OutputMessagePart, RequestType, ResponseText, ResponseType,
 	SimpleChatCompletionMessage, ToolCall,
 };
 
@@ -475,7 +651,7 @@ pub enum AIError {
 	MessageNotFound,
 	#[error("response was missing fields")]
 	IncompleteResponse,
-	#[error("todo: streaming is not currently supported for this provider")]
+	#[error("streaming is not currently supported for this provider")]
 	StreamingUnsupported,
 	#[error("unsupported model")]
 	UnsupportedModel,
@@ -489,8 +665,8 @@ pub enum AIError {
 	ResponseTooLarge,
 	#[error("prompt guard failed")]
 	PromptWebhookError,
-	#[error("failed to parse request: {0}")]
-	RequestParsing(serde_json::Error),
+	#[error("failed to parse {0:?} request: {1}")]
+	RequestParsing(InputFormat, serde_json::Error),
 	#[error("failed to marshal request: {0}")]
 	RequestMarshal(serde_json::Error),
 	#[error("failed to parse response: {0}")]
@@ -541,6 +717,58 @@ impl Default for PromptCachingConfig {
 			cache_tools: false,
 			min_tokens: Some(1024),
 			cache_message_offset: 0,
+		}
+	}
+}
+
+#[cfg(test)]
+mod token_gap_summary_tests {
+	use super::*;
+
+	#[test]
+	fn empty_summary_reports_empty() {
+		assert!(TokenGapSummary::default().is_empty());
+	}
+
+	#[test]
+	fn record_buckets_and_sums_correctly() {
+		let mut summary = TokenGapSummary::default();
+		// Falls in the first bucket (upper bound 0.001).
+		summary.record(Duration::from_micros(500));
+		// Falls in the last defined bucket (upper bound 2.5).
+		summary.record(Duration::from_millis(2000));
+		summary.record(Duration::from_millis(2400));
+		// Exceeds every defined bucket; goes into the overflow bucket.
+		summary.record(Duration::from_secs(10));
+
+		assert!(!summary.is_empty());
+
+		let buckets: Vec<(u64, f64)> = summary.iter().collect();
+		assert_eq!(buckets.len(), INTER_CHUNK_LATENCY_BUCKETS.len() + 1);
+
+		// First bucket: one observation of 0.0005s.
+		assert_eq!(buckets[0], (1, 0.0005));
+
+		// Last defined bucket (index 13, upper bound 2.5): two observations,
+		// mean should be their average.
+		let last_defined = buckets[INTER_CHUNK_LATENCY_BUCKETS.len() - 1];
+		assert_eq!(last_defined.0, 2);
+		assert!((last_defined.1 - 2.2).abs() < 1e-9);
+
+		// Overflow bucket: one observation of 10s.
+		let overflow = buckets[INTER_CHUNK_LATENCY_BUCKETS.len()];
+		assert_eq!(overflow, (1, 10.0));
+
+		// All other buckets remain untouched.
+		for (i, &(count, mean)) in buckets.iter().enumerate() {
+			if i == 0
+				|| i == INTER_CHUNK_LATENCY_BUCKETS.len() - 1
+				|| i == INTER_CHUNK_LATENCY_BUCKETS.len()
+			{
+				continue;
+			}
+			assert_eq!(count, 0);
+			assert_eq!(mean, 0.0);
 		}
 	}
 }

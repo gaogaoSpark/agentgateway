@@ -7,10 +7,17 @@ use crate::{
 	AIError, InputFormat, LLMRequest, LLMRequestParams, SimpleChatCompletionMessage, json,
 };
 
+fn default_object() -> String {
+	"list".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct Response {
+	#[serde(default = "default_object")]
 	pub object: String,
+	#[serde(default)]
 	pub model: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub usage: Option<Usage>,
 	#[serde(flatten, default)]
 	pub rest: serde_json::Value,
@@ -49,6 +56,9 @@ impl TryInto<typed::Request> for &Request {
 }
 
 impl RequestType for Request {
+	fn input_format() -> crate::InputFormat {
+		crate::InputFormat::Embeddings
+	}
 	fn body_is_json(&self) -> bool {
 		true
 	}
@@ -76,6 +86,7 @@ impl RequestType for Request {
 			input_format: InputFormat::Embeddings,
 			cache_convention: crate::CacheTokenConvention::pending(),
 			request_model: model,
+			original_model: None,
 			provider,
 			streaming: false,
 			params: LLMRequestParams {
@@ -90,6 +101,7 @@ impl RequestType for Request {
 					typed::EncodingFormat::Float => strng::literal!("float"),
 				}),
 				dimensions: self.dimensions.map(|d| d as u64),
+				reasoning_effort: None,
 			},
 			prompt: Default::default(),
 			provider_state: None,
@@ -144,7 +156,7 @@ impl crate::types::ResponseType for Response {
 		serde_json::to_vec(self)
 	}
 
-	fn visit_text_mut(&mut self, _f: &mut dyn FnMut(&mut String)) {}
+	fn visit_text_mut(&mut self, _f: &mut dyn FnMut(crate::types::ResponseText, &mut String)) {}
 }
 
 /// 'typed' provides a strictly-typed internal representation of the OpenAI embeddings API.

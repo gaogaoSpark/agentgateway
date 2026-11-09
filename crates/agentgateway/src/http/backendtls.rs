@@ -4,7 +4,7 @@ use std::sync::Arc;
 use agent_core::strng;
 use agent_core::strng::Strng;
 use once_cell::sync::Lazy;
-use rustls::ClientConfig;
+use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, ServerName};
 use serde::Serializer;
@@ -13,26 +13,11 @@ use tracing::trace;
 use crate::serdes::{schema_de, schema_ser};
 use crate::transport::tls;
 use crate::types::agent::{parse_cert, parse_key};
+use crate::types::discovery::Identity;
 use crate::{apply, transport};
 
 pub static SYSTEM_TRUST: Lazy<BackendTLS> =
 	Lazy::new(|| ResolvedBackendTLS::default().try_into().unwrap());
-pub static INSECURE_TRUST: Lazy<BackendTLS> = Lazy::new(|| {
-	ResolvedBackendTLS {
-		cert: None,
-		key: None,
-		root: None,
-		hostname: None,
-		insecure: true,
-		insecure_host: false,
-		alpn: None,
-		subject_alt_names: None,
-		key_exchange_groups: None,
-		spiffe: false,
-	}
-	.try_into()
-	.unwrap()
-});
 
 // a ClientConfig stores the ALPN, but we need to set it per request possibly. This struct helps manage that.
 #[derive(Clone, Debug)]
@@ -91,6 +76,8 @@ pub enum BackendTLSSource {
 	/// Sourced from the SPIFFE Workload API at connection time (SVID rotates), resolved via
 	/// `SpiffeClient::client_config`. See `proxy::httpproxy::resolve_backend_tls`.
 	Spiffe(SpiffeBackendTLS),
+	/// The configured TLS could not be built. Connections fail rather than fall back to plaintext.
+	Invalid(Strng),
 }
 
 /// Parameters needed to build a SPIFFE-sourced upstream `ClientConfig` at connection time.
@@ -104,11 +91,6 @@ pub struct SpiffeBackendTLS {
 }
 
 impl BackendTLS {
-	/// Whether this backend sources the gateway's client identity/roots from SPIFFE.
-	pub fn is_spiffe(&self) -> bool {
-		matches!(self.source, BackendTLSSource::Spiffe(_))
-	}
-
 	/// Returns the static config for the requested HTTP version. Only valid for
 	/// [`BackendTLSSource::Static`]; SPIFFE-sourced backends are resolved at connection time via
 	/// `proxy::httpproxy::resolve_backend_tls` and must not reach here.
@@ -121,6 +103,7 @@ impl BackendTLS {
 		VersionedBackendTLS {
 			hostname_override: self.hostname_override.clone(),
 			config: config.config_for(None),
+			expected_identities: None,
 			peer_identity_mode: tls::PeerIdentityMode::Istio,
 		}
 	}
@@ -130,22 +113,57 @@ impl BackendTLS {
 pub struct VersionedBackendTLS {
 	pub hostname_override: Option<ServerName<'static>>,
 	pub config: Arc<ClientConfig>,
+	/// If set, `config` is shared across identity sets and the peer is verified against these
+	/// identities with a verifier installed per connection. See `connect_config`.
+	pub expected_identities: Option<ExpectedIdentities>,
 	/// How to interpret the upstream server's SPIFFE identity when extracting peer TLS info.
 	/// `Spiffe` for SPIFFE-sourced backends so their non-Istio SVIDs are not parsed as Istio identities.
 	pub peer_identity_mode: tls::PeerIdentityMode,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExpectedIdentities {
+	pub roots: Arc<RootCertStore>,
+	pub identities: Vec<Identity>,
+}
+
+impl VersionedBackendTLS {
+	/// The config to establish a new connection with.
+	pub fn connect_config(&self) -> Arc<ClientConfig> {
+		let Some(expected) = &self.expected_identities else {
+			return self.config.clone();
+		};
+		let mut cc = ClientConfig::clone(&self.config);
+		cc.dangerous()
+			.set_certificate_verifier(Arc::new(tls::identity::IdentityVerifier {
+				roots: expected.roots.clone(),
+				identity: expected.identities.clone(),
+			}));
+		Arc::new(cc)
+	}
+}
+
+// Used in the connection pool key, so it must cover everything that affects how the connection was verified.
+// `roots` is not included as it is tied to `config`.
 impl std::hash::Hash for VersionedBackendTLS {
 	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 		// Hash the pointer address
 		Arc::as_ptr(&self.config).hash(state);
 		self.hostname_override.hash(state);
+		self
+			.expected_identities
+			.as_ref()
+			.map(|e| &e.identities)
+			.hash(state);
 	}
 }
 
 impl PartialEq for VersionedBackendTLS {
 	fn eq(&self, other: &Self) -> bool {
-		Arc::ptr_eq(&self.config, &other.config) && self.hostname_override == other.hostname_override
+		Arc::ptr_eq(&self.config, &other.config)
+			&& self.hostname_override == other.hostname_override
+			&& self.expected_identities.as_ref().map(|e| &e.identities)
+				== other.expected_identities.as_ref().map(|e| &e.identities)
 	}
 }
 
@@ -299,13 +317,13 @@ impl ResolvedBackendTLS {
 			}
 
 			let roots = Arc::new(roots);
-			let provider = transport::tls::provider_with_options(
+			let provider = transport::tls::provider_with_options_validated(
 				&[],
 				self.key_exchange_groups.as_deref().unwrap_or_default(),
-			);
+			)?;
 			let ccb = ClientConfig::builder_with_provider(provider.clone())
 				.with_protocol_versions(transport::tls::ALL_TLS_VERSIONS)
-				.expect("server config must be valid")
+				.expect("client config must be valid")
 				.with_root_certificates(roots.clone());
 
 			let mut cc = match (self.cert, self.key) {
@@ -398,5 +416,28 @@ impl LocalBackendTLS {
 			spiffe: self.spiffe.is_some(),
 		}
 		.try_into()
+	}
+}
+
+#[cfg(all(test, feature = "fips"))]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn fips_config_backend_tls_rejects_non_approved_key_exchange_group() {
+		let result = ResolvedBackendTLS {
+			insecure: true,
+			key_exchange_groups: Some(vec![tls::KeyExchangeGroup::X25519]),
+			..Default::default()
+		}
+		.try_into();
+		let err = match result {
+			Ok(_) => panic!("non-approved backend key exchange group was accepted"),
+			Err(err) => err,
+		};
+		assert!(
+			err.to_string().contains("X25519"),
+			"error should name the configured key exchange group, got: {err}"
+		);
 	}
 }

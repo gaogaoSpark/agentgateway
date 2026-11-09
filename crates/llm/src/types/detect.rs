@@ -29,6 +29,11 @@ fn lookup<'a, T, const C: usize>(
 pub enum Request {
 	Raw(Bytes),
 	Json(serde_json::Value),
+	/// A multipart/form-data body, forwarded as-is; `model` comes from its form field.
+	Multipart {
+		body: Bytes,
+		model: Option<String>,
+	},
 }
 
 impl<'de> Deserialize<'de> for Request {
@@ -49,13 +54,16 @@ impl Request {
 		f: impl Fn(&'a Value) -> Option<T>,
 	) -> Option<T> {
 		match &self {
-			Self::Raw(_) => None,
+			Self::Raw(_) | Self::Multipart { .. } => None,
 			Self::Json(b) => lookup(b, path, f),
 		}
 	}
 }
 
 impl RequestType for Request {
+	fn input_format() -> crate::InputFormat {
+		crate::InputFormat::Detect(None)
+	}
 	fn supports_model(&self) -> bool {
 		false
 	}
@@ -67,6 +75,7 @@ impl RequestType for Request {
 	fn to_value(&self) -> serde_json::Result<serde_json::Value> {
 		match self {
 			Self::Raw(body) => serde_json::from_slice(body),
+			Self::Multipart { .. } => Ok(Value::Null),
 			Self::Json(body) => Ok(body.clone()),
 		}
 	}
@@ -87,12 +96,14 @@ impl RequestType for Request {
 		Ok(LLMRequest {
 			// We never tokenize these, so always empty
 			input_tokens: None,
-			input_format: InputFormat::Detect,
+			input_format: InputFormat::Detect(None),
 			cache_convention: crate::CacheTokenConvention::pending(),
-			request_model: self
-				.lookup(lookups::MODEL, |v| v.as_str())
-				.map(Into::into)
-				.unwrap_or_default(),
+			request_model: match self {
+				Self::Multipart { model, .. } => model.as_deref().map(Into::into),
+				_ => self.lookup(lookups::MODEL, |v| v.as_str()).map(Into::into),
+			}
+			.unwrap_or_default(),
+			original_model: None,
 			provider,
 			streaming: self
 				.lookup(lookups::STREAM, |v| v.as_bool())
@@ -108,6 +119,9 @@ impl RequestType for Request {
 					.lookup(lookups::ENCODING_FORMAT, |v| v.as_str())
 					.map(Into::into),
 				dimensions: self.lookup(lookups::DIMENSIONS, |v| v.as_u64()),
+				reasoning_effort: self
+					.lookup(lookups::REASONING_EFFORT, |v| v.as_str())
+					.and_then(crate::ReasoningEffort::parse),
 			},
 			prompt: Default::default(),
 			provider_state: None,
@@ -197,9 +211,10 @@ mod tests {
 	fn llm_request() -> LLMRequest {
 		LLMRequest {
 			input_tokens: None,
-			input_format: crate::InputFormat::Detect,
+			input_format: crate::InputFormat::Detect(None),
 			cache_convention: crate::CacheTokenConvention::pending(),
 			request_model: strng::new("unknown"),
+			original_model: None,
 			provider: strng::new("aws.bedrock"),
 			streaming: false,
 			params: Default::default(),
@@ -429,6 +444,73 @@ mod tests {
 		assert_eq!(llm_response.output_tokens, Some(3));
 		assert_eq!(llm_response.total_tokens, Some(30550));
 	}
+
+	#[test]
+	fn to_llm_response_extracts_mistral_ocr_page_count() {
+		// Mistral Document AI bills pages, not tokens
+		let resp = Response::Json(serde_json::json!({
+			"pages": [
+				{"index": 0, "markdown": "# Title", "images": [], "dimensions": {"dpi": 200}},
+				{"index": 1, "markdown": "body", "images": [], "dimensions": {"dpi": 200}}
+			],
+			"model": "mistral-ocr-latest",
+			"usage_info": {
+				"pages_processed": 2,
+				"doc_size_bytes": 145349
+			}
+		}));
+
+		let llm_response = resp.to_llm_response(crate::LogContentFields::default());
+
+		assert_eq!(llm_response.pages, Some(2));
+		assert_eq!(llm_response.input_tokens, None);
+		assert_eq!(llm_response.output_tokens, None);
+		assert_eq!(llm_response.total_tokens, None);
+	}
+
+	#[test]
+	fn amend_from_stream_response_reports_usage_once_output_is_known() {
+		use std::sync::{Arc, Mutex};
+
+		// Mirrors the gateway reporter: only the first report_usage call is acted on.
+		struct FirstReport {
+			info: Arc<Mutex<crate::LLMInfo>>,
+			reported: Arc<Mutex<Option<crate::LLMResponse>>>,
+		}
+		impl crate::StreamingUsageReporter for FirstReport {
+			fn update(&self, f: &mut dyn FnMut(&mut crate::LLMInfo)) {
+				f(&mut self.info.lock().unwrap())
+			}
+			fn report_usage(&mut self) {
+				let mut reported = self.reported.lock().unwrap();
+				if reported.is_none() {
+					*reported = Some(self.info.lock().unwrap().response.clone());
+				}
+			}
+		}
+
+		let info = Arc::new(Mutex::new(crate::LLMInfo::new(
+			llm_request(),
+			LLMResponse::default(),
+		)));
+		let reported = Arc::new(Mutex::new(None));
+		let mut log = StreamingUsageGuard::new(Box::new(FirstReport {
+			info: info.clone(),
+			reported: reported.clone(),
+		}));
+
+		for event in [
+			serde_json::json!({"type": "message_start", "message": {"model": "claude-haiku-4-5", "usage": {"input_tokens": 15, "output_tokens": 1}}}),
+			serde_json::json!({"type": "message_delta", "usage": {"output_tokens": 21}}),
+		] {
+			amend_from_stream_response(&mut log, &StreamResponse { rest: event });
+		}
+
+		let reported = reported.lock().unwrap().clone().expect("usage reported");
+		assert_eq!(reported.input_tokens, Some(15));
+		assert_eq!(reported.output_tokens, Some(21));
+		assert_eq!(reported.total_tokens, Some(36));
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -463,8 +545,19 @@ mod lookups {
 	pub const MAX_TOKENS: [&[&str]; 2] = [&["max_completion_tokens"], &["max_tokens"]];
 	pub const ENCODING_FORMAT: [&[&str]; 1] = [&["encoding_format"]];
 	pub const DIMENSIONS: [&[&str]; 1] = [&["dimensions"]];
-	pub const USAGE_INPUT_TOKENS: [&[&str]; 7] = [
+	pub const REASONING_EFFORT: [&[&str]; 4] = [
+		// Completions
+		&["reasoning_effort"],
+		// Responses
+		&["reasoning", "effort"],
+		// Messages
+		&["output_config", "effort"],
+		// Gemini
+		&["generationConfig", "thinkingConfig", "thinkingLevel"],
+	];
+	pub const USAGE_INPUT_TOKENS: [&[&str]; 9] = [
 		&["usage", "input_tokens"],
+		&["message", "usage", "input_tokens"],
 		// Responses streaming
 		&["response", "usage", "input_tokens"],
 		&["usage", "prompt_tokens"],
@@ -472,13 +565,15 @@ mod lookups {
 		&["usage", "inputTokens"],
 		// Bedrock invoke
 		&["metadata", "usage", "inputTokens"],
+		// Bedrock invoke stream, any model format
+		&["amazon-bedrock-invocationMetrics", "inputTokenCount"],
 		// Gemini generateContent
 		&["usageMetadata", "promptTokenCount"],
 		// Gemini generateContent via Cloud Code, which wraps the payload in a
 		// `response` envelope
 		&["response", "usageMetadata", "promptTokenCount"],
 	];
-	pub const USAGE_OUTPUT_TOKENS: [&[&str]; 7] = [
+	pub const USAGE_OUTPUT_TOKENS: [&[&str]; 8] = [
 		&["usage", "output_tokens"],
 		// Responses streaming
 		&["response", "usage", "output_tokens"],
@@ -487,6 +582,8 @@ mod lookups {
 		&["usage", "outputTokens"],
 		// Bedrock invoke
 		&["metadata", "usage", "outputTokens"],
+		// Bedrock invoke stream, any model format
+		&["amazon-bedrock-invocationMetrics", "outputTokenCount"],
 		// Gemini generateContent
 		&["usageMetadata", "candidatesTokenCount"],
 		// Gemini generateContent via Cloud Code
@@ -501,10 +598,26 @@ mod lookups {
 		// Gemini generateContent via Cloud Code
 		&["response", "usageMetadata", "totalTokenCount"],
 	];
+	pub const PAGES: [&[&str]; 1] = [&["usage_info", "pages_processed"]];
 	pub const INPUT_IMAGE_TOKENS: [&[&str]; 1] = [&["usage", "input_tokens_details", "image_tokens"]];
-	pub const INPUT_TEXT_TOKENS: [&[&str]; 1] = [&["usage", "input_tokens_details", "text_tokens"]];
-	pub const INPUT_AUDIO_TOKENS: [&[&str]; 1] =
-		[&["usage", "prompt_tokens_details", "audio_tokens"]];
+	pub const INPUT_TEXT_TOKENS: [&[&str]; 2] = [
+		&["usage", "input_tokens_details", "text_tokens"],
+		// Audio transcriptions
+		&["usage", "input_token_details", "text_tokens"],
+	];
+	pub const INPUT_AUDIO_TOKENS: [&[&str]; 2] = [
+		&["usage", "prompt_tokens_details", "audio_tokens"],
+		// Audio transcriptions
+		&["usage", "input_token_details", "audio_tokens"],
+	];
+	pub const AUDIO_SECONDS: [&[&str]; 3] = [
+		// OpenAI `usage.type: duration`, OpenRouter
+		&["usage", "seconds"],
+		// Mistral
+		&["usage", "prompt_audio_seconds"],
+		// Transcription verbose_json, which may omit usage
+		&["duration"],
+	];
 	pub const OUTPUT_IMAGE_TOKENS: [&[&str]; 1] =
 		[&["usage", "output_tokens_details", "image_tokens"]];
 	pub const OUTPUT_TEXT_TOKENS: [&[&str]; 1] = [&["usage", "output_tokens_details", "text_tokens"]];
@@ -523,7 +636,7 @@ mod lookups {
 		// Completions
 		&["usage", "completion_tokens_details", "reasoning_tokens"],
 	];
-	pub const CACHE_CREATION_INPUT_TOKENS: [&[&str]; 6] = [
+	pub const CACHE_CREATION_INPUT_TOKENS: [&[&str]; 8] = [
 		// Responses
 		&["usage", "input_tokens_details", "cache_write_tokens"],
 		// Responses streaming
@@ -537,13 +650,36 @@ mod lookups {
 		&["usage", "prompt_tokens_details", "cache_write_tokens"],
 		// Provider-specific compatibility fields
 		&["usage", "cache_creation_input_tokens"],
+		&["message", "usage", "cache_creation_input_tokens"],
 		&["usage", "cacheWriteInputTokens"],
 		// Bedrock invoke
 		&["metadata", "usage", "cacheWriteInputTokensCount"],
+		&[
+			"amazon-bedrock-invocationMetrics",
+			"cacheWriteInputTokenCount",
+		],
 	];
-	pub const CACHED_INPUT_TOKENS: [&[&str]; 6] = [
+	pub const CACHE_CREATION_12H_INPUT_TOKENS: [&[&str]; 2] = [
+		// Responses
+		&[
+			"usage",
+			"input_tokens_details",
+			"cache_write_tokens_details",
+			"ttl_12h_tokens",
+		],
+		// Responses streaming
+		&[
+			"response",
+			"usage",
+			"input_tokens_details",
+			"cache_write_tokens_details",
+			"ttl_12h_tokens",
+		],
+	];
+	pub const CACHED_INPUT_TOKENS: [&[&str]; 8] = [
 		// Message
 		&["usage", "cache_read_input_tokens"],
+		&["message", "usage", "cache_read_input_tokens"],
 		// Responses
 		&["usage", "input_tokens_details", "cached_tokens"],
 		// Responses streaming
@@ -553,6 +689,10 @@ mod lookups {
 		&["usage", "cacheReadInputTokens"],
 		// Bedrock invoke
 		&["metadata", "usage", "cacheReadInputTokenCount"],
+		&[
+			"amazon-bedrock-invocationMetrics",
+			"cacheReadInputTokenCount",
+		],
 	];
 	pub const SERVICE_TIER: [&[&str]; 3] = [
 		// Completions
@@ -576,6 +716,9 @@ impl ResponseType for Response {
 		let output_tokens = self.lookup(lookups::USAGE_OUTPUT_TOKENS, |v| v.as_u64());
 		let total_tokens = self.lookup(lookups::USAGE_TOTAL_TOKENS, |v| v.as_u64());
 		crate::LLMResponse {
+			cache_creation_1h_input_tokens: None,
+			cache_creation_12h_input_tokens: self
+				.lookup(lookups::CACHE_CREATION_12H_INPUT_TOKENS, |v| v.as_u64()),
 			count_tokens: None, // We never tokenize these, so always empty
 			input_tokens,
 			input_image_tokens: self.lookup(lookups::INPUT_IMAGE_TOKENS, |v| v.as_u64()),
@@ -586,6 +729,8 @@ impl ResponseType for Response {
 			output_text_tokens: self.lookup(lookups::OUTPUT_TEXT_TOKENS, |v| v.as_u64()),
 			output_audio_tokens: self.lookup(lookups::OUTPUT_AUDIO_TOKENS, |v| v.as_u64()),
 			total_tokens: total_tokens.or_else(|| Some(input_tokens? + output_tokens?)),
+			pages: self.lookup(lookups::PAGES, |v| v.as_u64()),
+			audio_seconds: self.lookup(lookups::AUDIO_SECONDS, |v| v.as_f64()),
 			reasoning_tokens: self.lookup(lookups::REASONING, |v| v.as_u64()),
 			cache_creation_input_tokens: self
 				.lookup(lookups::CACHE_CREATION_INPUT_TOKENS, |v| v.as_u64()),
@@ -596,8 +741,11 @@ impl ResponseType for Response {
 			provider_model: self.lookup(lookups::MODEL, |v| v.as_str()).map(Into::into),
 			completion: None,
 			output_messages: None,
+			usage_lines: Vec::new(),
 			// TODO: we could probably derive this
 			first_token: None,
+			last_token_at: None,
+			inter_chunk_latencies: crate::TokenGapSummary::default(),
 		}
 	}
 
@@ -620,7 +768,7 @@ impl ResponseType for Response {
 		}
 	}
 
-	fn visit_text_mut(&mut self, _f: &mut dyn FnMut(&mut String)) {
+	fn visit_text_mut(&mut self, _f: &mut dyn FnMut(crate::types::ResponseText, &mut String)) {
 		unimplemented!("visit_text_mut is used for prompt guard; prompt guard is disabled for detect.")
 	}
 }
@@ -697,6 +845,12 @@ pub fn amend_from_stream_response(log: &mut StreamingUsageGuard, f: &StreamRespo
 		|v| v.as_u64(),
 		|l, v| l.response.output_audio_tokens = Some(v),
 	);
+	let audio_seconds = f.set_if(
+		log,
+		lookups::AUDIO_SECONDS,
+		|v| v.as_f64(),
+		|l, v| l.response.audio_seconds = Some(v),
+	);
 	let total_tokens = f.set_if(
 		log,
 		lookups::USAGE_TOTAL_TOKENS,
@@ -714,6 +868,12 @@ pub fn amend_from_stream_response(log: &mut StreamingUsageGuard, f: &StreamRespo
 		lookups::CACHE_CREATION_INPUT_TOKENS,
 		|v| v.as_u64(),
 		|l, v| l.response.cache_creation_input_tokens = Some(v),
+	);
+	let _cache_creation_12h_input_tokens = f.set_if(
+		log,
+		lookups::CACHE_CREATION_12H_INPUT_TOKENS,
+		|v| v.as_u64(),
+		|l, v| l.response.cache_creation_12h_input_tokens = Some(v),
 	);
 	let _cached_input_tokens = f.set_if(
 		log,
@@ -733,29 +893,31 @@ pub fn amend_from_stream_response(log: &mut StreamingUsageGuard, f: &StreamRespo
 		|v| v.as_str(),
 		|l, v| l.response.service_tier = Some(v.into()),
 	);
-	if total_tokens.is_none()
-		&& let (Some(input), Some(output)) = (input_tokens, output_tokens)
-	{
-		log.update(|l| l.response.total_tokens = Some(input + output));
+	// Input and output may arrive in different events (Anthropic sends input in message_start and
+	// output in message_delta), so derive the total from the accumulated values.
+	if total_tokens.is_none() && (input_tokens.is_some() || output_tokens.is_some()) {
+		log.update(|l| {
+			if let (Some(input), Some(output)) = (l.response.input_tokens, l.response.output_tokens) {
+				l.response.total_tokens = Some(input + output);
+			}
+		});
 	}
-	if input_tokens.is_some() || output_tokens.is_some() || total_tokens.is_some() {
+	// Reporting usage is one-shot, so wait until output is known; reporting on input alone (e.g.
+	// Anthropic message_start) would drop the output tokens. Drop reports if this never happens.
+	if output_tokens.is_some() || total_tokens.is_some() || audio_seconds.is_some() {
 		log.report_usage();
 	}
 }
 
 pub fn passthrough_stream(
 	mut log: StreamingUsageGuard,
-	resp: http::Response<axum_core::body::Body>,
-) -> http::Response<axum_core::body::Body> {
+	resp: agent_http::Response,
+) -> agent_http::Response {
 	let buffer_limit = agent_http::response_buffer_limit(&resp);
 	resp.map(|b| {
 		parse::sse::permissive_json_passthrough::<StreamResponse>(b, buffer_limit, move |f| match f {
-			Some(Ok(f)) => {
-				amend_from_stream_response(&mut log, &f);
-			},
-			Some(Err(e)) => {
-				debug!("failed to parse streaming response: {e}");
-			},
+			Some(Ok(f)) => amend_from_stream_response(&mut log, &f),
+			Some(Err(e)) => debug!("failed to parse streaming response: {e}"),
 			None => {},
 		})
 	})
@@ -763,8 +925,8 @@ pub fn passthrough_stream(
 
 pub fn passthrough_aws_stream(
 	mut log: StreamingUsageGuard,
-	resp: http::Response<axum_core::body::Body>,
-) -> http::Response<axum_core::body::Body> {
+	resp: agent_http::Response,
+) -> agent_http::Response {
 	use base64::Engine;
 	let buffer_limit = agent_http::response_buffer_limit(&resp);
 	resp.map(|b| {

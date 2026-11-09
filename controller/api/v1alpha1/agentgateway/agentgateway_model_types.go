@@ -1,7 +1,6 @@
 package agentgateway
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -43,7 +42,7 @@ type AgentgatewayModelList struct {
 // +kubebuilder:validation:ExactlyOneOf=provider;virtualModel
 // +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.baseURL)",message="baseURL requires provider"
 // +kubebuilder:validation:XValidation:rule="!has(self.virtualModel) || !has(self.policies)",message="policies cannot be used with virtualModel"
-// +kubebuilder:validation:XValidation:rule="!has(self.virtualModel) || self.visibility != 'Internal'",message="virtual models must be public"
+// +kubebuilder:validation:XValidation:rule="!has(self.virtualModel) || !has(self.visibility) || self.visibility != 'Internal'",message="virtual models must be public"
 // +kubebuilder:validation:XValidation:rule="!has(self.virtualModel) || !has(self.match) || !has(self.match.model) || !self.match.model.contains('*')",message="virtual model match.model must be an exact name"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'Ollama' || has(self.baseURL)",message="ollama requires baseURL"
 // +kubebuilder:validation:XValidation:rule="!has(self.baseURL) || (isURL(self.baseURL) && (url(self.baseURL).getScheme() == 'http' || url(self.baseURL).getScheme() == 'https') && url(self.baseURL).getHostname() != \"\")",message="baseURL must be an absolute http or https URL with a host"
@@ -76,7 +75,6 @@ type AgentgatewayModelSpec struct {
 
 	// Controls whether clients can request this model directly. Internal models
 	// can only be selected by virtual models. Defaults to Public.
-	// +kubebuilder:default=Public
 	// +optional
 	Visibility ModelVisibility `json:"visibility,omitempty"`
 
@@ -104,6 +102,10 @@ type AgentgatewayModelSpec struct {
 	// BaseURL overrides the provider address and base path prefix. It must use the
 	// http or https scheme. Backend policies may override the default TLS
 	// configuration. Query parameters, fragments, and user info are not supported.
+	// The URL path is the upstream base path and defaults to / when omitted.
+	// Provider-specific endpoint paths are appended to this base path.
+	// For example, `https://api.openai.com/v1` sends completions to `/v1/chat/completions`,
+	// while `https://api.openai.com` sends them to `/chat/completions`.
 	// +kubebuilder:validation:Format=uri
 	// +optional
 	BaseURL *LongString `json:"baseURL,omitempty"`
@@ -213,10 +215,9 @@ type ModelBackendAuth struct {
 	Location *AuthorizationLocation `json:"location,omitempty"`
 
 	// Credentials is a list of additional credentials to inject on the backend
-	// request. Each entry resolves a Secret key and writes its value to the
-	// entry's location. `credentials` is independent of the primary
-	// `key`/`secretRef`/`passthrough` mechanism and may be set on its own or
-	// alongside it.
+	// request. Each entry writes its value to the entry's location.
+	// `credentials` is independent of the primary `key`/`secretRef`/`passthrough`
+	// mechanism and may be set on its own or alongside it.
 	// +optional
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=8
@@ -257,6 +258,7 @@ type ModelProvider string
 
 const (
 	ModelProviderOpenAI      ModelProvider = "OpenAI"
+	ModelProviderCopilot     ModelProvider = "Copilot"
 	ModelProviderAzure       ModelProvider = "Azure"
 	ModelProviderAnthropic   ModelProvider = "Anthropic"
 	ModelProviderGemini      ModelProvider = "Gemini"
@@ -275,6 +277,10 @@ const (
 	ModelProviderTogetherAI  ModelProvider = "TogetherAI"
 	ModelProviderXAI         ModelProvider = "XAI"
 	ModelProviderFireworks   ModelProvider = "Fireworks"
+	ModelProviderMeta        ModelProvider = "Meta"
+	ModelProviderPerplexity  ModelProvider = "Perplexity"
+	ModelProviderTypesafe    ModelProvider = "Typesafe"
+	ModelProviderNebius      ModelProvider = "Nebius"
 	ModelProviderCustom      ModelProvider = "Custom"
 )
 
@@ -291,7 +297,7 @@ const (
 	ModelVisibilityInternal ModelVisibility = "Internal"
 )
 
-// +kubebuilder:validation:ExactlyOneOf=weighted;failover;conditional
+// +kubebuilder:validation:ExactlyOneOf=weighted;failover;conditional;callout
 type VirtualModel struct {
 	// Weight-based model selection.
 	// +optional
@@ -304,10 +310,15 @@ type VirtualModel struct {
 	// Ordered condition-based model selection.
 	// +optional
 	Conditional *ConditionalModelRouting `json:"conditional,omitempty"`
+
+	// Model selection by calling an external HTTP service.
+	// +optional
+	Callout *CalloutModelRouting `json:"callout,omitempty"`
 }
 
 type WeightedModelRouting struct {
-	// Concrete model targets and their relative weights.
+	// Model targets and their relative weights. Targets may be concrete or
+	// virtual models.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=64
 	// +required
@@ -318,7 +329,6 @@ type WeightedModelTarget struct {
 	ModelTargetReference `json:",inline"`
 
 	// Relative traffic weight. Defaults to 1.
-	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000000
 	// +optional
@@ -348,8 +358,9 @@ type FailoverModelTarget struct {
 }
 
 type ConditionalModelRouting struct {
-	// Concrete model targets evaluated in order. The first matching condition is
-	// selected. One final target may omit when to act as the fallback.
+	// Model targets evaluated in order. The first matching condition is
+	// selected. One final target may omit when to act as the fallback. Targets
+	// may be concrete or virtual models.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:XValidation:message="conditional targets without when must be last",rule="self.filter(e, !has(e.when)).size() <= 1 && (!self.exists(e, !has(e.when)) || !has(self[size(self) - 1].when))"
@@ -366,10 +377,76 @@ type ConditionalModelTarget struct {
 	When *CELExpression `json:"when,omitempty"`
 }
 
-type ModelTargetReference struct {
-	// Same-namespace AgentgatewayModel resource selected by this target.
+// +kubebuilder:validation:ExactlyOneOf=backendRef;url
+type CalloutModelRouting struct {
+	// Service that selects the model. Supported types: `Service` and `Backend`.
+	// A `url` may include the request path, such as `https://router.example.com/v1/route`.
+	// The callout request is sent with the `POST` method.
+	PolicyBackendEndpoint `json:",inline"`
+
+	// Headers to set on the callout request, computed from CEL expressions.
+	// Keys may be header names or the `:path`, `:method`, and `:authority`
+	// pseudo-headers.
+	// +kubebuilder:validation:MaxProperties=64
+	// +optional
+	Headers map[string]CELExpression `json:"headers,omitempty"`
+
+	// CEL expression that computes the callout request body. Strings and bytes
+	// are used directly; other values are JSON-encoded. If unset, the original
+	// request body is forwarded.
+	// +optional
+	Body *CELExpression `json:"body,omitempty"`
+
+	// CEL expressions that compute request payload fields from the callout
+	// response, overriding existing values. `callout.headers` holds the response
+	// headers and `callout.body` the decoded JSON response body. `model` is
+	// required and selects the concrete model name, which is matched against the
+	// effective match.model of models attached to the same listener.
+	// +kubebuilder:validation:MinProperties=1
+	// +kubebuilder:validation:MaxProperties=64
+	// +kubebuilder:validation:XValidation:rule="has(self.model)",message="transformation must set model"
 	// +required
-	ModelRef corev1.LocalObjectReference `json:"modelRef"`
+	Transformation map[string]CELExpression `json:"transformation"`
+
+	// Model used when the callout fails, returns a non-2xx or non-JSON
+	// response, or selects an unknown model. `transformation` is not applied to
+	// the fallback. If unset, the request is rejected.
+	// +optional
+	Fallback *ModelTargetReference `json:"fallback,omitempty"`
+
+	// Reuse callout responses using CEL expressions as the cache key. On a cache
+	// hit, `transformation` is evaluated against the cached response. Keying on
+	// a session identifier makes routing sticky for that session.
+	// +optional
+	Cache *CalloutCache `json:"cache,omitempty"`
+}
+
+type CalloutCache struct {
+	// Ordered list of CEL expressions evaluated against the request to
+	// construct the cache key.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +required
+	Key []CELExpression `json:"key"`
+
+	// Duration string, such as `5m`, or a CEL expression that returns the
+	// duration that a cached callout response may be reused, or a timestamp
+	// when it expires. The expression is evaluated with `callout` available,
+	// before `transformation` is applied.
+	// +required
+	TTL CELExpression `json:"ttl"`
+
+	// Maximum number of callout responses to keep in the cache. If unset, this
+	// defaults to 10000.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxEntries *uint32 `json:"maxEntries,omitempty"`
+}
+
+type ModelTargetReference struct {
+	// Same-namespace model resource selected by this target.
+	// +required
+	ModelRef ModelObjectReference `json:"modelRef"`
 
 	// Concrete model name selected through the referenced model. It is required
 	// when modelRef points to a wildcard match.model. When omitted, the referenced
@@ -384,4 +461,21 @@ type AgentgatewayModelStatus struct {
 	// +kubebuilder:validation:MaxItems=16
 	// +optional
 	Parents []gwv1.RouteParentStatus `json:"parents,omitempty"`
+}
+
+// References a same-namespace model resource. When group and kind are omitted,
+// the reference selects a model of the referring model's own kind.
+// +kubebuilder:validation:XValidation:rule="has(self.group) == has(self.kind)",message="group and kind must be set together"
+type ModelObjectReference struct {
+	// API group of the referenced model, such as `agentgateway.dev`.
+	// +optional
+	Group *gwv1.Group `json:"group,omitempty"`
+
+	// Kind of the referenced model, such as `AgentgatewayModel`.
+	// +optional
+	Kind *gwv1.Kind `json:"kind,omitempty"`
+
+	// Name of the referenced model.
+	// +required
+	Name gwv1.ObjectName `json:"name"`
 }
