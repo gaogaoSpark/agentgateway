@@ -82,6 +82,7 @@ async fn dfp_rejects_inference_routing() {
 				),
 				destination_mode: ext_proc::InferenceRoutingDestinationMode::Passthrough,
 				failure_mode: ext_proc::FailureMode::FailClosed,
+				prefix_cache: None,
 			},
 		)],
 	};

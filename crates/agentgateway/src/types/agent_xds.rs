@@ -2356,6 +2356,9 @@ fn backend_policy_from_proto(
 				target: Arc::new(resolve_simple_reference(ir.endpoint_picker.as_ref())),
 				destination_mode: http::ext_proc::InferenceRoutingDestinationMode::Validated,
 				failure_mode,
+				// The xDS schema has no prefixCache field; the router falls back to the
+				// process-wide default when the projection channel is on.
+				prefix_cache: None,
 			})
 		},
 		Some(bps::Kind::SessionAffinity(sa)) => {

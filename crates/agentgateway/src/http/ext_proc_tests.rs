@@ -2971,6 +2971,7 @@ async fn custom_llm_provider_service_backend_runs_inference_routing() {
 			))),
 			destination_mode: ext_proc::InferenceRoutingDestinationMode::Passthrough,
 			failure_mode: ext_proc::FailureMode::FailClosed,
+			prefix_cache: None,
 		})
 		.into(),
 	});
@@ -3071,6 +3072,7 @@ async fn custom_llm_provider_inference_routing_sees_input_shape_and_amends_token
 			))),
 			destination_mode: ext_proc::InferenceRoutingDestinationMode::Passthrough,
 			failure_mode: ext_proc::FailureMode::FailClosed,
+			prefix_cache: None,
 		})
 		.into(),
 	});

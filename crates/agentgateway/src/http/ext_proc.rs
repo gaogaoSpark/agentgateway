@@ -43,6 +43,40 @@ const TRACE_POLICY_KIND: &str = "ext_proc";
 const INFERENCE_DESTINATION_HEADER: HeaderName =
 	HeaderName::from_static("x-gateway-destination-endpoint");
 
+/// Environment variable that enables the EPP request-body projection channel. When unset
+/// (or set to anything but `1`/`true`/`yes`/`on`) the client body is streamed to the EPP
+/// as-is and the EPP's body is forwarded upstream, as before.
+///
+/// When enabled, the request body is projected down to the fields the EPP needs, the
+/// gateway computes the prefix-cache hashes and ships them in the projection (see
+/// [`epp_prefix`]; approximate chain only unless `prefixCache` says otherwise), and the
+/// EPP's body is discarded in favour of the client's original body. `prefixCache` config
+/// is ignored unless this is set.
+///
+/// Independent of this switch, the response body is never sent to the EPP
+/// (`BodySendMode::None`); only response trailers are relayed so the EPP can read
+/// `grpc-status` from streaming responses.
+pub const EPP_BODY_PROJECTION_ENV: &str = "AGENTGATEWAY_EPP_BODY_PROJECTION";
+
+/// Whether the EPP body-projection channel is enabled. Read once per process.
+pub fn epp_body_projection_enabled() -> bool {
+	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ENABLED.get_or_init(|| {
+		let on = std::env::var(EPP_BODY_PROJECTION_ENV)
+			.map(|v| {
+				matches!(
+					v.trim().to_ascii_lowercase().as_str(),
+					"1" | "true" | "yes" | "on"
+				)
+			})
+			.unwrap_or(false);
+		if on {
+			info!("{EPP_BODY_PROJECTION_ENV} set: EPP body projection channel enabled");
+		}
+		on
+	})
+}
+
 struct ResponseLoopContext<'a> {
 	response: Option<&'a mut http::Response>,
 	body_tx: &'a mut Sender<Result<Frame<Bytes>, Infallible>>,
@@ -96,6 +130,8 @@ pub mod proto {
 
 mod buffering;
 mod channel;
+mod epp_body;
+pub mod epp_prefix;
 mod headers;
 mod mutation;
 mod processing;
@@ -150,6 +186,10 @@ pub struct InferenceRouting {
 	#[serde(default, skip_serializing_if = "crate::serdes::is_default")]
 	#[cfg_attr(feature = "schema", schemars(skip))]
 	pub failure_mode: FailureMode,
+	/// Compute prefix-cache hashes in the gateway and ship them to the endpoint picker so it
+	/// does not need to tokenize or hash the request itself.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prefix_cache: Option<Arc<epp_prefix::PrefixCache>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -160,6 +200,9 @@ struct InferenceRoutingConfig {
 	/// How to use the destination returned by the endpoint picker.
 	#[serde(default)]
 	destination_mode: InferenceRoutingDestinationMode,
+	/// Gateway-side prefix-cache precomputation for the endpoint picker.
+	#[serde(default)]
+	prefix_cache: Option<Arc<epp_prefix::PrefixCache>>,
 }
 
 impl<'de> serde::Deserialize<'de> for InferenceRouting {
@@ -170,13 +213,18 @@ impl<'de> serde::Deserialize<'de> for InferenceRouting {
 		let InferenceRoutingConfig {
 			endpoint_picker,
 			destination_mode,
+			prefix_cache,
 		} = InferenceRoutingConfig::deserialize(deserializer)?;
+		if let Some(pc) = &prefix_cache {
+			pc.validate().map_err(serde::de::Error::custom)?;
+		}
 		Ok(Self {
 			target: endpoint_picker,
 			destination_mode,
 			// TODO: expose fail-open configuration for standalone EPP once the fallback behavior is
 			// explicitly supported and documented end-to-end.
 			failure_mode: FailureMode::FailClosed,
+			prefix_cache,
 		})
 	}
 }
@@ -185,6 +233,7 @@ impl<'de> serde::Deserialize<'de> for InferenceRouting {
 pub struct InferencePoolRouter {
 	ext_proc: Option<ExtProcInstance>,
 	destination_mode: InferenceRoutingDestinationMode,
+	prefix_cache: Option<epp_prefix::PrefixCacheComputer>,
 }
 
 #[derive(Debug, Default)]
@@ -197,8 +246,26 @@ pub struct InferenceRequestResult {
 
 impl InferenceRouting {
 	pub fn build(&self, client: PolicyClient) -> InferencePoolRouter {
+		// With the projection channel on, the gateway always computes prefix-cache hashes for
+		// the EPP: the backend's `prefixCache` if set, otherwise the process-wide default
+		// (approximate chain over estimate pseudo-tokens; precise off). Off: nothing is computed.
+		let prefix_cache = if epp_body_projection_enabled() {
+			let pc = self
+				.prefix_cache
+				.clone()
+				.unwrap_or_else(epp_prefix::default_from_env);
+			epp_prefix::PrefixCacheComputer::new(pc)
+				.inspect_err(|e| warn!("invalid prefixCache config, EPP will compute hashes: {e}"))
+				.ok()
+		} else {
+			if self.prefix_cache.is_some() {
+				warn!("prefixCache configured but {EPP_BODY_PROJECTION_ENV} is not set; ignoring");
+			}
+			None
+		};
 		InferencePoolRouter {
 			destination_mode: self.destination_mode,
+			prefix_cache,
 			ext_proc: Some(ExtProcInstance::new(
 				client,
 				SimpleBackendReferenceWithPolicies {
@@ -211,7 +278,8 @@ impl InferenceRouting {
 				None,
 				ProcessingOptions {
 					request_body_mode: BodySendMode::FullDuplexStreamed,
-					response_body_mode: BodySendMode::FullDuplexStreamed,
+					// The EPP does not need the response body, only its trailers (grpc-status).
+					response_body_mode: BodySendMode::None,
 					request_trailer_mode: TrailerSendMode::Send,
 					response_trailer_mode: TrailerSendMode::Send,
 					..Default::default()
@@ -235,10 +303,23 @@ impl InferencePoolRouter {
 		};
 		// The destination header is an EPP output, not a client-controlled input.
 		req.headers_mut().remove(&INFERENCE_DESTINATION_HEADER);
+		// Projection channel: send the EPP only the body fields it needs; the upstream gets
+		// the original body back afterwards, keeping just the EPP's header mutations.
+		// Off by default (see EPP_BODY_PROJECTION_ENV): the body streams to the EPP as-is.
+		let original_body = if epp_body_projection_enabled() {
+			epp_body::project_for_epp(req, self.prefix_cache.as_ref())
+				.await
+				.map_err(|e| ProxyError::Processing(anyhow!("failed to read request body: {e}")))?
+		} else {
+			None
+		};
 		let r = std::mem::take(req);
 		let (new_req, pr) = ext_proc.mutate_request(r).await?;
 		let failed_open = ext_proc.skipped;
 		*req = new_req;
+		if let Some(original_body) = original_body {
+			epp_body::restore_original(req, original_body);
+		}
 		let dest = req
 			.headers_mut()
 			.remove(&INFERENCE_DESTINATION_HEADER)
@@ -859,6 +940,106 @@ impl ExtProcInstance {
 				drop(tx_chunk);
 				return;
 			}
+		}
+	}
+
+	// relay_response_trailers passes a response body through to the client untouched while
+	// forwarding only its trailers to ext_proc (used when the body send mode is None but the
+	// trailer send mode is Send). The client receives the trailers with any header mutations
+	// applied; if ext_proc never answers with a trailers response the original trailers are
+	// forwarded so the response is never truncated.
+	async fn relay_response_trailers(
+		mut body: http::Body,
+		mut tx_chunk: Sender<Result<Frame<Bytes>, Infallible>>,
+		mut rx: Receiver<ProcessingResponse>,
+		tx: Sender<ProcessingRequest>,
+		metadata_context: Option<Arc<Metadata>>,
+		response_trailers: Arc<Mutex<Option<::http::HeaderMap>>>,
+		first_message: FirstExtProcMessage,
+	) {
+		let mut first_message = first_message;
+		let mut sent_trailers = false;
+		loop {
+			let frame = match body.frame().await.transpose() {
+				Ok(frame) => frame,
+				Err(error) => {
+					warn!("response trailer relay stopped reading body: {error}");
+					return;
+				},
+			};
+			let Some(frame) = frame else {
+				break;
+			};
+			if frame.is_data() {
+				let data = frame.into_data().expect("already checked");
+				if tx_chunk.send(Ok(Frame::data(data))).await.is_err() {
+					trace!("response trailer relay stopped after body channel closed");
+					return;
+				}
+				continue;
+			}
+			let trailers = frame.into_trailers().expect("already checked");
+			*response_trailers.lock().expect("trailers mutex poisoned") = Some(trailers.clone());
+			sent_trailers = true;
+			let sent = tx
+				.send(ProcessingRequest {
+					request: Some(Request::ResponseTrailers(HttpTrailers {
+						trailers: to_header_map(&trailers),
+					})),
+					metadata_context: metadata_context.as_deref().cloned(),
+					attributes: first_message.take_attributes_or_default(),
+					protocol_config: first_message.take_protocol_config(),
+					observability_mode: false,
+				})
+				.await;
+			if sent.is_err() {
+				trace!("ext_proc request channel closed; forwarding original response trailers unchanged");
+				let _ = tx_chunk.send(Ok(Frame::trailers(trailers))).await;
+				return;
+			}
+			break;
+		}
+
+		if !sent_trailers {
+			trace!("response body ended without trailers; nothing to relay to ext_proc");
+			return;
+		}
+
+		loop {
+			let Some(presp) = rx.recv().await else {
+				trace!("ext_proc stream closed before trailers response; forwarding original trailers");
+				break;
+			};
+			if to_immediate_response(&presp).is_some() {
+				warn!("received ImmediateResponse while waiting for response trailers; ignoring");
+				break;
+			}
+			match handle_response_for_response_mutation(
+				false,
+				false,
+				false,
+				None,
+				&mut tx_chunk,
+				&response_trailers,
+				presp,
+			)
+			.await
+			{
+				Ok((_, true)) => return,
+				Ok((_, false)) => {},
+				Err(error) => {
+					warn!("response trailers mutation failed: {error}");
+					break;
+				},
+			}
+		}
+		// No trailers response was applied; make sure the client still gets the originals.
+		let trailers = response_trailers
+			.lock()
+			.expect("trailers mutex poisoned")
+			.take();
+		if let Some(trailers) = trailers {
+			let _ = tx_chunk.send(Ok(Frame::trailers(trailers))).await;
 		}
 	}
 
@@ -1519,14 +1700,19 @@ impl ExtProcInstance {
 		let end_of_stream = body.is_end_stream();
 		let had_body = !end_of_stream;
 		let response_body_mode = self.mode_state.response_body_mode;
+		let send_response_trailers = self.mode_state.response_trailer_mode == TrailerSendMode::Send;
 		// response_fsm drives local flow in mutate_response, while mode_state tracks
 		// the currently effective ext_proc processing modes.
 		let mut response_fsm =
 			ResponseFlowFsm::new(send_response_headers, response_body_mode, had_body);
+		// With responseBodyMode=None the body is not inspected, but trailers can still be relayed
+		// to ext_proc (and their mutations applied) as long as the upstream may produce them.
+		let relays_response_trailers_only =
+			send_response_trailers && had_body && !response_fsm.send_body;
 		let protocol_config = self.protocol_config();
 		let mut first_message = FirstExtProcMessage::for_body_phase(
 			send_response_headers,
-			response_fsm.send_body,
+			response_fsm.send_body || relays_response_trailers_only,
 			attributes.clone(),
 			protocol_config,
 			self.protocol_config_sent,
@@ -1556,7 +1742,34 @@ impl ExtProcInstance {
 		}
 
 		if response_fsm.phase == ResponsePhase::Complete {
-			return Ok((http::Response::from_parts(parts, body), None));
+			if !relays_response_trailers_only {
+				return Ok((http::Response::from_parts(parts, body), None));
+			}
+			// Response headers are skipped, so the body is never inspected: pass it through
+			// untouched and relay only the trailers to ext_proc.
+			let mut managed_body = body;
+			let original_body = managed_body.take_content();
+			let (tx_chunk, rx_chunk) = tokio::sync::mpsc::channel(1);
+			let body = http_body_util::StreamBody::new(ReceiverStream::new(rx_chunk));
+			managed_body.replace_content(agent_http::RawBody::new(body).into());
+			let resp = http::Response::from_parts(parts, managed_body);
+			let rx = self
+				.rx_resp_for_response
+				.take()
+				.expect("mutate_response called twice");
+			let (first_message, sends_protocol_config) =
+				FirstExtProcMessage::take_for_send(&mut first_message);
+			self.mark_protocol_config_sent_if(sends_protocol_config);
+			tokio::task::spawn(Self::relay_response_trailers(
+				original_body,
+				tx_chunk,
+				rx,
+				self.tx_req.clone().ok_or(Error::RequestSend)?,
+				metadata_context,
+				response_trailers,
+				first_message,
+			));
+			return Ok((resp, None));
 		}
 
 		let tx = self.tx_req.clone();
@@ -1698,13 +1911,26 @@ impl ExtProcInstance {
 							BufferedBodyPhase::take_deferred_body(&mut pending_response_buffer);
 					},
 					BodyPath::None => {
-						if let Some(original_body) =
-							BufferedBodyPhase::take_deferred_body(&mut pending_response_buffer)
-						{
-							resp.body_mut().restore_content(original_body);
-							return Ok((resp, None));
-						}
-						if let Some(original_body) = pending_response_body.take() {
+						let original_body = BufferedBodyPhase::take_deferred_body(&mut pending_response_buffer)
+							.or_else(|| pending_response_body.take());
+						if let Some(original_body) = original_body {
+							// The body is not inspected, but trailers still need to be relayed to
+							// ext_proc so their header mutations can be applied to the client.
+							if self.mode_state.response_trailer_mode == TrailerSendMode::Send {
+								let (first_message, sends_protocol_config) =
+									FirstExtProcMessage::take_for_send(&mut first_message);
+								self.mark_protocol_config_sent_if(sends_protocol_config);
+								tokio::task::spawn(Self::relay_response_trailers(
+									original_body,
+									tx_chunk,
+									rx,
+									tx.clone().ok_or(Error::RequestSend)?,
+									metadata_context.clone(),
+									response_trailers.clone(),
+									first_message,
+								));
+								return Ok((resp, None));
+							}
 							resp.body_mut().restore_content(original_body);
 							return Ok((resp, None));
 						}
